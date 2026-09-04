@@ -120,43 +120,17 @@ copy_bin_with_libs() {
     return 0
 }
 
-# Copy disk tools (xz, partprobe, blockdev) needed by the Fedora install path.
+# Copy disk tools (partprobe, blockdev) needed by the Fedora install path.
+# xz is not needed here: busybox provides xz/unlzma/lzcat applets.
 install_disk_tools() {
-    mkdir -p "$BUILD_DIR/usr/bin"
+    mkdir -p "$BUILD_DIR/bin"
 
-    if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
-        echo "Bundling disk tools via Docker..."
-        docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
-            apk add --no-cache xz parted util-linux-misc >/dev/null 2>&1
-            mkdir -p /output/bin /output/usr/bin /output/lib
-            for b in xz partprobe blockdev; do
-                p=$(command -v $b 2>/dev/null) || continue
-                if [ "${p#/usr/}" != "$p" ]; then dest=/output/usr/bin; else dest=/output/bin; fi
-                cp -L "$p" "$dest/$(basename $p)"
-                deps=$(ldd "$p" 2>/dev/null || true)
-                printf "%s\n" "$deps" | while read -r _ a _; do
-                    case "$a" in
-                        /*) cp -L "$a" /output/lib/ 2>/dev/null || true ;;
-                    esac
-                done
-            done
-            chown -R $HOST_UID:$HOST_GID /output
-        ' || true
-        chmod +x "$BUILD_DIR"/bin/xz "$BUILD_DIR"/bin/partprobe "$BUILD_DIR"/bin/blockdev \
-            "$BUILD_DIR"/usr/bin/xz "$BUILD_DIR"/usr/bin/partprobe "$BUILD_DIR"/usr/bin/blockdev 2>/dev/null || true
-    fi
-
-    # Best-effort fallback from the host (skip if already present).
-    for b in xz partprobe blockdev; do
-        if [ -e "$BUILD_DIR/bin/$b" ] || [ -e "$BUILD_DIR/usr/bin/$b" ]; then
+    for b in partprobe blockdev; do
+        if [ -e "$BUILD_DIR/bin/$b" ]; then
             continue
         fi
         if command -v "$b" >/dev/null 2>&1; then
-            case "$b" in
-                xz)        copy_bin_with_libs "$(command -v xz)" "$BUILD_DIR/bin/xz" || true ;;
-                partprobe) copy_bin_with_libs "$(command -v partprobe)" "$BUILD_DIR/bin/partprobe" || true ;;
-                blockdev)  copy_bin_with_libs "$(command -v blockdev)" "$BUILD_DIR/bin/blockdev" || true ;;
-            esac
+            copy_bin_with_libs "$(command -v "$b")" "$BUILD_DIR/bin/$b" || true
         fi
     done
 }
