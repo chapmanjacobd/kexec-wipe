@@ -51,7 +51,9 @@ install_busybox() {
             cp /bin/busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /bin/busybox /output/bin/busybox 2>/dev/null
-        ' && chmod +x "$BUILD_DIR/bin/busybox" && return 0
+        '
+        chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
+        chmod +x "$BUILD_DIR/bin/busybox" && return 0
         echo "Docker busybox build failed; falling back to host busybox."
     fi
 
@@ -129,6 +131,7 @@ install_install_tools() {
             cp -rL /etc/ssl /output/etc/ 2>/dev/null || true
             cp /etc/ssl/certs/ca-certificates.crt /output/etc/ 2>/dev/null || true
         ' || true
+        chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
         chmod +x "$BUILD_DIR"/bin/curl "$BUILD_DIR"/bin/xz "$BUILD_DIR"/bin/ip \
             "$BUILD_DIR"/bin/partprobe "$BUILD_DIR"/bin/blockdev \
             "$BUILD_DIR"/usr/bin/curl "$BUILD_DIR"/usr/bin/xz "$BUILD_DIR"/usr/bin/ip \
@@ -300,7 +303,7 @@ build_initramfs() {
     for cmd in sh bash mount umount mkdir cat echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
                lsblk blkid fdisk parted sync dd chroot sha256sum \
-               udhcpc ip xz unlzma lzcat modprobe awk; do
+               udhcpc ip xz unlzma lzcat modprobe awk switch_root; do
         ln -sf busybox "$cmd"
     done
     cd "$REPO_DIR"
@@ -325,6 +328,7 @@ build_initramfs() {
             echo "Docker static build failed, trying to copy host nvme-cli with libs..."
             copy_nvme_with_libs
         }
+        chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
     else
         copy_nvme_with_libs
     fi

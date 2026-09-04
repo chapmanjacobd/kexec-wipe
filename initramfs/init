@@ -406,6 +406,41 @@ cleanup_and_reboot() {
     reboot -f
 }
 
+# After --install-fedora, skip the reboot and boot directly into the freshly
+# written Fedora via switch_root. systemd (Fedora's init) mounts the API
+# filesystems (/dev, /proc, /sys, /run) itself early in boot, so we only need
+# to provide a console and the mounted root partition.
+switch_to_fedora() {
+    local rootpart
+    rootpart=$(first_root_part "$KEXEC_WIPE_DEV")
+    local rootfs=""
+    rootfs=$(blkid -s TYPE -o value "$rootpart" 2>/dev/null) || true
+
+    if [ -z "$rootfs" ]; then
+        warn "Could not detect Fedora root filesystem; cannot switch_root."
+        return 1
+    fi
+
+    case "$rootfs" in
+        xfs)   modprobe xfs 2>/dev/null || true ;;
+        btrfs) modprobe btrfs 2>/dev/null || true ;;
+        *)     modprobe "$rootfs" 2>/dev/null || true ;;
+    esac
+
+    local newroot=/sysroot
+    mkdir -p "$newroot"
+    if ! mount -t "$rootfs" "$rootpart" "$newroot" 2>/dev/null; then
+        warn "Could not mount $rootpart for switch_root."
+        return 1
+    fi
+
+    [ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null || true
+    sync
+
+    log "Switching root into Fedora ($rootpart)..."
+    exec switch_root -c /dev/console "$newroot" /sbin/init
+}
+
 main() {
     log "=== kexec-wipe initramfs ==="
 
@@ -425,8 +460,20 @@ main() {
 
     install_fedora
 
-    log "Rebooting in 5 seconds..."
-    sleep 5
+    # When installing Fedora, boot straight into it instead of rebooting.
+    if [ "$KEXEC_WIPE_INSTALL" = "1" ]; then
+        log "Booting into freshly installed Fedora..."
+        sleep 3
+        if switch_to_fedora; then
+            # switch_root exec's into systemd; we only reach here on failure.
+            :
+        fi
+        log "switch_root failed; falling back to reboot."
+        sleep 2
+    else
+        log "Rebooting in 5 seconds..."
+        sleep 5
+    fi
 
     cleanup_and_reboot
 }

@@ -71,8 +71,10 @@ initramfs sanitizes the drive, it:
 3. Decompresses the raw image and writes it to the target (it never writes the
    compressed stream directly to the disk).
 4. Detects UEFI vs BIOS and architecture, chroots into the installed OS, and
-   runs `grub2-install`/`grub2-mkconfig` so the fresh Fedora boots on bare metal.
-5. Reboots into the new install.
+   runs `grub2-install`/`grub2-mkconfig` so the fresh Fedora boots on bare metal
+   on subsequent boots.
+5. `switch_root`s directly into the fresh Fedora in the same boot — no redundant
+   reboot. (If switch_root fails it falls back to a plain reboot.)
 
 The image URL, release, and checksum are pinned in `lib/kexec.sh` (mirroring the
 `INITRAMFS_VERSION` convention) and bumped by the maintainer per Fedora release.
