@@ -283,7 +283,9 @@ fedora_raw_sha256() {
 # Bring up the first NIC using DHCP so we can download the Fedora image.
 setup_network() {
     # Best-effort: load virtio-net if available (needed for QEMU virtio-net-pci).
-    modprobe virtio_net 2>/dev/null || true
+    # The NVMe driver load (check_device) proves modprobe works; do the same here.
+    modprobe virtio_net 2>&1 | sed 's/^/    modprobe: /'
+    sleep 1
 
     # Ensure a minimal udhcpc script exists (busybox drops to /etc/udhcpc.script).
     if [ ! -x /etc/udhcpc.script ]; then
@@ -300,9 +302,14 @@ EOF
     # Prefer an existing DHCP lease (e.g. early network), otherwise run udhcpc.
     if ! ip addr show 2>/dev/null | grep -q "inet "; then
         log "Starting DHCP on all interfaces..."
+        log "Network interfaces: $(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | tr '\n' ' ')"
         for iface in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
-            if udhcpc -i "$iface" -q -n -s /etc/udhcpc.script >/dev/null 2>&1; then
+            log "  Running udhcpc on $iface..."
+            if timeout 10 udhcpc -i "$iface" -q -n -s /etc/udhcpc.script; then
+                log "  udhcpc succeeded on $iface."
                 break
+            else
+                log "  udhcpc failed on $iface (exit $?)."
             fi
         done
     fi
@@ -312,6 +319,7 @@ EOF
         return 0
     fi
 
+    ip addr show 2>&1 | sed 's/^/    addr: /'
     fatal "Could not bring up networking (needed to install Fedora)."
 }
 

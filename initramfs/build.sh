@@ -303,7 +303,7 @@ build_initramfs() {
     for cmd in sh bash mount umount mkdir cat echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
                lsblk blkid fdisk parted sync dd chroot sha256sum chmod \
-               udhcpc ip xz unlzma lzcat modprobe awk switch_root; do
+               udhcpc ip xz unlzma lzcat modprobe awk switch_root timeout; do
         ln -sf busybox "$cmd"
     done
     cd "$REPO_DIR"
