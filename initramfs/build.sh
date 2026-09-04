@@ -253,7 +253,7 @@ build_initramfs() {
     cd "$BUILD_DIR/bin"
     for cmd in sh bash mount umount mkdir cat echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
-               lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname ls rmdir \
+               lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
                xz unlzma lzcat modprobe awk switch_root timeout \
                cut sort basename dirname expr printf seq stat touch; do
         ln -sf busybox "$cmd"
