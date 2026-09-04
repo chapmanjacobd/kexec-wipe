@@ -2,7 +2,7 @@
 
 Securely wipe NVMe drives with a single command. Supports both non-root drives (direct sanitization) and root drives (via kexec into a minimal in-memory environment).
 
-## Quick Start
+## Quick Wipe
 
 ```bash
 curl -sL https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
