@@ -5,6 +5,31 @@ INITRAMFS_VERSION="v0.1.0"
 INITRAMFS_BASE_URL="https://github.com/xk/kexec-wipe/releases/download"
 INITRAMFS_FILE="kexec-wipe-initramfs-${INITRAMFS_VERSION}.cpio.gz"
 
+# Pinned Fedora Cloud Base raw image used for --install-fedora.
+# The xz filename and checksums are compose-specific, so they are pinned
+# here (mirroring INITRAMFS_VERSION) and bumped by the maintainer per release.
+INSTALL_FEDORA_RELEASE="44"
+INSTALL_FEDORA_CURRENT="1.7"
+INSTALL_FEDORA_BASE="https://download.fedoraproject.org/pub/fedora/linux/releases/${INSTALL_FEDORA_RELEASE}/Cloud"
+INSTALL_FEDORA_SHA256_x86_64="7e4fb73907abdc761d226ddaf3263bdfca62a0b0bfb5f0798545a9981fdd1953"
+INSTALL_FEDORA_SHA256_aarch64="090d3cb07b266535ff81603d12cd143626caedc51be46977fef5f9161d5117b3"
+
+fedora_raw_url() {
+    local arch
+    case "$(uname -m)" in
+        aarch64|arm64) arch="aarch64" ;;
+        *) arch="x86_64" ;;
+    esac
+    echo "${INSTALL_FEDORA_BASE}/${arch}/images/Fedora-Cloud-Base-AmazonEC2-${INSTALL_FEDORA_RELEASE}-${INSTALL_FEDORA_CURRENT}.${arch}.raw.xz"
+}
+
+fedora_raw_sha256() {
+    case "$(uname -m)" in
+        aarch64|arm64) echo "$INSTALL_FEDORA_SHA256_aarch64" ;;
+        *) echo "$INSTALL_FEDORA_SHA256_x86_64" ;;
+    esac
+}
+
 check_kexec() {
     if ! command -v kexec &>/dev/null; then
         fatal "kexec is required for root disk sanitization but was not found.
@@ -33,6 +58,9 @@ download_initramfs() {
     success "Initramfs downloaded ($(bytes_to_human "$(stat -c%s "$dest")"))."
 }
 
+# Federation finds a kernel image (optionally with its initrd) suitable for kexec.
+# On classic setups this is vmlinuz + separate initrd, or a single UKI (Unified
+# Kernel Image, common on aarch64) that embeds linux+initrd. Prints "<kernel> [initrd]".
 find_kernel() {
     local kver
     kver=$(uname -r)
@@ -43,6 +71,8 @@ find_kernel() {
         "/boot/bzImage-${kver}"
         "/boot/vmlinux-${kver}"
         "/vmlinuz-${kver}"
+        "/boot/EFI/fedora/linux-${kver}.efi"
+        "/boot/EFI/fedora/vmlinuz-${kver}"
     )
 
     for c in "${candidates[@]}"; do
@@ -55,9 +85,39 @@ find_kernel() {
     fatal "Could not find kernel image for ${kver}. Searched: ${candidates[*]}"
 }
 
+# Locate the initrd (if any) accompanying a classic kernel image. UKIs embed
+# their initrd, so nothing to return there.
+find_initrd() {
+    local kernel="$1"
+    local kver
+    kver=$(uname -r)
+
+    # .efi is a UKI; initrd is embedded.
+    case "$kernel" in
+        *.efi) return 0 ;;
+    esac
+
+    local candidates=(
+        "/boot/initramfs-${kver}.img"
+        "/boot/initrd.img-${kver}"
+        "/boot/initramfs-${kver}"
+        "/initramfs-${kver}.img"
+    )
+
+    for c in "${candidates[@]}"; do
+        if [ -f "$c" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+
+    warn "No separate initrd found for ${kernel}; using kernel as-is (UKI assumes embedded initrd)."
+}
+
 do_kexec_wipe() {
     local dev="$1"
     local method="${2:-auto}"
+    local install="${3:-0}"
 
     check_kexec
 
@@ -74,13 +134,49 @@ do_kexec_wipe() {
     cmdline="${cmdline} kexec_wipe_dev=${dev}"
     cmdline="${cmdline} kexec_wipe_method=${method}"
 
+    if [ "$install" -eq 1 ]; then
+        cmdline="${cmdline} kexec_wipe_install=1"
+        info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} after wipe"
+    fi
+
+    # For a classic kernel use the separate initrd. For a UKI (.efi) there is
+    # no separate initrd; the embedded one is used, so we pass no --initrd.
+    local initrd
+    initrd=$(find_initrd "$kernel")
+
     info "Loading kernel into memory..."
     info "  Kernel:    $kernel"
+    if [ -n "$initrd" ]; then
+        info "  Initrd:    $initrd"
+    else
+        info "  Initrd:    (embedded in UKI)"
+    fi
     info "  Initramfs: $initramfs_path"
     info "  Target:    $dev"
 
-    kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
-        || fatal "Failed to load kernel into memory via kexec."
+    if [ -n "$initrd" ]; then
+        # Classic kernel with our wipe initramfs (replaces normal early userspace).
+        kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
+            || fatal "Failed to load kernel into memory via kexec."
+    else
+        # UKI (.efi): the embedded initrd/cmdline are normally staged by the
+        # firmware's loader, which kexec bypasses. Try loading the UKI with our
+        # initramfs directly first; if kexec cannot parse the PE, fall back to
+        # extracting the embedded initrd (objcopy) and concatenating ours.
+        if kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" 2>/dev/null; then
+            : # loaded UKI directly
+        else
+            local kinitrd="${WIPE_TMPDIR}/uki-initrd"
+            info "Direct UKI load failed; extracting embedded initrd for a combined initramfs..."
+            if extract_uki_initrd "$kernel" "$kinitrd"; then
+                cat "$kinitrd" "$initramfs_path" > "${WIPE_TMPDIR}/combined-initrd"
+            else
+                cat "$initramfs_path" > "${WIPE_TMPDIR}/combined-initrd"
+            fi
+            kexec -l "$kernel" --initrd="${WIPE_TMPDIR}/combined-initrd" --command-line="$cmdline" \
+                || fatal "Failed to load kernel into memory via kexec."
+        fi
+    fi
 
     success "Kernel loaded. System will now kexec into minimal environment."
     warn "THE SYSTEM WILL REBOOT MOMENTARILY. Any unsaved work will be lost."
@@ -90,4 +186,22 @@ do_kexec_wipe() {
 
     sync
     kexec -e || fatal "kexec -e failed. System may need manual reboot."
+}
+
+# Extract the initrd payload embedded in a UKI (.efi) file. UKIs are PE images
+# with a .linux/.initrd section pair; objcopy can dump arbitrary sections.
+extract_uki_initrd() {
+    local uki="$1"
+    local out="$2"
+
+    if command -v objcopy &>/dev/null; then
+        if objcopy --dump-section .initrd="$out" "$uki" 2>/dev/null && [ -s "$out" ]; then
+            return 0
+        fi
+        # Some UKIs use a different section name; fall through and warn.
+        warn "Could not extract .initrd from UKI ${uki}."
+    else
+        warn "objcopy not available to extract UKI initrd."
+    fi
+    return 1
 }

@@ -18,11 +18,16 @@ Options:
                         block      - Block-erase only
                         overwrite  - Overwrite (slowest, most thorough)
   --dry-run             Show what would be done without making changes
+  --install-fedora      After sanitizing the root disk via kexec, download and
+                        write a Fedora Cloud Base image and install a bootloader
+                        so it can boot. Requires the root-disk (kexec) path and
+                        network access in the initramfs.
   --help                Show this help message
 
 Examples:
   sudo bash wipe.sh /dev/nvme0n1
   sudo bash wipe.sh /dev/nvme0n1 --method=block
+  sudo bash wipe.sh /dev/nvme0n1 --install-fedora
   sudo bash wipe.sh /dev/nvme0n1 --dry-run
 
 How it works:
@@ -36,6 +41,7 @@ parse_args() {
     TARGET_DEVICE=""
     METHOD="auto"
     DRY_RUN=0
+    INSTALL_FEDORA=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -48,6 +54,9 @@ parse_args() {
                 ;;
             --dry-run)
                 DRY_RUN=1
+                ;;
+            --install-fedora)
+                INSTALL_FEDORA=1
                 ;;
             --help|-h)
                 usage
@@ -93,6 +102,9 @@ main() {
         if ! command -v nvme &>/dev/null; then
             fatal "nvme-cli is required but not found. Install it with your package manager."
         fi
+        if [ "$INSTALL_FEDORA" -eq 1 ]; then
+            fatal "--install-fedora requires targeting the root disk (it runs inside the kexec initramfs)."
+        fi
     fi
 
     if [ "$is_root" -eq 1 ]; then
@@ -108,12 +120,18 @@ main() {
     local method_display="$METHOD"
     [ "$method_display" = "auto" ] && method_display="auto (crypto-erase -> block-erase)"
     echo -e "${BOLD}Sanitize method:${RESET} $method_display"
+    if [ "$INSTALL_FEDORA" -eq 1 ]; then
+        echo -e "${BOLD}Install:${RESET} Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (${INSTALL_FEDORA_CURRENT})"
+    fi
     echo ""
 
     if [ "$DRY_RUN" -eq 1 ]; then
         info "DRY RUN - no changes will be made."
         if [ "$is_root" -eq 1 ]; then
             info "Would kexec into minimal environment and sanitize $TARGET_DEVICE."
+            if [ "$INSTALL_FEDORA" -eq 1 ]; then
+                info "Would then install Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} on $TARGET_DEVICE."
+            fi
         else
             info "Would unmount all partitions on $TARGET_DEVICE and sanitize."
         fi
@@ -123,7 +141,7 @@ main() {
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
     if [ "$is_root" -eq 1 ]; then
-        do_kexec_wipe "$TARGET_DEVICE" "$METHOD"
+        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
     else
         detach_device "$TARGET_DEVICE"
         do_sanitize "$TARGET_DEVICE" "$METHOD"

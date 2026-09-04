@@ -9,8 +9,12 @@
 
 set -e
 
-# Shared libraries for dynamically-linked nvme-cli live in /lib
+# Shared libraries for dynamically-linked binaries live in /lib
 export LD_LIBRARY_PATH=/lib
+
+# CA bundle location for HTTPS downloads (bundled at initramfs build time).
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 
 log() {
     echo "[kexec-wipe] $*"
@@ -28,6 +32,7 @@ parse_cmdline() {
 
     KEXEC_WIPE_DEV=""
     KEXEC_WIPE_METHOD="auto"
+    KEXEC_WIPE_INSTALL=0
 
     for arg in $cmdline; do
         case "$arg" in
@@ -36,6 +41,9 @@ parse_cmdline() {
                 ;;
             kexec_wipe_method=*)
                 KEXEC_WIPE_METHOD="${arg#kexec_wipe_method=}"
+                ;;
+            kexec_wipe_install=*)
+                KEXEC_WIPE_INSTALL="${arg#kexec_wipe_install=}"
                 ;;
         esac
     done
@@ -168,6 +176,229 @@ wait_for_completion() {
     return 1
 }
 
+# --- Optional: install Fedora after wipe --------------------------------
+# Pinned Fedora Cloud Base raw image (bumped by the maintainer in wipe.sh's
+# lib/kexec.sh; mirrored here so the initramfs is self-contained for install).
+INSTALL_FEDORA_RELEASE="44"
+INSTALL_FEDORA_CURRENT="1.7"
+INSTALL_FEDORA_BASE="https://download.fedoraproject.org/pub/fedora/linux/releases/${INSTALL_FEDORA_RELEASE}/Cloud"
+
+arch_name() {
+    case "$(uname -m)" in
+        aarch64|arm64) echo "aarch64" ;;
+        *) echo "x86_64" ;;
+    esac
+}
+
+fedora_raw_url() {
+    local arch
+    arch=$(arch_name)
+    echo "${INSTALL_FEDORA_BASE}/${arch}/images/Fedora-Cloud-Base-AmazonEC2-${INSTALL_FEDORA_RELEASE}-${INSTALL_FEDORA_CURRENT}.${arch}.raw.xz"
+}
+
+# Signed/known checksum per arch. Kept in sync with lib/kexec.sh.
+fedora_raw_sha256() {
+    local arch
+    arch=$(arch_name)
+    case "$arch" in
+        aarch64) echo "090d3cb07b266535ff81603d12cd143626caedc51be46977fef5f9161d5117b3" ;;
+        *)       echo "7e4fb73907abdc761d226ddaf3263bdfca62a0b0bfb5f0798545a9981fdd1953" ;;
+    esac
+}
+
+# Bring up the first NIC using DHCP so we can download the Fedora image.
+setup_network() {
+    # Ensure a minimal udhcpc script exists (busybox drops to /etc/udhcpc.script).
+    if [ ! -x /etc/udhcpc.script ]; then
+        cat > /etc/udhcpc.script <<'EOF'
+#!/bin/sh
+[ "$1" = "bound" ] || exit 0
+[ -n "$ip" ] && ip addr add "$ip/$( [ -n "$mask" ] && echo "$mask" || echo 24 )" dev "$interface" 2>/dev/null
+[ -n "$router" ] && ip route add default via "$router" dev "$interface" 2>/dev/null
+[ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
+EOF
+        chmod +x /etc/udhcpc.script
+    fi
+
+    # Prefer an existing DHCP lease (e.g. early network), otherwise run udhcpc.
+    if ! ip addr show 2>/dev/null | grep -q "inet "; then
+        log "Starting DHCP on all interfaces..."
+        for iface in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
+            if udhcpc -i "$iface" -q -n -s /etc/udhcpc.script >/dev/null 2>&1; then
+                break
+            fi
+        done
+    fi
+
+    if ip addr show 2>/dev/null | grep -q "inet "; then
+        log "Network is up."
+        return 0
+    fi
+
+    fatal "Could not bring up networking (needed to install Fedora)."
+}
+
+download_fedora_image() {
+    local url
+    url=$(fedora_raw_url)
+    local dest="$1"
+
+    log "Downloading Fedora Cloud Base from: $url"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 "$url" -o "$dest" || fatal "Failed to download Fedora image."
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$dest" "$url" || fatal "Failed to download Fedora image."
+    else
+        fatal "Neither curl nor wget is available to download the Fedora image."
+    fi
+
+    if [ ! -s "$dest" ]; then
+        fatal "Downloaded Fedora image is empty."
+    fi
+
+    local expected
+    expected=$(fedora_raw_sha256)
+    local got
+    got=$(sha256sum "$dest" | awk '{print $1}')
+
+    if [ "$got" != "$expected" ]; then
+        fatal "Fedora image checksum mismatch (got $got, expected $expected)."
+    fi
+
+    log "Fedora image downloaded and verified."
+}
+
+# Decompress the raw image and write it to the device. We never write the
+# compressed stream directly to the disk.
+write_fedora_image() {
+    local xzfile="$1"
+    local dev="$2"
+
+    log "Writing Fedora image to $dev (this can take a while)..."
+    if command -v xz >/dev/null 2>&1; then
+        # Try with GNU-only options first, then a plain write as fallback.
+        ( xz -dc "$xzfile" | dd of="$dev" bs=4M conv=fsync status=none ) 2>/dev/null || \
+        ( xz -dc "$xzfile" | dd of="$dev" bs=4M conv=fsync ) || \
+        ( xz -dc "$xzfile" | dd of="$dev" bs=4M ) || fatal "Failed to write Fedora image."
+    else
+        # busybox provides xz decompression via unlzma/lzcat applets.
+        ( unlzma -dc "$xzfile" | dd of="$dev" bs=4M conv=fsync ) 2>/dev/null || \
+        ( lzcat -dc "$xzfile" | dd of="$dev" bs=4M ) || fatal "Failed to write Fedora image."
+    fi
+
+    sync
+    sleep 1
+    blockdev --rereadpt "$dev" 2>/dev/null || partprobe "$dev" 2>/dev/null || true
+    log "Fedora image written."
+}
+
+# Find an ext/xfs/btrfs partition in the written image and return its device.
+first_root_part() {
+    local dev="$1"
+    local part
+    part=$(blkid "$dev"* 2>/dev/null | grep -iE 'TYPE="(xfs|ext4|ext3|ext2|btrfs)"' | cut -d: -f1 | head -1)
+    if [ -n "$part" ]; then
+        echo "$part"
+        return 0
+    fi
+    # Fallback: assume the root is the first partition.
+    echo "${dev}p1"
+}
+
+# Install a bootloader into the written Fedora so it boots on bare metal.
+# We chroot into the image's root and run its own grub2-install, which keeps the
+# image's normal boot config and covers both UEFI and legacy BIOS targets.
+install_bootloader() {
+    local dev="$1"
+
+    log "Installing bootloader on $dev..."
+
+    local rootpart
+    rootpart=$(first_root_part "$dev")
+    local rootfs=""
+    rootfs=$(blkid -s TYPE -o value "$rootpart" 2>/dev/null) || true
+
+    if [ -z "$rootfs" ]; then
+        warn "Could not detect filesystem of $rootpart; skipping bootloader install."
+        return 0
+    fi
+
+    # Load kernel module for the root filesystem if not already available.
+    case "$rootfs" in
+        xfs)   [ -d /sys/fs/xfs ] || modprobe xfs 2>/dev/null || true ;;
+        btrfs) modprobe btrfs 2>/dev/null || true ;;
+        ext*|*) modprobe "$rootfs" 2>/dev/null || true ;;
+    esac
+
+    local mnt
+    mnt=/mnt/root
+    mkdir -p "$mnt"
+    if ! mount -t "$rootfs" "$rootpart" "$mnt" 2>/dev/null; then
+        warn "Could not mount $rootpart; skipping bootloader install."
+        return 0
+    fi
+
+    # Bind system pseudo-fses so chrooted tools work.
+    mount -t proc proc "$mnt/proc" 2>/dev/null || true
+    mount -t sysfs sys "$mnt/sys" 2>/dev/null || true
+    mount -t devtmpfs dev "$mnt/dev" 2>/dev/null || true
+
+    local uefi=0
+    [ -d /sys/firmware/efi ] && uefi=1
+
+    if [ -x "$mnt/sbin/grub2-install" ] || [ -x "$mnt/usr/sbin/grub2-install" ]; then
+        local grub_target
+        grub_target=$(detect_grub_target "$uefi")
+
+        log "Using GRUB (target: $grub_target) from the installed image..."
+        if chroot "$mnt" /bin/bash -c "grub2-install --target=$grub_target --no-floppy '$dev' 2>/dev/null || grub2-install --no-floppy '$dev' 2>/dev/null || grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1"; then
+            chroot "$mnt" /bin/bash -c "grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1" || true
+            log "GRUB installed successfully."
+        else
+            warn "GRUB installation failed; leaving image as-is."
+        fi
+    else
+        warn "No GRUB found in installed image; skipping bootloader install."
+    fi
+
+    sync
+    umount "$mnt/dev" 2>/dev/null || true
+    umount "$mnt/sys" 2>/dev/null || true
+    umount "$mnt/proc" 2>/dev/null || true
+    umount "$mnt" 2>/dev/null || true
+}
+
+detect_grub_target() {
+    local uefi="$1"
+    if [ "$(arch_name)" = "aarch64" ]; then
+        # ARM64 is always EFI (there is no legacy BIOS ARM path).
+        echo "arm64-efi"
+    elif [ "$uefi" -eq 1 ]; then
+        echo "x86_64-efi"
+    else
+        echo "i386-pc"
+    fi
+}
+
+install_fedora() {
+    log "=== Installing Fedora after wipe ==="
+    if [ "$KEXEC_WIPE_INSTALL" != "1" ]; then
+        return 0
+    fi
+
+    setup_network
+
+    local xzfile
+    xzfile=/tmp/fedora.raw.xz
+    download_fedora_image "$xzfile"
+    write_fedora_image "$xzfile" "$KEXEC_WIPE_DEV"
+    install_bootloader "$KEXEC_WIPE_DEV"
+    rm -f "$xzfile"
+
+    log "Fedora installation complete."
+}
+
 cleanup_and_reboot() {
     log "Syncing..."
     sync
@@ -191,6 +422,9 @@ main() {
 
     echo ""
     log "Drive $KEXEC_WIPE_DEV has been sanitized."
+
+    install_fedora
+
     log "Rebooting in 5 seconds..."
     sleep 5
 
