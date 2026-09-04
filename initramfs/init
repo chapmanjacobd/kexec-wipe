@@ -349,6 +349,31 @@ write_fedora_image() {
         sleep 1
     fi
 
+    # Fallback: if partition nodes still did not appear (e.g. emulated NVMe
+    # devices where sysfs rescan is not supported), create the partition device
+    # nodes manually. The kernel has usually already re-read the partition
+    # table via BLKRRPART; devtmpfs just failed to materialize the nodes. We
+    # parse fdisk and mknod the partition nodes directly. NVMe minor numbers
+    # and partition indices happen to coincide (pN -> minor N), which holds for
+    # the first namespace of a single disk.
+    if ! ls "${dev}p"* >/dev/null 2>&1; then
+        log "Partition nodes missing; creating them manually via fdisk/mknod..."
+        local devmajor=""
+        [ -f "/sys/block/$devname/dev" ] && devmajor=$(cut -d: -f1 "/sys/block/$devname/dev")
+        if [ -n "$devmajor" ]; then
+            local part
+            for part in $(fdisk -l "$dev" 2>/dev/null | awk -v d="$dev" '$1 ~ d"p[0-9]+" {print $1}'); do
+                local minor="${part##*p}"
+                if [ ! -b "$part" ]; then
+                    mknod "$part" b "$devmajor" "$minor" 2>/dev/null || true
+                fi
+            done
+            if ls "${dev}p"* >/dev/null 2>&1; then
+                log "Partition nodes created manually."
+            fi
+        fi
+    fi
+
     log "Fedora image written."
 }
 

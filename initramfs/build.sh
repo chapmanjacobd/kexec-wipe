@@ -117,6 +117,27 @@ copy_bin_with_libs() {
         esac
         copy_lib "$resolved"
     done
+
+    # The ELF interpreter (dynamic loader) itself. copy_lib places it under
+    # /lib, but the interpreter in the ELF header may point at /lib64. Mirror
+    # it to both locations so dynamically-linked helpers can actually exec.
+    local ld_line
+    ld_line=$(ldd "$bin" 2>/dev/null | grep 'ld-linux' | head -1)
+    if [ -n "$ld_line" ]; then
+        local ld_path
+        ld_path=$(echo "$ld_line" | awk '{print $1}')
+        if [ -n "$ld_path" ] && [ -f "$ld_path" ]; then
+            local ld_base
+            ld_base=$(basename "$ld_path")
+            if [ ! -e "$BUILD_DIR/lib/$ld_base" ]; then
+                cp -L "$ld_path" "$BUILD_DIR/lib/$ld_base"
+            fi
+            mkdir -p "$BUILD_DIR/lib64"
+            if [ ! -e "$BUILD_DIR/lib64/$ld_base" ]; then
+                cp -L "$ld_path" "$BUILD_DIR/lib64/$ld_base"
+            fi
+        fi
+    fi
     return 0
 }
 
