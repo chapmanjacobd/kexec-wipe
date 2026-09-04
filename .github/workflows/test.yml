@@ -1,0 +1,118 @@
+name: Test
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-verify:
+    name: Build and verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble wipe.sh
+        run: ./build.sh
+
+      - name: Verify wipe.sh is up to date
+        run: |
+          ./build.sh --output=/tmp/wipe-check.sh
+          if ! diff -u wipe.sh /tmp/wipe-check.sh; then
+            echo "::error::wipe.sh is out of date. Run ./build.sh and commit."
+            exit 1
+          fi
+
+      - name: Syntax check all scripts
+        run: |
+          set -e
+          bash -n wipe.sh
+          for f in lib/*.sh; do bash -n "$f"; done
+          sh -n initramfs/init
+          bash -n initramfs/build.sh
+          bash -n build.sh
+
+      - name: Test wipe.sh --help
+        run: |
+          bash wipe.sh --help
+          cat wipe.sh | bash -s -- --help
+
+      - name: Build initramfs (no Docker)
+        run: ./initramfs/build.sh --no-docker --output=/tmp/initramfs.cpio.gz
+
+      - name: Verify initramfs contents
+        run: |
+          mkdir -p /tmp/initramfs-check
+          cd /tmp/initramfs-check
+          zcat /tmp/initramfs.cpio.gz | cpio -idm 2>/dev/null
+          test -f bin/busybox
+          test -f bin/nvme
+          test -f init && test -x init
+          test -L bin/sh
+          test -L bin/mount
+          test -L bin/reboot
+
+      - name: Build initramfs (with Docker)
+        run: ./initramfs/build.sh --output=/tmp/initramfs-docker.cpio.gz
+
+      - name: Verify initramfs (with Docker)
+        run: |
+          mkdir -p /tmp/initramfs-docker-check
+          cd /tmp/initramfs-docker-check
+          zcat /tmp/initramfs-docker.cpio.gz | cpio -idm 2>/dev/null
+          test -f bin/busybox
+          test -f bin/nvme
+          test -f init && test -x init
+          test -L bin/sh
+          test -L bin/mount
+          test -L bin/reboot
+          LD_LIBRARY_PATH=./lib ldd bin/nvme >/dev/null 2>&1
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 linux-image-generic
+
+      - name: QEMU smoke test
+        run: |
+          KERNEL=$(ls /boot/vmlinuz-* | head -1)
+          echo "Using kernel: $KERNEL"
+
+          timeout 30 qemu-system-x86_64 \
+            -kernel "$KERNEL" \
+            -initrd /tmp/initramfs-docker.cpio.gz \
+            -append "kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto" \
+            -nographic -no-reboot -m 512 \
+            > /tmp/serial.log 2>&1 || true
+
+          echo "--- Serial output ---"
+          cat /tmp/serial.log
+          echo "--- End serial output ---"
+
+          grep -q "kexec-wipe initramfs" /tmp/serial.log
+          echo "QEMU smoke test passed."
+
+  argument-parsing:
+    name: Argument parsing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test --help
+        run: bash wipe.sh --help
+
+      - name: Test no device
+        run: ! bash wipe.sh 2>/dev/null
+
+      - name: Test invalid method
+        run: ! bash wipe.sh /dev/fake --method=invalid 2>/dev/null
+
+      - name: Test non-NVMe device
+        run: ! bash wipe.sh /dev/sda 2>/dev/null
+
+      - name: Test --install-fedora on non-root
+        run: ! bash wipe.sh /dev/sda --install-fedora 2>/dev/null
