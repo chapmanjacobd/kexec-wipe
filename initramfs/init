@@ -33,6 +33,10 @@ parse_cmdline() {
     KEXEC_WIPE_DEV=""
     KEXEC_WIPE_METHOD="auto"
     KEXEC_WIPE_INSTALL=0
+    # Optional overrides for the Fedora install source (used by tests). When
+    # empty, the pinned release/checksum above is used.
+    KEXEC_WIPE_FEDORA_URL=""
+    KEXEC_WIPE_FEDORA_SHA256=""
 
     for arg in $cmdline; do
         case "$arg" in
@@ -44,6 +48,12 @@ parse_cmdline() {
                 ;;
             kexec_wipe_install=*)
                 KEXEC_WIPE_INSTALL="${arg#kexec_wipe_install=}"
+                ;;
+            kexec_wipe_fedora_url=*)
+                KEXEC_WIPE_FEDORA_URL="${arg#kexec_wipe_fedora_url=}"
+                ;;
+            kexec_wipe_fedora_sha256=*)
+                KEXEC_WIPE_FEDORA_SHA256="${arg#kexec_wipe_fedora_sha256=}"
                 ;;
         esac
     done
@@ -65,6 +75,16 @@ mount_pseudo_fs() {
 }
 
 check_device() {
+    # Best-effort: if the target is an NVMe device whose driver is modular
+    # (e.g. not built into the running kernel), try to load it before checking.
+    case "$KEXEC_WIPE_DEV" in
+        /dev/nvme*)
+            modprobe nvme-core 2>/dev/null || modprobe nvme 2>/dev/null || true
+            # Probe is async; give the controller a moment to register.
+            sleep 1
+            ;;
+    esac
+
     if [ ! -b "$KEXEC_WIPE_DEV" ]; then
         fatal "Target device $KEXEC_WIPE_DEV not found."
     fi
@@ -239,9 +259,9 @@ EOF
 }
 
 download_fedora_image() {
-    local url
-    url=$(fedora_raw_url)
-    local dest="$1"
+    local url="$1"
+    local expected="$2"
+    local dest="$3"
 
     log "Downloading Fedora Cloud Base from: $url"
 
@@ -257,8 +277,6 @@ download_fedora_image() {
         fatal "Downloaded Fedora image is empty."
     fi
 
-    local expected
-    expected=$(fedora_raw_sha256)
     local got
     got=$(sha256sum "$dest" | awk '{print $1}')
 
@@ -389,9 +407,20 @@ install_fedora() {
 
     setup_network
 
+    # Allow a test to override the source/checksum; otherwise use the pinned
+    # release above.
+    local url="$KEXEC_WIPE_FEDORA_URL"
+    local sha="$KEXEC_WIPE_FEDORA_SHA256"
+    if [ -z "$url" ]; then
+        url=$(fedora_raw_url)
+    fi
+    if [ -z "$sha" ]; then
+        sha=$(fedora_raw_sha256)
+    fi
+
     local xzfile
     xzfile=/tmp/fedora.raw.xz
-    download_fedora_image "$xzfile"
+    download_fedora_image "$url" "$sha" "$xzfile"
     write_fedora_image "$xzfile" "$KEXEC_WIPE_DEV"
     install_bootloader "$KEXEC_WIPE_DEV"
     rm -f "$xzfile"
