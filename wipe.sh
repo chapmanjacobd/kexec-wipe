@@ -98,13 +98,6 @@ validate_device() {
     fi
 }
 
-get_nvme_ctrl() {
-    local dev="$1"
-    local devname
-    devname=$(basename "$dev")
-    echo "${devname%%n[0-9]*}"
-}
-
 get_device_info() {
     local dev="$1"
     local devname
@@ -136,11 +129,22 @@ is_root_device() {
     local devname
     devname=$(basename "$dev")
 
-    # Get the device name of the root filesystem (strip partition number)
+    # Get the device name of the root filesystem (strip partition suffix)
     local root_dev
     root_dev=$(findmnt -n -o SOURCE / 2>/dev/null) || return 1
     root_dev=$(basename "$root_dev")
-    root_dev="${root_dev%%[0-9]*}"
+    # Use lsblk to find the parent (disk) device. This correctly handles
+    # NVMe (nvme0n1p2 -> nvme0n1), mmcblk (mmcblk0p1 -> mmcblk0), and
+    # traditional (sda1 -> sda) partition naming.
+    local parent
+    parent=$(lsblk -n -o PKNAME "/dev/$root_dev" 2>/dev/null | head -1) || true
+    if [ -n "$parent" ]; then
+        root_dev="$parent"
+    else
+        # Fallback: best-effort string stripping
+        root_dev="${root_dev%%p[0-9]*}"
+        root_dev="${root_dev%%[0-9]*}"
+    fi
 
     [ "$root_dev" = "$devname" ]
 }
@@ -239,10 +243,11 @@ detach_device() {
     sync
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
-    deactivate_swap "$dev"
-    remove_lvm "$dev"
-    remove_raid "$dev"
+    # Unmount first so LVM/RAID teardown doesn't fail with "device is busy".
     unmount_device "$dev"
+    deactivate_swap "$dev"
+    remove_raid "$dev"
+    remove_lvm "$dev"
 }
 # --- end lib/unmount.sh ---
 

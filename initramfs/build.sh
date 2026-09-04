@@ -234,48 +234,7 @@ copy_nvme_with_libs() {
     nvme_bin=$(command -v nvme) || { echo "WARNING: nvme not found. Initramfs will lack nvme support."; return 0; }
 
     echo "Copying nvme-cli with shared libraries..."
-
-    # Copy the binary
-    cp "$nvme_bin" "$BUILD_DIR/bin/nvme"
-
-    # Copy shared libraries.
-    local lib_dir="$BUILD_DIR/lib"
-    mkdir -p "$lib_dir"
-
-    # Parse ldd output: each line is either "  lib => /path (0xaddr)" or "  /path (0xaddr)"
-    ldd "$nvme_bin" 2>/dev/null | while IFS= read -r line; do
-        # Extract the path: if there's "=>" use the right side, otherwise use the first field
-        local resolved
-        if echo "$line" | grep -q '=>'; then
-            resolved=$(echo "$line" | sed 's/.*=> \([^ ]*\).*/\1/')
-        else
-            resolved=$(echo "$line" | awk '{print $1}')
-        fi
-
-        # Skip non-path entries (vdso) and the dynamic linker (we'll handle it separately)
-        case "$resolved" in
-            linux-vdso*) continue ;;
-            *ld-linux*) continue ;;
-            /*) ;;
-            *) continue ;;
-        esac
-
-        copy_lib "$resolved"
-    done
-
-    # Copy ld-linux-x86-64.so.2 (the dynamic linker) into the right place
-    local ld_line
-    ld_line=$(ldd "$nvme_bin" 2>/dev/null | grep 'ld-linux' | head -1)
-    if [ -n "$ld_line" ]; then
-        local ld_path
-        ld_path=$(echo "$ld_line" | awk '{print $1}')
-        if [ -n "$ld_path" ] && [ -f "$ld_path" ]; then
-            local ld_real
-            ld_real=$(readlink -f "$ld_path" 2>/dev/null || echo "$ld_path")
-            mkdir -p "$BUILD_DIR/lib64"
-            cp -L "$ld_real" "$BUILD_DIR/lib64/"
-        fi
-    fi
+    copy_bin_with_libs "$nvme_bin" "$BUILD_DIR/bin/nvme"
 }
 
 build_initramfs() {
@@ -294,8 +253,7 @@ build_initramfs() {
     cd "$BUILD_DIR/bin"
     for cmd in sh bash mount umount mkdir cat echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
-               lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
-               lsmod insmod rmmod modinfo \
+               lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname ls rmdir \
                xz unlzma lzcat modprobe awk switch_root timeout \
                cut sort basename dirname expr printf seq stat touch; do
         ln -sf busybox "$cmd"

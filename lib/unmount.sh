@@ -90,8 +90,9 @@ detach_device() {
     sync
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
 
-    deactivate_swap "$dev"
-    remove_lvm "$dev"
-    remove_raid "$dev"
+    # Unmount first so LVM/RAID teardown doesn't fail with "device is busy".
     unmount_device "$dev"
+    deactivate_swap "$dev"
+    remove_raid "$dev"
+    remove_lvm "$dev"
 }
