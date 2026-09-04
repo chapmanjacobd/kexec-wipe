@@ -203,6 +203,11 @@ parse_args() {
         esac
         shift
     done
+
+    case "$OUTPUT" in
+        /*) ;;
+        *) OUTPUT="$REPO_DIR/$OUTPUT" ;;
+    esac
 }
 
 check_deps() {
