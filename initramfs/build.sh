@@ -44,7 +44,7 @@ install_busybox() {
         curl -fsSL "$BUSYBOX_URL" -o "$BUILD_DIR/bin/busybox" && chmod +x "$BUILD_DIR/bin/busybox" && return 0
     fi
 
-    if command -v docker >/dev/null 2>&1; then
+    if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
         echo "Building busybox static via Docker (arch: $(host_arch))..."
         docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache busybox-static >/dev/null 2>&1
@@ -112,7 +112,7 @@ install_install_tools() {
     mkdir -p "$BUILD_DIR/usr/bin" "$BUILD_DIR/etc"
 
     # CA certificates so HTTPS downloads verify.
-    if command -v docker >/dev/null 2>&1; then
+    if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
         echo "Bundling network/install tools via Docker..."
         docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache curl xz iproute2 parted util-linux-misc >/dev/null 2>&1

@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   test:
-    name: Build and test
+    name: Static checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -39,40 +39,95 @@ jobs:
           bash -n build.sh
           echo "All syntax checks passed."
 
-      - name: Test pipe execution
+      - name: Test argument parsing
         run: |
+          set -e
           bash wipe.sh --help
           cat wipe.sh | bash -s -- --help
+          ! bash wipe.sh 2>/dev/null
+          ! bash wipe.sh /dev/fake --method=invalid 2>/dev/null
+          ! bash wipe.sh /dev/sda 2>/dev/null
+          ! bash wipe.sh /dev/sda --install-fedora 2>/dev/null
+
+      - name: Install nvme-cli
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nvme-cli
 
       - name: Build initramfs (no Docker)
-        run: ./initramfs/build.sh --no-docker --output=/tmp/kexec-wipe-initramfs.cpio.gz
+        run: ./initramfs/build.sh --no-docker --output=/tmp/initramfs.cpio.gz
 
       - name: Verify initramfs contents
         run: |
           mkdir -p /tmp/initramfs-check
           cd /tmp/initramfs-check
-          zcat /tmp/kexec-wipe-initramfs.cpio.gz | cpio -idm 2>/dev/null
+          zcat /tmp/initramfs.cpio.gz | cpio -idm 2>/dev/null
 
-          # Check required files exist
           test -f bin/busybox
           test -f bin/nvme
-          test -f init
-          test -x init
+          test -f init && test -x init
 
-          # Check busybox symlinks
           test -L bin/sh
           test -L bin/mount
           test -L bin/reboot
 
-          # Check nvme can load its libraries
           LD_LIBRARY_PATH=./lib ldd bin/nvme >/dev/null 2>&1
 
           echo "Initramfs verification passed."
 
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build initramfs (with Docker)
+        run: ./initramfs/build.sh --output=/tmp/initramfs-docker.cpio.gz
+
+      - name: Verify initramfs (with Docker)
+        run: |
+          mkdir -p /tmp/initramfs-docker-check
+          cd /tmp/initramfs-docker-check
+          zcat /tmp/initramfs-docker.cpio.gz | cpio -idm 2>/dev/null
+
+          test -f bin/busybox
+          test -f bin/nvme
+          test -f init && test -x init
+
+          test -L bin/sh
+          test -L bin/mount
+          test -L bin/reboot
+
+          LD_LIBRARY_PATH=./lib ldd bin/nvme >/dev/null 2>&1
+
+          echo "Initramfs verification passed."
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 linux-image-generic
+
+      - name: QEMU smoke test
+        run: |
+          KERNEL=$(ls /boot/vmlinuz-* | head -1)
+          echo "Using kernel: $KERNEL"
+
+          timeout 30 qemu-system-x86_64 \
+            -kernel "$KERNEL" \
+            -initrd /tmp/initramfs-docker.cpio.gz \
+            -append "kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto" \
+            -nographic -no-reboot -m 512 \
+            > /tmp/serial.log 2>&1 || true
+
+          echo "--- Serial output ---"
+          cat /tmp/serial.log
+          echo "--- End serial output ---"
+
+          grep -q "kexec-wipe initramfs" /tmp/serial.log
+          echo "QEMU smoke test passed."
+
   release:
     name: Create release
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, integration]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
@@ -87,8 +142,8 @@ jobs:
               --generate-notes \
               --repo "${GITHUB_REPOSITORY}"
 
-  upload_release_assets:
-    name: Upload release asset
+  upload-release:
+    name: Upload release assets
     runs-on: ubuntu-latest
     needs: release
     if: startsWith(github.ref, 'refs/tags/v')
@@ -108,15 +163,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Extract version from tag
           VERSION="${GITHUB_REF_NAME}"
           INITRAMFS_VERSION=$(grep 'INITRAMFS_VERSION=' lib/kexec.sh | head -1 | cut -d'"' -f2)
           INITRAMFS_ASSET="kexec-wipe-initramfs-${INITRAMFS_VERSION}.cpio.gz"
 
-          # Rename to versioned filename
           cp kexec-wipe-initramfs.cpio.gz "${INITRAMFS_ASSET}"
 
-          # Upload both wipe.sh and initramfs
           gh release upload "${VERSION}" \
             wipe.sh \
             "${INITRAMFS_ASSET}" \
