@@ -322,8 +322,9 @@ build_initramfs() {
             apk add --no-cache git gcc make musl-dev linux-headers json-c-dev openssl-dev python3 meson \
             && git clone --depth 1 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
             && cd /tmp/nvme-cli \
-            && make static \
-            && cp nvme /output/bin/nvme \
+            && meson setup .build --buildtype=release --default-library=static -DBUILD_TESTING=false \
+            && meson compile -C .build nvme \
+            && cp .build/nvme /output/bin/nvme \
             && chown -R $HOST_UID:$HOST_GID /output
         ' || {
             echo "Docker static build failed, trying to copy host nvme-cli with libs..."
