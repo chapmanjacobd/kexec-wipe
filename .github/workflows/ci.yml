@@ -145,6 +145,11 @@ jobs:
           if [ -d "$SRC_MODS/kernel/drivers/nvme" ]; then
             cp -a "$SRC_MODS/kernel/drivers/nvme"/* "$DST_MODS/kernel/drivers/nvme/"
           fi
+          # Stage virtio-net modules so the guest can bring up a NIC for DHCP.
+          mkdir -p "$DST_MODS/kernel/drivers/net"
+          for f in "$SRC_MODS"/kernel/drivers/net/virtio_net*; do
+            [ -e "$f" ] && cp -a "$f" "$DST_MODS/kernel/drivers/net/"
+          done
           # Overwrite with the full host module metadata so modprobe resolves.
           for f in modules.dep modules.dep.bin modules.builtin modules.builtin.bin modules.alias modules.alias.bin modules.symbols; do
             [ -f "$SRC_MODS/$f" ] && cp "$SRC_MODS/$f" "$DST_MODS/$f" 2>/dev/null || true
