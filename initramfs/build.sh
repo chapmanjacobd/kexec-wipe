@@ -46,13 +46,13 @@ install_busybox() {
 
     if command -v docker >/dev/null 2>&1; then
         echo "Building busybox static via Docker (arch: $(host_arch))..."
-        docker run --rm -v "$BUILD_DIR:/output" alpine:latest sh -c '
+        docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache busybox-static >/dev/null 2>&1
             cp /bin/busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /bin/busybox /output/bin/busybox 2>/dev/null
+            chown -R $HOST_UID:$HOST_GID /output/bin/busybox
         '
-        chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
         chmod +x "$BUILD_DIR/bin/busybox" && return 0
         echo "Docker busybox build failed; falling back to host busybox."
     fi
@@ -114,7 +114,7 @@ install_install_tools() {
     # CA certificates so HTTPS downloads verify.
     if command -v docker >/dev/null 2>&1; then
         echo "Bundling network/install tools via Docker..."
-        docker run --rm -v "$BUILD_DIR:/output" alpine:latest sh -c '
+        docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache curl xz iproute2 parted util-linux-misc >/dev/null 2>&1
             mkdir -p /output/bin /output/usr/bin /output/lib /output/etc
             for b in curl xz ip partprobe blockdev; do
@@ -130,8 +130,8 @@ install_install_tools() {
             done
             cp -rL /etc/ssl /output/etc/ 2>/dev/null || true
             cp /etc/ssl/certs/ca-certificates.crt /output/etc/ 2>/dev/null || true
+            chown -R $HOST_UID:$HOST_GID /output
         ' || true
-        chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
         chmod +x "$BUILD_DIR"/bin/curl "$BUILD_DIR"/bin/xz "$BUILD_DIR"/bin/ip \
             "$BUILD_DIR"/bin/partprobe "$BUILD_DIR"/bin/blockdev \
             "$BUILD_DIR"/usr/bin/curl "$BUILD_DIR"/usr/bin/xz "$BUILD_DIR"/usr/bin/ip \
@@ -318,17 +318,17 @@ build_initramfs() {
     echo "Building nvme-cli..."
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker &>/dev/null; then
         echo "Building static nvme-cli via Docker..."
-        docker run --rm -v "$BUILD_DIR:/output" alpine:latest sh -c '
+        docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache git gcc make musl-dev linux-headers json-c-dev openssl-dev \
             && git clone --depth 1 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
             && cd /tmp/nvme-cli \
             && make STATIC=1 \
-            && cp nvme /output/bin/nvme
+            && cp nvme /output/bin/nvme \
+            && chown -R $HOST_UID:$HOST_GID /output
         ' || {
             echo "Docker static build failed, trying to copy host nvme-cli with libs..."
             copy_nvme_with_libs
         }
-        chown -R "$(id -u):$(id -g)" "$BUILD_DIR"
     else
         copy_nvme_with_libs
     fi
