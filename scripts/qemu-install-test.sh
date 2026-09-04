@@ -149,6 +149,7 @@ build_fake_fedora() {
 
 # Embed the fake Fedora .xz into a copy of the staged initramfs, mirroring how
 # wipe.sh hands the image to the initramfs (lib/kexec.sh augment_initramfs).
+# Also embeds hostname and authorized_keys for user provisioning.
 embed_fedora() {
     echo "==> Embedding Fedora image into initramfs"
     local work="$OUT_DIR/augment"
@@ -159,6 +160,10 @@ embed_fedora() {
     local dest="$work/opt"
     mkdir -p "$dest"
     cp "$OUT_DIR/fedora.raw.xz" "$dest/fedora.raw.xz"
+
+    # Embed hostname and authorized_keys (mirrors lib/kexec.sh do_kexec_wipe).
+    echo "test-host" > "$dest/kexec-wipe-hostname"
+    : > "$dest/kexec-wipe-authorized_keys"
 
     ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$OUT_DIR/augmented-initramfs.cpio.gz" )
     rm -rf "$work"

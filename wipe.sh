@@ -578,9 +578,32 @@ do_kexec_wipe() {
     if [ "$install" -eq 1 ]; then
         local fedora="${WIPE_TMPDIR}/fedora.raw.xz"
         download_fedora_image "$fedora"
+
+        # Capture the host's hostname and authorized_keys for user provisioning.
+        local host_hostname
+        host_hostname=$(hostname)
+        echo "$host_hostname" > "${WIPE_TMPDIR}/hostname"
+        info "  Hostname:  $host_hostname"
+
+        local auth_keys=""
+        if [ -f "${HOME:-/root}/.ssh/authorized_keys" ]; then
+            auth_keys="${HOME:-/root}/.ssh/authorized_keys"
+        elif [ -f "/root/.ssh/authorized_keys" ]; then
+            auth_keys="/root/.ssh/authorized_keys"
+        fi
+        if [ -n "$auth_keys" ] && [ -s "$auth_keys" ]; then
+            cp "$auth_keys" "${WIPE_TMPDIR}/authorized_keys"
+            info "  SSH keys:  $(wc -l < "${WIPE_TMPDIR}/authorized_keys") key(s) from $auth_keys"
+        else
+            warn "No authorized_keys found; SSH key access will not be configured."
+            : > "${WIPE_TMPDIR}/authorized_keys"
+        fi
+
         info "Embedding Fedora image into initramfs..."
         local augmented
         augmented=$(augment_initramfs "$initramfs_path" "/opt/fedora.raw.xz" "$fedora")
+        augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-hostname" "${WIPE_TMPDIR}/hostname")
+        augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-authorized_keys" "${WIPE_TMPDIR}/authorized_keys")
         initramfs_path="$augmented"
         info "  Augmented initramfs: $initramfs_path"
     fi

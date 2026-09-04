@@ -56,6 +56,7 @@ parse_cmdline() {
     # Optional overrides for the Fedora install source (used by tests). When
     # empty, the pinned release/checksum above is used.
     KEXEC_WIPE_FEDORA_IMAGE=""
+    KEXEC_WIPE_HOSTNAME=""
 
     for arg in $cmdline; do
         case "$arg" in
@@ -80,6 +81,9 @@ parse_cmdline() {
     if [ -z "$KEXEC_WIPE_DEV" ]; then
         fatal "No target device specified in kernel command line."
     fi
+
+    # Read the hostname from the embedded file (written by the host-side script).
+    [ -f /opt/kexec-wipe-hostname ] && KEXEC_WIPE_HOSTNAME=$(cat /opt/kexec-wipe-hostname)
 }
 
 mount_pseudo_fs() {
@@ -472,6 +476,111 @@ detect_grub_target() {
     fi
 }
 
+# Sanitize a hostname for use as a Linux username.  Lowercases, truncates to 32
+# characters, and strips characters outside [a-z0-9_-].  Returns empty string if
+# the result would be empty.
+sanitize_username() {
+    local raw="$1"
+    local cleaned
+    cleaned=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g' | cut -c1-32)
+    echo "$cleaned"
+}
+
+# Configure a user account and SSH access on the freshly written Fedora image.
+# The hostname is used as the username; authorized_keys is read from the
+# embedded file at /opt/kexec-wipe-authorized_keys.
+configure_fedora_user() {
+    if [ -z "$KEXEC_WIPE_HOSTNAME" ]; then
+        warn "No hostname; skipping user provisioning."
+        return 0
+    fi
+
+    local username
+    username=$(sanitize_username "$KEXEC_WIPE_HOSTNAME")
+    if [ -z "$username" ]; then
+        warn "Hostname '$KEXEC_WIPE_HOSTNAME' produced empty username; skipping user provisioning."
+        return 0
+    fi
+
+    log "Configuring user '$username' (from hostname '$KEXEC_WIPE_HOSTNAME')..."
+
+    local rootpart
+    rootpart=$(first_root_part "$KEXEC_WIPE_DEV")
+
+    if ! wait_for_partition "$rootpart" 15; then
+        warn "Partition $rootpart not found; skipping user provisioning."
+        return 0
+    fi
+
+    local rootfs=""
+    rootfs=$(detect_fs_type "$rootpart") || true
+    if [ -z "$rootfs" ]; then
+        warn "Could not detect filesystem of $rootpart; skipping user provisioning."
+        return 0
+    fi
+
+    case "$rootfs" in
+        xfs)   [ -d /sys/fs/xfs ] || modprobe xfs 2>/dev/null || true ;;
+        btrfs) modprobe btrfs 2>/dev/null || true ;;
+        ext*|*) modprobe "$rootfs" 2>/dev/null || true ;;
+    esac
+
+    local mnt=/mnt/root
+    mkdir -p "$mnt"
+    if ! mount -t "$rootfs" "$rootpart" "$mnt" 2>"$mnt/mouterr"; then
+        warn "Could not mount $rootpart for user provisioning: $(cat "$mnt/mouterr" 2>/dev/null)"
+        return 0
+    fi
+    rm -f "$mnt/mouterr"
+
+    mount -t proc proc "$mnt/proc" 2>/dev/null || true
+    mount -t sysfs sys "$mnt/sys" 2>/dev/null || true
+    mount -t devtmpfs dev "$mnt/dev" 2>/dev/null || true
+
+    local chroot_ok=1
+
+    if ! chroot "$mnt" /bin/bash -c "id '$username'" >/dev/null 2>&1; then
+        if chroot "$mnt" /bin/bash -c "useradd -m -G wheel -c 'kexec-wipe user' '$username'" 2>/dev/null; then
+            log "Created user '$username'."
+        else
+            warn "useradd failed; skipping user provisioning."
+            chroot_ok=0
+        fi
+    else
+        log "User '$username' already exists; skipping creation."
+        # Ensure the user is in the wheel group even if it already existed.
+        chroot "$mnt" /bin/bash -c "usermod -aG wheel '$username'" 2>/dev/null || true
+    fi
+
+    if [ "$chroot_ok" -eq 1 ]; then
+        # Grant passwordless sudo via a drop-in.
+        chroot "$mnt" /bin/bash -c "mkdir -p /etc/sudoers.d && echo '$username ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$username && chmod 0440 /etc/sudoers.d/$username" 2>/dev/null || warn "Could not configure sudo for '$username'."
+
+        # Set up SSH authorized_keys.
+        chroot "$mnt" /bin/bash -c "mkdir -p /home/$username/.ssh && chmod 0700 /home/$username/.ssh" 2>/dev/null || true
+        if [ -f /opt/kexec-wipe-authorized_keys ] && [ -s /opt/kexec-wipe-authorized_keys ]; then
+            cp /opt/kexec-wipe-authorized_keys "$mnt/home/$username/.ssh/authorized_keys"
+            chroot "$mnt" /bin/bash -c "chown $username:$username /home/$username/.ssh/authorized_keys && chmod 0600 /home/$username/.ssh/authorized_keys" 2>/dev/null || true
+            log "Copied authorized_keys for '$username'."
+        else
+            warn "No authorized_keys found; SSH key access not configured."
+        fi
+
+        # Ensure sshd is enabled on boot.
+        chroot "$mnt" /bin/bash -c "systemctl enable sshd" 2>/dev/null || \
+        chroot "$mnt" /bin/bash -c "ln -sf /usr/lib/systemd/system/sshd.service /etc/systemd/system/multi-user.target.wants/sshd.service" 2>/dev/null || \
+        warn "Could not enable sshd; you may need to enable it manually."
+    fi
+
+    sync
+    umount "$mnt/dev" 2>/dev/null || true
+    umount "$mnt/sys" 2>/dev/null || true
+    umount "$mnt/proc" 2>/dev/null || true
+    umount "$mnt" 2>/dev/null || true
+
+    log "User provisioning complete."
+}
+
 install_fedora() {
     log "=== Installing Fedora after wipe ==="
     if [ "$KEXEC_WIPE_INSTALL" != "1" ]; then
@@ -583,8 +692,9 @@ main() {
 
     install_fedora
 
-    # When installing Fedora, boot straight into it instead of rebooting.
+    # When installing Fedora, provision the user and boot straight into it.
     if [ "$KEXEC_WIPE_INSTALL" = "1" ]; then
+        configure_fedora_user
         log "Booting into freshly installed Fedora..."
         sleep 3
         if switch_to_fedora; then

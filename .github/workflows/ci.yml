@@ -194,6 +194,8 @@ jobs:
           gzip -dc /tmp/install-initramfs.cpio.gz | ( cd /tmp/augment && cpio -idm 2>/dev/null )
           mkdir -p /tmp/augment/opt
           cp /tmp/fedora.raw.xz /tmp/augment/opt/fedora.raw.xz
+          echo "test-host" > /tmp/augment/opt/kexec-wipe-hostname
+          : > /tmp/augment/opt/kexec-wipe-authorized_keys
           ( cd /tmp/augment && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > /tmp/install-initramfs.cpio.gz )
           rm -rf /tmp/augment
 

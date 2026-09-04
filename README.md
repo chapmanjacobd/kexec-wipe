@@ -73,7 +73,9 @@ initramfs sanitizes the drive, it:
 4. Detects UEFI vs BIOS and architecture, chroots into the installed OS, and
    runs `grub2-install`/`grub2-mkconfig` so the fresh Fedora boots on bare metal
    on subsequent boots.
-5. `switch_root`s directly into the fresh Fedora in the same boot — no redundant
+5. Provisions a user account named after the source host, copies the source
+   `~/.ssh/authorized_keys` into it, grants sudo, and enables `sshd`.
+6. `switch_root`s directly into the fresh Fedora in the same boot — no redundant
    reboot. (If switch_root fails it falls back to a plain reboot.)
 
 The image URL, release, and checksum are pinned in `lib/kexec.sh` (mirroring the
