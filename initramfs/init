@@ -152,8 +152,8 @@ do_sanitize() {
     # NVMe Sanitize command) we still attempt the real sanitize, but a full
     # failure must not abort the script so CI can exercise the rest of the
     # pipeline (install, switch_root).
-    # Returns 0 on success, 1 on failure, 2 on test-mode-skip (sanitize
-    # was not actually performed).
+    # Returns 0 on success, 1 on failure, 2 on test-mode-skip (sanitize does
+    # not run).
     local ok=1
 
     case "$KEXEC_WIPE_METHOD" in
@@ -344,7 +344,7 @@ write_fedora_image() {
         blockdev --rereadpt "$dev" 2>/dev/null || true
     done
 
-    # Fallback: if partition nodes still did not appear (e.g. emulated NVMe
+    # Fallback: if partition nodes remain absent (e.g. emulated NVMe
     # devices where sysfs rescan is not supported), try partprobe to ask the
     # kernel to re-read and create the partition nodes.
     if ! ls "${dev}p"* >/dev/null 2>&1; then
@@ -353,10 +353,10 @@ write_fedora_image() {
         sleep 1
     fi
 
-    # Fallback: if partition nodes still did not appear (e.g. emulated NVMe
+    # Fallback: if partition nodes remain absent (e.g. emulated NVMe
     # devices where sysfs rescan is not supported), create the partition device
     # nodes manually. The kernel has usually already re-read the partition
-    # table via BLKRRPART; devtmpfs just failed to materialize the nodes. We
+    # table via BLKRRPART; devtmpfs fails to materialize the nodes. We
     # parse fdisk and mknod the partition nodes directly. NVMe minor numbers
     # and partition indices happen to coincide (pN -> minor N), which holds for
     # the first namespace of a single disk.
@@ -394,7 +394,7 @@ first_root_part() {
     echo "${dev}p1"
 }
 
-# Install a bootloader into the written Fedora so it boots on bare metal.
+# Install a bootloader into the Fedora image so it boots on bare metal.
 # We chroot into the image's root and run its own grub2-install, which keeps the
 # image's normal boot config and covers both UEFI and legacy BIOS targets.
 install_bootloader() {
