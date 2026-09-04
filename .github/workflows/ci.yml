@@ -109,9 +109,11 @@ jobs:
         run: |
           KERNEL=$(ls /boot/vmlinuz-* | head -1)
           echo "Using kernel: $KERNEL"
+          sudo cp "$KERNEL" /tmp/vmlinuz
+          sudo chmod 644 /tmp/vmlinuz
 
           timeout 30 qemu-system-x86_64 \
-            -kernel "$KERNEL" \
+            -kernel /tmp/vmlinuz \
             -initrd /tmp/initramfs-docker.cpio.gz \
             -append "kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto" \
             -nographic -no-reboot -m 512 \
