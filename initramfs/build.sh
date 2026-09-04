@@ -186,7 +186,7 @@ stage_fs_modules() {
 }
 
 parse_args() {
-    OUTPUT="${SCRIPT_DIR}/kexec-wipe-initramfs.cpio.gz"
+    OUTPUT="${SCRIPT_DIR}/kexec-wipe-initramfs-$(host_arch).cpio.gz"
 
     while [ $# -gt 0 ]; do
         case "$1" in

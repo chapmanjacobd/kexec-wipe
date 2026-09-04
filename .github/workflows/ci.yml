@@ -251,37 +251,74 @@ jobs:
               --generate-notes \
               --repo "${GITHUB_REPOSITORY}"
 
-  upload-release:
-    name: Upload release assets
-    runs-on: ubuntu-latest
-    needs: release
+  build-initramfs:
+    name: Build initramfs (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [test, integration]
     if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v6
+
+      - name: Verify runner architecture
+        run: |
+          case "${{ matrix.arch }}:$(uname -m)" in
+            x86_64:x86_64|aarch64:aarch64) ;;
+            *) echo "Unexpected runner architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Build initramfs
+        run: ./initramfs/build.sh --output="kexec-wipe-initramfs-${{ matrix.arch }}.cpio.gz"
+
+      - name: Upload initramfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: initramfs-${{ matrix.arch }}
+          path: kexec-wipe-initramfs-${{ matrix.arch }}.cpio.gz
+
+  upload-release:
+    name: Upload release assets
+    runs-on: ubuntu-latest
+    needs: [release, build-initramfs]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v6
+
       - name: Assemble self-contained wipe.sh
         run: ./build.sh
 
-      - name: Build initramfs (with Docker for static nvme-cli)
-        run: ./initramfs/build.sh --output=kexec-wipe-initramfs.cpio.gz
+      - name: Download architecture-specific initramfs artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: initramfs-*
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          X86_ASSET=$(sed -n 's/^INITRAMFS_URL_x86_64="[^"]*\/\([^/]*\)"$/\1/p' lib/kexec.sh)
+          test -n "$X86_ASSET"
+          if [ "$X86_ASSET" != "kexec-wipe-initramfs-x86_64.cpio.gz" ]; then
+            cp "kexec-wipe-initramfs-x86_64.cpio.gz" "$X86_ASSET"
+          fi
+          cp "kexec-wipe-initramfs-x86_64.cpio.gz" "kexec-wipe-initramfs-v0.1.0.cpio.gz"
 
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          INITRAMFS_VERSION=$(grep 'INITRAMFS_VERSION=' lib/kexec.sh | head -1 | cut -d'"' -f2)
-          INITRAMFS_ASSET="kexec-wipe-initramfs-${INITRAMFS_VERSION}.cpio.gz"
-
-          cp kexec-wipe-initramfs.cpio.gz "${INITRAMFS_ASSET}"
 
           gh release upload "${VERSION}" \
             wipe.sh \
-            "${INITRAMFS_ASSET}" \
+            kexec-wipe-initramfs-*.cpio.gz \
             --clobber \
             --repo "${GITHUB_REPOSITORY}"
-
-

@@ -396,13 +396,10 @@ do_sanitize() {
 #!/bin/bash
 # kexec-based approach for sanitizing the root device
 
-# Version of the prebuilt initramfs archive (bumped only when content changes).
-# INITRAMFS_RELEASE is the GitHub release tag the archive is uploaded to.
-INITRAMFS_VERSION="v0.1.0"
-INITRAMFS_RELEASE="v0.1.8"
-INITRAMFS_SHA256="e7601a597965d312c097829d66441ca4237846e04bef31b8416555d3dff4ae95"
-INITRAMFS_BASE_URL="https://github.com/chapmanjacobd/kexec-wipe/releases/download"
-INITRAMFS_FILE="kexec-wipe-initramfs-${INITRAMFS_VERSION}.cpio.gz"
+# Explicit architecture-specific initramfs assets. Update both URLs when the
+# initramfs content or release changes.
+INITRAMFS_URL_x86_64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.1.8/kexec-wipe-initramfs-v0.1.0.cpio.gz"
+INITRAMFS_URL_aarch64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.1.8/kexec-wipe-initramfs-v0.1.0-aarch64.cpio.gz"
 
 # Pinned Fedora Cloud Base raw image for --install-fedora.
 # Bumped by the maintainer per Fedora release.
@@ -412,18 +409,37 @@ INSTALL_FEDORA_BASE="https://download.fedoraproject.org/pub/fedora/linux/release
 INSTALL_FEDORA_SHA256_x86_64="7e4fb73907abdc761d226ddaf3263bdfca62a0b0bfb5f0798545a9981fdd1953"
 INSTALL_FEDORA_SHA256_aarch64="090d3cb07b266535ff81603d12cd143626caedc51be46977fef5f9161d5117b3"
 
+platform_arch() {
+    case "$(uname -m)" in
+        aarch64|arm64) echo "aarch64" ;;
+        x86_64|amd64) echo "x86_64" ;;
+        *) echo "x86_64" ;;
+    esac
+}
+
+initramfs_file() {
+    case "$(platform_arch)" in
+        aarch64) echo "kexec-wipe-initramfs-v0.1.0-aarch64.cpio.gz" ;;
+        *) echo "kexec-wipe-initramfs-v0.1.0.cpio.gz" ;;
+    esac
+}
+
+initramfs_url() {
+    case "$(platform_arch)" in
+        aarch64) echo "$INITRAMFS_URL_aarch64" ;;
+        *) echo "$INITRAMFS_URL_x86_64" ;;
+    esac
+}
+
 fedora_raw_url() {
     local arch
-    case "$(uname -m)" in
-        aarch64|arm64) arch="aarch64" ;;
-        *) arch="x86_64" ;;
-    esac
+    arch=$(platform_arch)
     echo "${INSTALL_FEDORA_BASE}/${arch}/images/Fedora-Cloud-Base-AmazonEC2-${INSTALL_FEDORA_RELEASE}-${INSTALL_FEDORA_CURRENT}.${arch}.raw.xz"
 }
 
 fedora_raw_sha256() {
-    case "$(uname -m)" in
-        aarch64|arm64) echo "$INSTALL_FEDORA_SHA256_aarch64" ;;
+    case "$(platform_arch)" in
+        aarch64) echo "$INSTALL_FEDORA_SHA256_aarch64" ;;
         *) echo "$INSTALL_FEDORA_SHA256_x86_64" ;;
     esac
 }
@@ -435,31 +451,35 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
     fi
 }
 
+download_url() {
+    local url="$1"
+    local dest="$2"
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$url" -o "$dest"
+    elif command -v wget &>/dev/null; then
+        wget -q "$url" -O "$dest"
+    else
+        fatal "Neither curl nor wget is available to download files."
+    fi
+}
+
 download_initramfs() {
     local dest="$1"
-    local url="${INITRAMFS_BASE_URL}/${INITRAMFS_RELEASE}/${INITRAMFS_FILE}"
+    local arch
+    arch=$(platform_arch)
+    local url
+    url=$(initramfs_url)
 
     info "Downloading initramfs from ${url}..."
 
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$dest" || fatal "Failed to download initramfs."
-    elif command -v wget &>/dev/null; then
-        wget -q "$url" -O "$dest" || fatal "Failed to download initramfs."
-    else
-        fatal "Neither curl nor wget is available to download the initramfs."
-    fi
+    download_url "$url" "$dest" || fatal "Failed to download ${arch} initramfs."
 
     if [ ! -s "$dest" ]; then
         fatal "Downloaded initramfs is empty."
     fi
 
-    local got
-    got=$(sha256sum "$dest" | awk '{print $1}')
-    if [ "$got" != "$INITRAMFS_SHA256" ]; then
-        fatal "Initramfs checksum mismatch (got $got, expected $INITRAMFS_SHA256)."
-    fi
-
-    success "Initramfs downloaded and verified ($(bytes_to_human "$(stat -c%s "$dest")"))."
+    success "Initramfs downloaded for ${arch} ($(bytes_to_human "$(stat -c%s "$dest")"))."
 }
 
 # Download and verify the Fedora Cloud Base raw image on the host.
@@ -582,7 +602,7 @@ do_kexec_wipe() {
     check_kexec
 
     make_tmpdir
-    local initramfs_path="${WIPE_TMPDIR}/${INITRAMFS_FILE}"
+    local initramfs_path="${WIPE_TMPDIR}/$(initramfs_file)"
 
     download_initramfs "$initramfs_path"
 

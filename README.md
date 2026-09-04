@@ -78,8 +78,8 @@ initramfs sanitizes the drive, it:
 6. `switch_root`s directly into the fresh Fedora in the same boot — no redundant
    reboot. (If switch_root fails it falls back to a plain reboot.)
 
-The image URL, release, and checksum are pinned in `lib/kexec.sh` (mirroring the
-`INITRAMFS_VERSION` convention) and bumped by the maintainer per Fedora release.
+The image URL, release, and checksum are pinned in `lib/kexec.sh` and bumped by
+the maintainer per Fedora release.
 
 **Caveat:** Fedora Cloud Base images are built for virtualized/cloud environments
 and carry cloud-init assumptions. Even with a bootloader installed, first boot on
@@ -88,10 +88,14 @@ the write and bootloader correct; it does not guarantee cloud-init parity on met
 
 ## Architecture Support
 
-x86_64 and aarch64 are supported. The initramfs build picks the correct busybox,
-Fedora image, GRUB target, and kernel candidates per architecture. On aarch64,
-where Fedora ships Unified Kernel Images (UKI), kexec attempts a direct UKI load
-and falls back to extracting the embedded initrd (`objcopy`) if needed.
+x86_64 and aarch64 are supported. Each architecture uses a separate initramfs
+asset because its busybox, nvme-cli, libraries, and kernel modules are
+architecture-specific. The initramfs build picks the correct busybox and the
+release workflow builds the assets on native x86_64 and aarch64 runners.
+The Fedora image, GRUB target, and kernel candidates are also selected per
+architecture. On aarch64, where Fedora ships Unified Kernel Images (UKI), kexec
+attempts a direct UKI load and falls back to extracting the embedded initrd
+(`objcopy`) if needed.
 
 ## Requirements
 
@@ -130,11 +134,14 @@ lib/main_body.sh   - Arg parsing, usage, main flow
 
 ### Releasing
 
-1. Bump `INITRAMFS_VERSION` (only when the initramfs content changes) and set
-   `INITRAMFS_RELEASE` to the tag you will release under, in `lib/kexec.sh`
-2. Build initramfs: `./initramfs/build.sh`
-3. Build wipe.sh: `./build.sh`
-4. Create a GitHub release and upload the initramfs as an asset
+1. Update the explicit architecture-specific initramfs URLs in
+   `lib/kexec.sh` when the content or release changes.
+2. Build wipe.sh: `./build.sh`
+3. Push a version tag; CI builds native x86_64 and aarch64 initramfs assets and
+   uploads them to the GitHub release.
+
+Initramfs downloads use the pinned HTTPS URLs in `lib/kexec.sh`; they are not
+checksum-verified.
 
 ## Safety
 
