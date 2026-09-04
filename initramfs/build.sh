@@ -300,7 +300,7 @@ build_initramfs() {
             && meson install -C .build \
             && git clone --depth 1 --branch v2.16 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
             && cd /tmp/nvme-cli \
-            && meson setup .build --buildtype=release --default-library=static -Dprefer_static=true -Ddocs=false \
+            && meson setup .build --buildtype=release --default-library=static -Dprefer_static=true -Dc_link_args=-static -Ddocs=false \
             && meson compile -C .build nvme \
             && cp .build/nvme /tmp/nvme
         ' && {
