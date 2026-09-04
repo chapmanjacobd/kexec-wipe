@@ -282,6 +282,9 @@ fedora_raw_sha256() {
 
 # Bring up the first NIC using DHCP so we can download the Fedora image.
 setup_network() {
+    # Best-effort: load virtio-net if available (needed for QEMU virtio-net-pci).
+    modprobe virtio_net 2>/dev/null || true
+
     # Ensure a minimal udhcpc script exists (busybox drops to /etc/udhcpc.script).
     if [ ! -x /etc/udhcpc.script ]; then
         cat > /etc/udhcpc.script <<'EOF'
