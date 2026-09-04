@@ -5,7 +5,7 @@ usage() {
 kexec-wipe - Securely wipe NVMe drives
 
 Usage:
-  curl -sL https://raw.githubusercontent.com/xk/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
+  curl -sL https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
   sudo ./wipe.sh /dev/nvme0n1 [OPTIONS]
 
 Arguments:

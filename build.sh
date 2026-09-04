@@ -39,7 +39,7 @@ done
 # kexec-wipe - Securely wipe NVMe drives
 #
 # Usage:
-#   curl -sL https://raw.githubusercontent.com/xk/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
+#   curl -sL https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
 #
 # This file is assembled by build.sh from lib/*.sh modules.
 # For development, edit the files in lib/ and run ./build.sh.

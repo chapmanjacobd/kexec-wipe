@@ -2,7 +2,7 @@
 # kexec-based approach for sanitizing the root device
 
 INITRAMFS_VERSION="v0.1.0"
-INITRAMFS_BASE_URL="https://github.com/xk/kexec-wipe/releases/download"
+INITRAMFS_BASE_URL="https://github.com/chapmanjacobd/kexec-wipe/releases/download"
 INITRAMFS_FILE="kexec-wipe-initramfs-${INITRAMFS_VERSION}.cpio.gz"
 
 # Pinned Fedora Cloud Base raw image used for --install-fedora.
