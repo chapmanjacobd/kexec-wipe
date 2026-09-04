@@ -1,10 +1,12 @@
 #!/bin/bash
 # kexec-based approach for sanitizing the root device
 
-# Explicit architecture-specific initramfs assets. Update both URLs when the
-# initramfs content or release changes.
-INITRAMFS_URL_x86_64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.1.8/kexec-wipe-initramfs-v0.1.0.cpio.gz"
-INITRAMFS_URL_aarch64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.1.8/kexec-wipe-initramfs-v0.1.0-aarch64.cpio.gz"
+# Explicit architecture-specific initramfs assets. Update the URLs and
+# checksums together when the initramfs content or release changes.
+INITRAMFS_URL_x86_64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.0/kexec-wipe-initramfs-x86_64.cpio.gz"
+INITRAMFS_URL_aarch64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.0/kexec-wipe-initramfs-aarch64.cpio.gz"
+INITRAMFS_SHA256_x86_64="982930de883489de89c111749b2957f07724bbf8069877602435016c5def0833"
+INITRAMFS_SHA256_aarch64="5d72c86a82370c21fa4fe28514b7bebb8323ba7571dc575dff53142043b06143"
 
 # Pinned Fedora Cloud Base raw image for --install-fedora.
 # Bumped by the maintainer per Fedora release.
@@ -24,8 +26,8 @@ platform_arch() {
 
 initramfs_file() {
     case "$(platform_arch)" in
-        aarch64) echo "kexec-wipe-initramfs-v0.1.0-aarch64.cpio.gz" ;;
-        *) echo "kexec-wipe-initramfs-v0.1.0.cpio.gz" ;;
+        aarch64) echo "kexec-wipe-initramfs-aarch64.cpio.gz" ;;
+        *) echo "kexec-wipe-initramfs-x86_64.cpio.gz" ;;
     esac
 }
 
@@ -33,6 +35,13 @@ initramfs_url() {
     case "$(platform_arch)" in
         aarch64) echo "$INITRAMFS_URL_aarch64" ;;
         *) echo "$INITRAMFS_URL_x86_64" ;;
+    esac
+}
+
+initramfs_sha256() {
+    case "$(platform_arch)" in
+        aarch64) echo "$INITRAMFS_SHA256_aarch64" ;;
+        *) echo "$INITRAMFS_SHA256_x86_64" ;;
     esac
 }
 
@@ -75,6 +84,8 @@ download_initramfs() {
     arch=$(platform_arch)
     local url
     url=$(initramfs_url)
+    local expected
+    expected=$(initramfs_sha256)
 
     info "Downloading initramfs from ${url}..."
 
@@ -84,7 +95,13 @@ download_initramfs() {
         fatal "Downloaded initramfs is empty."
     fi
 
-    success "Initramfs downloaded for ${arch} ($(bytes_to_human "$(stat -c%s "$dest")"))."
+    local got
+    got=$(sha256sum "$dest" | awk '{print $1}')
+    if [ "$got" != "$expected" ]; then
+        fatal "Initramfs checksum mismatch for ${arch} (got $got, expected $expected)."
+    fi
+
+    success "Initramfs downloaded and verified for ${arch} ($(bytes_to_human "$(stat -c%s "$dest")"))."
 }
 
 # Download and verify the Fedora Cloud Base raw image on the host.

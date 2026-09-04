@@ -134,14 +134,14 @@ lib/main_body.sh   - Arg parsing, usage, main flow
 
 ### Releasing
 
-1. Update the explicit architecture-specific initramfs URLs in
-   `lib/kexec.sh` when the content or release changes.
+1. Update the explicit architecture-specific initramfs URLs and SHA256 checksums
+   in `lib/kexec.sh` when the content or release changes.
 2. Build wipe.sh: `./build.sh`
 3. Push a version tag; CI builds native x86_64 and aarch64 initramfs assets and
    uploads them to the GitHub release.
 
-Initramfs downloads use the pinned HTTPS URLs in `lib/kexec.sh`; they are not
-checksum-verified.
+Initramfs downloads use the pinned HTTPS URLs and SHA256 checksums in
+`lib/kexec.sh`.
 
 ## Safety
 

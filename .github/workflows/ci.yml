@@ -309,7 +309,6 @@ jobs:
           if [ "$X86_ASSET" != "kexec-wipe-initramfs-x86_64.cpio.gz" ]; then
             cp "kexec-wipe-initramfs-x86_64.cpio.gz" "$X86_ASSET"
           fi
-          cp "kexec-wipe-initramfs-x86_64.cpio.gz" "kexec-wipe-initramfs-v0.1.0.cpio.gz"
 
       - name: Upload release assets
         env:
