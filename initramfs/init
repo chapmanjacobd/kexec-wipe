@@ -478,4 +478,4 @@ main() {
     cleanup_and_reboot
 }
 
-exec main
+main

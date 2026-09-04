@@ -322,7 +322,7 @@ build_initramfs() {
             apk add --no-cache git gcc make musl-dev linux-headers json-c-dev openssl-dev python3 meson \
             && git clone --depth 1 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
             && cd /tmp/nvme-cli \
-            && make STATIC=1 \
+            && make static \
             && cp nvme /output/bin/nvme \
             && chown -R $HOST_UID:$HOST_GID /output
         ' || {
