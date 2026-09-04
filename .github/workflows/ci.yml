@@ -218,7 +218,7 @@ jobs:
           # freshly written root, which prints the marker before powering off.
           grep -q "Fedora installation complete" /tmp/install-serial.log
           grep -q "KEXEC-WIPE-TEST-INSTALL-BOOT-OK" /tmp/install-serial.log
-          grep -q "Drive /dev/nvme0n1 has been sanitized" /tmp/install-serial.log
+          grep -q "Sanitize was not performed" /tmp/install-serial.log
           echo "QEMU Fedora install test passed."
 
   release:

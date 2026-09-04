@@ -148,6 +148,8 @@ do_sanitize() {
     # NVMe Sanitize command) we still attempt the real sanitize, but a full
     # failure must not abort the script so CI can exercise the rest of the
     # pipeline (install, switch_root).
+    # Returns 0 on success, 1 on failure, 2 on test-mode-skip (sanitize
+    # was not actually performed).
     local ok=1
 
     case "$KEXEC_WIPE_METHOD" in
@@ -174,32 +176,24 @@ do_sanitize() {
     if [ "$ok" -eq 0 ]; then
         if [ "$KEXEC_WIPE_TEST" = "1" ]; then
             log "TEST MODE: sanitize failed but continuing (emulated device cannot sanitize)."
-            return 0
+            return 2
         fi
         fatal_reboot "All sanitize methods failed."
     fi
 }
 
 wait_for_completion() {
+    local sanitize_status="${1:-0}"
     local timeout=7200
     local elapsed=0
     local interval=5
 
-    log "Waiting for sanitize to complete (timeout: ${timeout}s)..."
-
-    # In test mode the wipe already failed (emulated device), so there is no
-    # sanitize to wait for; confirm nothing is in progress and move on.
-    if [ "$KEXEC_WIPE_TEST" = "1" ]; then
-        local t_status
-        t_status=$(nvme sanitize -H "$KEXEC_WIPE_DEV" -o xml 2>/dev/null) || true
-        local t_stat
-        t_stat=$(echo "$t_status" | sed -n 's/.*<stat>\(.*\)<\/stat>.*/\1/p' | head -1) || true
-        case "$t_stat" in
-            0x02) log "Previous sanitize result: success." ;;
-            *)    log "No sanitize in progress (emulated device); continuing." ;;
-        esac
+    # If do_sanitize returned 2 (test-mode-skip), nothing to wait for.
+    if [ "$sanitize_status" -eq 2 ]; then
         return 0
     fi
+
+    log "Waiting for sanitize to complete (timeout: ${timeout}s)..."
 
     while [ "$elapsed" -lt "$timeout" ]; do
         local status
@@ -312,7 +306,40 @@ write_fedora_image() {
 
     sync
     sleep 1
-    blockdev --rereadpt "$dev" 2>/dev/null || partprobe "$dev" 2>/dev/null || true
+
+    # Force the kernel to re-read the partition table. After writing a raw
+    # image, the in-memory partition table is stale. BLKRRPART triggers a
+    # rescan and uevent generation so devtmpfs can create the partition nodes.
+    local devname
+    devname=$(basename "$dev")
+
+    # Remove stale partition nodes first (if any).
+    for old_part in "${dev}"p*; do
+        [ -b "$old_part" ] && rm -f "$old_part" 2>/dev/null || true
+    done
+
+    blockdev --rereadpt "$dev" 2>/dev/null || true
+
+    # Also trigger a device-level rescan via sysfs (NVMe specific).
+    if [ -d "/sys/block/$devname/device" ]; then
+        echo 1 > "/sys/block/$devname/device/rescan" 2>/dev/null || true
+    fi
+
+    # Wait for partition nodes to appear (up to 10s).
+    log "Waiting for partition nodes to appear..."
+    local waited=0
+    while [ "$waited" -lt 10 ]; do
+        # Check if any partition of $dev exists.
+        if ls "${dev}p"* >/dev/null 2>&1; then
+            log "Partition table re-read complete."
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        # Retry the re-read on each iteration; sometimes the first attempt races.
+        blockdev --rereadpt "$dev" 2>/dev/null || true
+    done
+
     log "Fedora image written."
 }
 
@@ -340,7 +367,7 @@ install_bootloader() {
     local rootpart
     rootpart=$(first_root_part "$dev")
 
-    if ! wait_for_partition "$rootpart" 5; then
+    if ! wait_for_partition "$rootpart" 15; then
         warn "Partition $rootpart not found; skipping bootloader install."
         return 0
     fi
@@ -507,11 +534,18 @@ main() {
 
     log "Sanitize method: $KEXEC_WIPE_METHOD"
 
-    do_sanitize
-    wait_for_completion
+    local sanitize_rc=0
+    do_sanitize || sanitize_rc=$?
+    wait_for_completion "$sanitize_rc"
 
-    echo ""
-    log "Drive $KEXEC_WIPE_DEV has been sanitized."
+    if [ "$sanitize_rc" -eq 2 ]; then
+        log "Sanitize was not performed (test/emulated device)."
+    elif [ "$sanitize_rc" -eq 0 ]; then
+        echo ""
+        log "Drive $KEXEC_WIPE_DEV has been sanitized."
+    else
+        fatal_reboot "Sanitize failed."
+    fi
 
     install_fedora
 

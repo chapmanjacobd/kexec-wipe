@@ -187,7 +187,7 @@ check() {
     local ok=1
     grep -q "Fedora installation complete" "$OUT_DIR/install-serial.log" || ok=0
     grep -q "KEXEC-WIPE-TEST-INSTALL-BOOT-OK" "$OUT_DIR/install-serial.log" || ok=0
-    grep -q "Drive /dev/nvme0n1 has been sanitized" "$OUT_DIR/install-serial.log" || ok=0
+    grep -q "Sanitize was not performed" "$OUT_DIR/install-serial.log" || ok=0
     if [ "$ok" -eq 1 ]; then
         echo "PASS: full install pipeline verified."
     else
