@@ -1,5 +1,5 @@
 #!/bin/bash
-# NVMe sanitize operations with crypto-erase fallback to block-erase
+# NVMe sanitize operations with crypto-erase, block-erase, and overwrite
 
 SANITIZE_METHOD=""
 

@@ -40,7 +40,7 @@ parse_args() {
     done
     [ -n "$INITRD" ] || usage
     if [ -z "$KERNEL" ]; then
-        # Prefer the running kernel, whose modules were staged into the initramfs.
+        # Prefer the running kernel, whose modules are staged into the initramfs.
         KERNEL="/boot/vmlinuz-$(uname -r)"
         [ -f "$KERNEL" ] || KERNEL="$(ls /boot/vmlinuz-* | head -1)"
     fi

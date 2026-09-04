@@ -24,7 +24,7 @@ BUSYBOX_URL="https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/bus
 USE_DOCKER=1
 BUILD_DIR=""
 
-# Host architecture (normalized). Used to pick the right binaries.
+# Host architecture (normalized).
 host_arch() {
     local a
     a=$(uname -m)
@@ -36,7 +36,7 @@ host_arch() {
 
 # Obtain a busybox static binary matching the target architecture. The official
 # prebuilt static binaries only exist for x86_64, so other architectures (e.g.
-# aarch64) are built from Alpine via Docker, falling back to host busybox.
+# aarch64) build from Alpine via Docker, falling back to host busybox.
 install_busybox() {
     echo "Installing busybox..."
 
@@ -68,7 +68,6 @@ install_busybox() {
 }
 
 # Copy a dynamically-linked binary plus its shared libraries into the build dir.
-# Reuses the ldd-parsing approach also used for nvme-cli.
 # Copy a shared library into the build, preserving the soname symlink that the
 # dynamic loader needs. `resolved` is the soname path from ldd (e.g.
 # /usr/lib64/libcurl.so.4); we copy the real versioned file and add a symlink
@@ -121,20 +120,16 @@ copy_bin_with_libs() {
     return 0
 }
 
-# Copy the Fedora install support tools (network, verification, decompression,
-# partitioning, grub chroot helpers). When Docker is available these come from
-# Alpine so HTTPS + partprobe are fully functional; otherwise best-effort from
-# the host.
-install_install_tools() {
-    mkdir -p "$BUILD_DIR/usr/bin" "$BUILD_DIR/etc"
+# Copy disk tools (xz, partprobe, blockdev) needed by the Fedora install path.
+install_disk_tools() {
+    mkdir -p "$BUILD_DIR/usr/bin"
 
-    # CA certificates so HTTPS downloads verify.
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
-        echo "Bundling network/install tools via Docker..."
+        echo "Bundling disk tools via Docker..."
         docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
-            apk add --no-cache curl xz iproute2 parted util-linux-misc >/dev/null 2>&1
-            mkdir -p /output/bin /output/usr/bin /output/lib /output/etc
-            for b in curl xz ip partprobe blockdev; do
+            apk add --no-cache xz parted util-linux-misc >/dev/null 2>&1
+            mkdir -p /output/bin /output/usr/bin /output/lib
+            for b in xz partprobe blockdev; do
                 p=$(command -v $b 2>/dev/null) || continue
                 if [ "${p#/usr/}" != "$p" ]; then dest=/output/usr/bin; else dest=/output/bin; fi
                 cp -L "$p" "$dest/$(basename $p)"
@@ -145,39 +140,30 @@ install_install_tools() {
                     esac
                 done
             done
-            cp -rL /etc/ssl /output/etc/ 2>/dev/null || true
-            cp /etc/ssl/certs/ca-certificates.crt /output/etc/ 2>/dev/null || true
             chown -R $HOST_UID:$HOST_GID /output
         ' || true
-        chmod +x "$BUILD_DIR"/bin/curl "$BUILD_DIR"/bin/xz "$BUILD_DIR"/bin/ip \
-            "$BUILD_DIR"/bin/partprobe "$BUILD_DIR"/bin/blockdev \
-            "$BUILD_DIR"/usr/bin/curl "$BUILD_DIR"/usr/bin/xz "$BUILD_DIR"/usr/bin/ip \
-            "$BUILD_DIR"/usr/bin/partprobe "$BUILD_DIR"/usr/bin/blockdev 2>/dev/null || true
+        chmod +x "$BUILD_DIR"/bin/xz "$BUILD_DIR"/bin/partprobe "$BUILD_DIR"/bin/blockdev \
+            "$BUILD_DIR"/usr/bin/xz "$BUILD_DIR"/usr/bin/partprobe "$BUILD_DIR"/usr/bin/blockdev 2>/dev/null || true
     fi
 
-    # Best-effort fallback from the host (only if not already copied via Docker).
-    for b in curl wget xz ip partprobe blockdev; do
+    # Best-effort fallback from the host (skip if already present).
+    for b in xz partprobe blockdev; do
         if [ -e "$BUILD_DIR/bin/$b" ] || [ -e "$BUILD_DIR/usr/bin/$b" ]; then
             continue
         fi
         if command -v "$b" >/dev/null 2>&1; then
             case "$b" in
-                curl) copy_bin_with_libs "$(command -v curl)" "$BUILD_DIR/bin/curl" || true ;;
-                wget) copy_bin_with_libs "$(command -v wget)" "$BUILD_DIR/bin/wget" || true ;;
-                xz)   copy_bin_with_libs "$(command -v xz)" "$BUILD_DIR/bin/xz" || true ;;
-                ip)   copy_bin_with_libs "$(command -v ip)" "$BUILD_DIR/bin/ip" || true ;;
+                xz)        copy_bin_with_libs "$(command -v xz)" "$BUILD_DIR/bin/xz" || true ;;
                 partprobe) copy_bin_with_libs "$(command -v partprobe)" "$BUILD_DIR/bin/partprobe" || true ;;
-                blockdev) copy_bin_with_libs "$(command -v blockdev)" "$BUILD_DIR/bin/blockdev" || true ;;
+                blockdev)  copy_bin_with_libs "$(command -v blockdev)" "$BUILD_DIR/bin/blockdev" || true ;;
             esac
         fi
     done
-    [ -d /etc/ssl ] && cp -rL /etc/ssl "$BUILD_DIR/etc/" 2>/dev/null || true
-    [ -f /etc/ca-certificates.crt ] && cp /etc/ca-certificates.crt "$BUILD_DIR/etc/" 2>/dev/null || true
 }
 
 # Stage kernel filesystem modules (xfs/btrfs/ext4) so the chroot bootloader step
-# can mount the written Fedora image. Modules are kernel-version-specific, so we
-# copy the build host's matching modules as a reasonable default.
+# can mount the written Fedora image. Modules are kernel-version-specific, so
+# the build host's matching modules are copied as a reasonable default.
 stage_fs_modules() {
     local kver
     kver=$(uname -r)
@@ -252,7 +238,7 @@ copy_nvme_with_libs() {
     # Copy the binary
     cp "$nvme_bin" "$BUILD_DIR/bin/nvme"
 
-    # Copy required shared libraries
+    # Copy shared libraries.
     local lib_dir="$BUILD_DIR/lib"
     mkdir -p "$lib_dir"
 
@@ -310,7 +296,7 @@ build_initramfs() {
                reboot poweroff halt dmesg hexdump head tail wc find df free \
                lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
                lsmod insmod rmmod modinfo \
-               udhcpc ip xz unlzma lzcat modprobe awk switch_root timeout \
+               xz unlzma lzcat modprobe awk switch_root timeout \
                cut sort basename dirname expr printf seq stat touch; do
         ln -sf busybox "$cmd"
     done
@@ -320,8 +306,8 @@ build_initramfs() {
     mkdir -p "$BUILD_DIR/sbin"
     ln -sf ../bin/busybox "$BUILD_DIR/sbin/modprobe"
 
-    # Install Fedora network/install support tools (curl/xz/ip/partprobe/CA certs)
-    install_install_tools
+    # Install Fedora install support tools (xz/partprobe/blockdev)
+    install_disk_tools
 
     # Stage filesystem kernel modules for the chroot bootloader step.
     stage_fs_modules

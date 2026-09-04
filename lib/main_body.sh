@@ -13,15 +13,14 @@ Arguments:
 
 Options:
   --method=METHOD       Sanitize method (default: auto)
-                        auto       - Try crypto-erase, fallback to block-erase
+                        auto       - Try crypto-erase, then block-erase
                         crypto     - Crypto-erase only (fastest for SED drives)
                         block      - Block-erase only
                         overwrite  - Overwrite (slowest, most thorough)
   --dry-run             Show what would be done without making changes
-  --install-fedora      After sanitizing the root disk via kexec, download and
-                        write a Fedora Cloud Base image and install a bootloader
-                        so it can boot. Requires the root-disk (kexec) path and
-                        network access in the initramfs.
+  --install-fedora      After sanitizing the root disk via kexec, write a
+                        Fedora Cloud Base image and install a bootloader so it
+                        can boot. Requires the root-disk (kexec) path.
   --help                Show this help message
 
 Examples:

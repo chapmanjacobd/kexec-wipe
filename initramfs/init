@@ -12,10 +12,6 @@ set -e
 # Shared libraries for dynamically-linked binaries live in /lib
 export LD_LIBRARY_PATH=/lib
 
-# CA bundle location for HTTPS downloads (bundled at initramfs build time).
-export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
-
 log() {
     echo "[kexec-wipe] $*"
 }
@@ -59,11 +55,6 @@ parse_cmdline() {
     KEXEC_WIPE_TEST=0
     # Optional overrides for the Fedora install source (used by tests). When
     # empty, the pinned release/checksum above is used.
-    KEXEC_WIPE_FEDORA_URL=""
-    KEXEC_WIPE_FEDORA_SHA256=""
-    # Path of a pre-embedded Fedora image inside this initramfs (set by wipe.sh
-    # when it embeds the image before kexec). When present, no network/curl is
-    # needed inside the initramfs.
     KEXEC_WIPE_FEDORA_IMAGE=""
 
     for arg in $cmdline; do
@@ -79,12 +70,6 @@ parse_cmdline() {
                 ;;
             kexec_wipe_test=*)
                 KEXEC_WIPE_TEST="${arg#kexec_wipe_test=}"
-                ;;
-            kexec_wipe_fedora_url=*)
-                KEXEC_WIPE_FEDORA_URL="${arg#kexec_wipe_fedora_url=}"
-                ;;
-            kexec_wipe_fedora_sha256=*)
-                KEXEC_WIPE_FEDORA_SHA256="${arg#kexec_wipe_fedora_sha256=}"
                 ;;
             kexec_wipe_fedora_image=*)
                 KEXEC_WIPE_FEDORA_IMAGE="${arg#kexec_wipe_fedora_image=}"
@@ -268,127 +253,11 @@ wait_for_completion() {
 }
 
 # --- Optional: install Fedora after wipe --------------------------------
-# Pinned Fedora Cloud Base raw image (bumped by the maintainer in wipe.sh's
-# lib/kexec.sh; mirrored here so the initramfs is self-contained for install).
-INSTALL_FEDORA_RELEASE="44"
-INSTALL_FEDORA_CURRENT="1.7"
-INSTALL_FEDORA_BASE="https://download.fedoraproject.org/pub/fedora/linux/releases/${INSTALL_FEDORA_RELEASE}/Cloud"
-
 arch_name() {
     case "$(uname -m)" in
         aarch64|arm64) echo "aarch64" ;;
         *) echo "x86_64" ;;
     esac
-}
-
-fedora_raw_url() {
-    local arch
-    arch=$(arch_name)
-    echo "${INSTALL_FEDORA_BASE}/${arch}/images/Fedora-Cloud-Base-AmazonEC2-${INSTALL_FEDORA_RELEASE}-${INSTALL_FEDORA_CURRENT}.${arch}.raw.xz"
-}
-
-# Signed/known checksum per arch. Kept in sync with lib/kexec.sh.
-fedora_raw_sha256() {
-    local arch
-    arch=$(arch_name)
-    case "$arch" in
-        aarch64) echo "090d3cb07b266535ff81603d12cd143626caedc51be46977fef5f9161d5117b3" ;;
-        *)       echo "7e4fb73907abdc761d226ddaf3263bdfca62a0b0bfb5f0798545a9981fdd1953" ;;
-    esac
-}
-
-# Bring up the first NIC using DHCP so we can download the Fedora image.
-setup_network() {
-    # Best-effort: load virtio-net if available (needed for QEMU virtio-net-pci).
-    # The NVMe driver load (check_device) proves modprobe works; do the same here.
-    modprobe virtio_net 2>&1 | sed 's/^/    modprobe: /'
-    sleep 1
-
-    # Ensure a minimal udhcpc script exists (busybox drops to /etc/udhcpc.script).
-    if [ ! -x /etc/udhcpc.script ]; then
-        cat > /etc/udhcpc.script <<'EOF'
-#!/bin/sh
-[ "$1" = "bound" ] || exit 0
-[ -n "$ip" ] || exit 0
-# Busybox udhcpc exposes the netmask as a dotted quad in $subnet. Convert it to
-# a CIDR prefix (255.255.255.0 -> 24). Fall back to 24 if unset/unparsable.
-prefix=24
-if [ -n "$subnet" ]; then
-    prefix=0
-    for o in $(echo "$subnet" | tr '.' ' '); do
-        case "$o" in 255) prefix=$((prefix + 8)) ;;
-                     254) prefix=$((prefix + 7)) ;;
-                     252) prefix=$((prefix + 6)) ;;
-                     248) prefix=$((prefix + 5)) ;;
-                     240) prefix=$((prefix + 4)) ;;
-                     224) prefix=$((prefix + 3)) ;;
-                     192) prefix=$((prefix + 2)) ;;
-                     128) prefix=$((prefix + 1)) ;;
-                     0)   : ;;
-                     *)   prefix=24; break ;;
-        esac
-    done
-fi
-ip addr add "$ip/$prefix" dev "$interface"
-[ -n "$router" ] && ip route add default via "$router" dev "$interface" 2>/dev/null
-[ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
-exit 0
-EOF
-        chmod +x /etc/udhcpc.script
-    fi
-
-    # Prefer an existing DHCP lease (e.g. early network), otherwise run udhcpc.
-    if ! ip addr show 2>/dev/null | grep -q "inet "; then
-        log "Starting DHCP on all interfaces..."
-        log "Network interfaces: $(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | tr '\n' ' ')"
-        for iface in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
-            ip link set "$iface" up
-            log "  Running udhcpc on $iface..."
-            timeout 10 udhcpc -i "$iface" -q -n -s /etc/udhcpc.script
-            if ip addr show dev "$iface" 2>/dev/null | grep -q "inet "; then
-                log "  Got an address via DHCP on $iface."
-                break
-            fi
-            log "  No address yet on $iface; trying next."
-        done
-    fi
-
-    if ip addr show 2>/dev/null | grep -q "inet "; then
-        log "Network is up."
-        return 0
-    fi
-
-    ip addr show 2>&1 | sed 's/^/    addr: /'
-    fatal "Could not bring up networking (needed to install Fedora)."
-}
-
-download_fedora_image() {
-    local url="$1"
-    local expected="$2"
-    local dest="$3"
-
-    log "Downloading Fedora Cloud Base from: $url"
-
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 "$url" -o "$dest" || fatal "Failed to download Fedora image."
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$dest" "$url" || fatal "Failed to download Fedora image."
-    else
-        fatal "Neither curl nor wget is available to download the Fedora image."
-    fi
-
-    if [ ! -s "$dest" ]; then
-        fatal "Downloaded Fedora image is empty."
-    fi
-
-    local got
-    got=$(sha256sum "$dest" | awk '{print $1}')
-
-    if [ "$got" != "$expected" ]; then
-        fatal "Fedora image checksum mismatch (got $got, expected $expected)."
-    fi
-
-    log "Fedora image downloaded and verified."
 }
 
 # Decompress the raw image and write it to the device. We never write the
@@ -511,34 +380,12 @@ install_fedora() {
         return 0
     fi
 
-    local xzfile=""
-
-    if [ -n "$KEXEC_WIPE_FEDORA_IMAGE" ]; then
-        # wipe.sh pre-downloaded the image on the host and embedded it into this
-        # initramfs (see lib/kexec.sh augment_initramfs). No network needed.
-        xzfile="$KEXEC_WIPE_FEDORA_IMAGE"
-        if [ ! -f "$xzfile" ]; then
-            fatal "Pre-embedded Fedora image not found at $xzfile."
-        fi
-        log "Using pre-embedded Fedora image: $xzfile"
-    else
-        # Fallback (tests/legacy): download inside the initramfs.
-        setup_network
-
-        # Allow a test to override the source/checksum; otherwise use the pinned
-        # release above.
-        local url="$KEXEC_WIPE_FEDORA_URL"
-        local sha="$KEXEC_WIPE_FEDORA_SHA256"
-        if [ -z "$url" ]; then
-            url=$(fedora_raw_url)
-        fi
-        if [ -z "$sha" ]; then
-            sha=$(fedora_raw_sha256)
-        fi
-
-        xzfile=/tmp/fedora.raw.xz
-        download_fedora_image "$url" "$sha" "$xzfile"
+    if [ -z "$KEXEC_WIPE_FEDORA_IMAGE" ] || [ ! -f "$KEXEC_WIPE_FEDORA_IMAGE" ]; then
+        fatal "No Fedora image found. wipe.sh must embed it before kexec."
     fi
+
+    local xzfile="$KEXEC_WIPE_FEDORA_IMAGE"
+    log "Using pre-embedded Fedora image: $xzfile"
 
     write_fedora_image "$xzfile" "$KEXEC_WIPE_DEV"
     install_bootloader "$KEXEC_WIPE_DEV"

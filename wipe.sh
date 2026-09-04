@@ -248,7 +248,7 @@ detach_device() {
 
 # --- begin lib/sanitize.sh ---
 #!/bin/bash
-# NVMe sanitize operations with crypto-erase fallback to block-erase
+# NVMe sanitize operations with crypto-erase, block-erase, and overwrite
 
 SANITIZE_METHOD=""
 
@@ -395,7 +395,7 @@ INITRAMFS_VERSION="v0.1.0"
 INITRAMFS_BASE_URL="https://github.com/chapmanjacobd/kexec-wipe/releases/download"
 INITRAMFS_FILE="kexec-wipe-initramfs-${INITRAMFS_VERSION}.cpio.gz"
 
-# Pinned Fedora Cloud Base raw image used for --install-fedora.
+# Pinned Fedora Cloud Base raw image for --install-fedora.
 # The xz filename and checksums are compose-specific, so they are pinned
 # here (mirroring INITRAMFS_VERSION) and bumped by the maintainer per release.
 INSTALL_FEDORA_RELEASE="44"
@@ -422,7 +422,7 @@ fedora_raw_sha256() {
 
 check_kexec() {
     if ! command -v kexec &>/dev/null; then
-        fatal "kexec is required for root disk sanitization but was not found.
+        fatal "kexec is required for root disk sanitization but not found.
 Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf install kexec-tools')."
     fi
 }
@@ -448,8 +448,7 @@ download_initramfs() {
     success "Initramfs downloaded ($(bytes_to_human "$(stat -c%s "$dest")"))."
 }
 
-# Download and verify the Fedora Cloud Base raw image on the host (full host
-# toolchain), before kexec. The initramfs itself is then network-free.
+# Download and verify the Fedora Cloud Base raw image on the host.
 download_fedora_image() {
     local dest="$1"
     local url="${2:-$(fedora_raw_url)}"
@@ -480,8 +479,8 @@ download_fedora_image() {
 
 # Embed a file into a copy of the initramfs cpio archive. The kernel-initramfs is
 # itself an unpacked RAM filesystem, so appending a file to it makes that file
-# available to the initramfs/init as if it were on disk. Prints the augmented
-# initramfs path.
+# available to the initramfs/init as if on disk. Prints the augmented initramfs
+# path.
 #
 #   args: INITRAMFS_IN  (path to source cpio.gz)
 #         EMBEDDED_PATH (absolute path the file should appear at in the initramfs)
@@ -539,7 +538,7 @@ find_initrd() {
     local kver
     kver=$(uname -r)
 
-    # .efi is a UKI; initrd is embedded.
+    # .efi is a UKI; the initrd is within the binary.
     case "$kernel" in
         *.efi) return 0 ;;
     esac
@@ -573,10 +572,9 @@ do_kexec_wipe() {
 
     download_initramfs "$initramfs_path"
 
-    # With --install-fedora the Fedora image is downloaded ON THE HOST (full
-    # toolchain) and embedded into the initramfs BEFORE kexec, so the minimal
-    # initramfs never needs network access or curl. The image path is handed to
-    # the initramfs via the kernel command line.
+    # With --install-fedora, the Fedora image is downloaded on the host and
+    # embedded into the initramfs. The image path is handed to the initramfs
+    # via the kernel command line.
     if [ "$install" -eq 1 ]; then
         local fedora="${WIPE_TMPDIR}/fedora.raw.xz"
         download_fedora_image "$fedora"
@@ -601,8 +599,8 @@ do_kexec_wipe() {
         info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after wipe"
     fi
 
-    # For a classic kernel use the separate initrd. For a UKI (.efi) there is
-    # no separate initrd; the embedded one is used, so we pass no --initrd.
+    # For a classic kernel, pass the separate initrd. For a UKI (.efi), the
+    # initrd is embedded; no --initrd is needed.
     local initrd
     initrd=$(find_initrd "$kernel")
 
@@ -617,14 +615,13 @@ do_kexec_wipe() {
     info "  Target:    $dev"
 
     if [ -n "$initrd" ]; then
-        # Classic kernel with our wipe initramfs (replaces normal early userspace).
+        # Classic kernel: load with the wipe initramfs.
         kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
             || fatal "Failed to load kernel into memory via kexec."
     else
-        # UKI (.efi): the embedded initrd/cmdline are normally staged by the
-        # firmware's loader, which kexec bypasses. Try loading the UKI with our
-        # initramfs directly first; if kexec cannot parse the PE, fall back to
-        # extracting the embedded initrd (objcopy) and concatenating ours.
+        # UKI (.efi): try loading the UKI with our initramfs directly. If kexec
+        # cannot parse the PE, extract the embedded initrd (objcopy) and
+        # concatenate it with ours.
         if kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" 2>/dev/null; then
             : # loaded UKI directly
         else
@@ -650,8 +647,8 @@ do_kexec_wipe() {
     kexec -e || fatal "kexec -e failed. System may need manual reboot."
 }
 
-# Extract the initrd payload embedded in a UKI (.efi) file. UKIs are PE images
-# with a .linux/.initrd section pair; objcopy can dump arbitrary sections.
+# Extract the initrd payload from a UKI (.efi) file. UKIs are PE images with a
+# .linux/.initrd section pair; objcopy can dump arbitrary sections.
 extract_uki_initrd() {
     local uki="$1"
     local out="$2"
@@ -684,15 +681,14 @@ Arguments:
 
 Options:
   --method=METHOD       Sanitize method (default: auto)
-                        auto       - Try crypto-erase, fallback to block-erase
+                        auto       - Try crypto-erase, then block-erase
                         crypto     - Crypto-erase only (fastest for SED drives)
                         block      - Block-erase only
                         overwrite  - Overwrite (slowest, most thorough)
   --dry-run             Show what would be done without making changes
-  --install-fedora      After sanitizing the root disk via kexec, download and
-                        write a Fedora Cloud Base image and install a bootloader
-                        so it can boot. Requires the root-disk (kexec) path and
-                        network access in the initramfs.
+  --install-fedora      After sanitizing the root disk via kexec, write a
+                        Fedora Cloud Base image and install a bootloader so it
+                        can boot. Requires the root-disk (kexec) path.
   --help                Show this help message
 
 Examples:
