@@ -230,7 +230,7 @@ remove_raid() {
     if [ -n "$md_paths" ]; then
         for md in $md_paths; do
             info "  Stopping MD array: /dev/$md"
-            mdstop "/dev/$md" 2>/dev/null || true
+            mdadm --stop "/dev/$md" 2>/dev/null || true
         done
     fi
 }
@@ -396,10 +396,8 @@ do_sanitize() {
 #!/bin/bash
 # kexec-based approach for sanitizing the root device
 
-# Version of the prebuilt initramfs archive (bumped only when the initramfs
-# content changes). INITRAMFS_RELEASE is the GitHub release tag the archive is
-# uploaded to, which usually tracks the kexec-wipe release version. The asset
-# filename uses INITRAMFS_VERSION; the URL path uses INITRAMFS_RELEASE.
+# Version of the prebuilt initramfs archive (bumped only when content changes).
+# INITRAMFS_RELEASE is the GitHub release tag the archive is uploaded to.
 INITRAMFS_VERSION="v0.1.0"
 INITRAMFS_RELEASE="v0.1.8"
 INITRAMFS_SHA256="e7601a597965d312c097829d66441ca4237846e04bef31b8416555d3dff4ae95"
@@ -407,8 +405,7 @@ INITRAMFS_BASE_URL="https://github.com/chapmanjacobd/kexec-wipe/releases/downloa
 INITRAMFS_FILE="kexec-wipe-initramfs-${INITRAMFS_VERSION}.cpio.gz"
 
 # Pinned Fedora Cloud Base raw image for --install-fedora.
-# The xz filename and checksums are compose-specific, so they are pinned
-# here (mirroring INITRAMFS_VERSION) and bumped by the maintainer per release.
+# Bumped by the maintainer per Fedora release.
 INSTALL_FEDORA_RELEASE="44"
 INSTALL_FEDORA_CURRENT="1.7"
 INSTALL_FEDORA_BASE="https://download.fedoraproject.org/pub/fedora/linux/releases/${INSTALL_FEDORA_RELEASE}/Cloud"

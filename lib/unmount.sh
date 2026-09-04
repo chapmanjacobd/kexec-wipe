@@ -77,7 +77,7 @@ remove_raid() {
     if [ -n "$md_paths" ]; then
         for md in $md_paths; do
             info "  Stopping MD array: /dev/$md"
-            mdstop "/dev/$md" 2>/dev/null || true
+            mdadm --stop "/dev/$md" 2>/dev/null || true
         done
     fi
 }
