@@ -1,0 +1,200 @@
+#!/bin/sh
+#
+# kexec-wipe initramfs init script
+#
+# This runs in a minimal in-memory environment after kexec.
+# It reads kexec_wipe_dev and kexec_wipe_method from the kernel command line,
+# sanitizes the target device, and reboots.
+#
+
+set -e
+
+# Shared libraries for dynamically-linked nvme-cli live in /lib
+export LD_LIBRARY_PATH=/lib
+
+log() {
+    echo "[kexec-wipe] $*"
+}
+
+fatal() {
+    echo "[kexec-wipe] FATAL: $*" >&2
+    sleep 5
+    reboot -f
+}
+
+parse_cmdline() {
+    local cmdline
+    cmdline=$(cat /proc/cmdline)
+
+    KEXEC_WIPE_DEV=""
+    KEXEC_WIPE_METHOD="auto"
+
+    for arg in $cmdline; do
+        case "$arg" in
+            kexec_wipe_dev=*)
+                KEXEC_WIPE_DEV="${arg#kexec_wipe_dev=}"
+                ;;
+            kexec_wipe_method=*)
+                KEXEC_WIPE_METHOD="${arg#kexec_wipe_method=}"
+                ;;
+        esac
+    done
+
+    if [ -z "$KEXEC_WIPE_DEV" ]; then
+        fatal "No target device specified in kernel command line."
+    fi
+}
+
+mount_pseudo_fs() {
+    log "Mounting pseudo-filesystems..."
+    mount -t proc proc /proc 2>/dev/null || true
+    mount -t sysfs sys /sys 2>/dev/null || true
+    mount -t devtmpfs dev /dev 2>/dev/null || true
+
+    # Wait for device nodes to appear
+    log "Waiting for devices to settle..."
+    sleep 3
+}
+
+check_device() {
+    if [ ! -b "$KEXEC_WIPE_DEV" ]; then
+        fatal "Target device $KEXEC_WIPE_DEV not found."
+    fi
+    log "Target device: $KEXEC_WIPE_DEV"
+}
+
+try_crypto_erase() {
+    log "Attempting crypto-erase..."
+    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-crypto-erase -f 2>/dev/null; then
+        return 0
+    fi
+    log "Crypto-erase failed or not supported."
+    return 1
+}
+
+try_block_erase() {
+    log "Attempting block-erase..."
+    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-block-erase -f 2>/dev/null; then
+        return 0
+    fi
+    log "Block-erase failed."
+    return 1
+}
+
+try_overwrite() {
+    log "Attempting overwrite (this may take a while)..."
+    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-overwrite -f 2>/dev/null; then
+        return 0
+    fi
+    log "Overwrite failed."
+    return 1
+}
+
+do_sanitize() {
+    case "$KEXEC_WIPE_METHOD" in
+        crypto)
+            try_crypto_erase || fatal "Crypto-erase failed."
+            ;;
+        block)
+            try_block_erase || fatal "Block-erase failed."
+            ;;
+        overwrite)
+            try_overwrite || fatal "Overwrite failed."
+            ;;
+        auto|"")
+            try_crypto_erase || try_block_erase || fatal "All sanitize methods failed."
+            ;;
+        *)
+            fatal "Unknown method: $KEXEC_WIPE_METHOD"
+            ;;
+    esac
+}
+
+wait_for_completion() {
+    local timeout=7200
+    local elapsed=0
+    local interval=5
+
+    log "Waiting for sanitize to complete (timeout: ${timeout}s)..."
+
+    while [ "$elapsed" -lt "$timeout" ]; do
+        local status
+        status=$(nvme sanitize -H "$KEXEC_WIPE_DEV" -o xml 2>/dev/null) || true
+
+        local san_stat
+        san_stat=$(echo "$status" | sed -n 's/.*<stat>\(.*\)<\/stat>.*/\1/p' | head -1) || true
+
+        local progress
+        progress=$(echo "$status" | sed -n 's/.*<sprog>\(.*\)<\/sprog>.*/\1/p' | head -1) || true
+
+        local pct="0"
+        if [ -n "$progress" ]; then
+            pct=$((progress / 100))
+        fi
+
+        case "$san_stat" in
+            0x01)
+                printf "\r  Sanitizing... %d%% " "$pct"
+                ;;
+            0x02)
+                echo ""
+                log "Sanitize completed successfully."
+                return 0
+                ;;
+            0x03)
+                echo ""
+                log "Sanitize completed with FAILURE."
+                return 1
+                ;;
+            0x04)
+                if [ "$elapsed" -eq 0 ]; then
+                    log "No sanitize in progress."
+                    local ssrc
+                    ssrc=$(echo "$status" | sed -n 's/.*<ssrc>\(.*\)<\/ssrc>.*/\1/p' | head -1) || true
+                    if [ "$ssrc" = "0x02" ]; then
+                        log "Previous sanitize result: success."
+                        return 0
+                    fi
+                fi
+                ;;
+        esac
+
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+    done
+
+    echo ""
+    log "Timed out waiting for sanitize."
+    return 1
+}
+
+cleanup_and_reboot() {
+    log "Syncing..."
+    sync
+    log "Rebooting..."
+    reboot -f
+}
+
+main() {
+    log "=== kexec-wipe initramfs ==="
+
+    # Kernel unpacks initramfs as root; mount pseudo-filesystems on top
+    mkdir -p /proc /sys /dev /tmp
+    mount_pseudo_fs
+    parse_cmdline
+    check_device
+
+    log "Sanitize method: $KEXEC_WIPE_METHOD"
+
+    do_sanitize
+    wait_for_completion
+
+    echo ""
+    log "Drive $KEXEC_WIPE_DEV has been sanitized."
+    log "Rebooting in 5 seconds..."
+    sleep 5
+
+    cleanup_and_reboot
+}
+
+exec main
