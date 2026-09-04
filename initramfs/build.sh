@@ -290,15 +290,26 @@ build_initramfs() {
     echo "Building nvme-cli..."
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker &>/dev/null; then
         echo "Building static nvme-cli via Docker..."
-        docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
-            apk add --no-cache bash git gcc make musl-dev linux-headers json-c-dev openssl-dev python3 meson \
+        local nvme_container="kexec-wipe-nvme-$$"
+        docker run --name "$nvme_container" alpine:latest sh -c '
+            apk add --no-cache bash git gcc make musl-dev linux-headers json-c-dev openssl-dev openssl-libs-static python3 meson ninja \
+            && git clone --depth 1 https://github.com/linux-nvme/libnvme.git /tmp/libnvme \
+            && cd /tmp/libnvme \
+            && meson setup .build --buildtype=release --default-library=static -Ddocs=false -Dpython=disabled \
+            && meson compile -C .build \
+            && meson install -C .build \
             && git clone --depth 1 --branch v2.16 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
             && cd /tmp/nvme-cli \
-            && meson setup .build --buildtype=release --default-library=static -Ddocs=false \
+            && meson setup .build --buildtype=release --default-library=static -Dprefer_static=true -Ddocs=false \
             && meson compile -C .build nvme \
-            && cp .build/nvme /output/bin/nvme \
-            && chown -R $HOST_UID:$HOST_GID /output
-        ' || {
+            && cp .build/nvme /tmp/nvme
+        ' && {
+            mkdir -p "$BUILD_DIR/bin"
+            docker cp "$nvme_container":/tmp/nvme "$BUILD_DIR/bin/nvme"
+            chmod +x "$BUILD_DIR/bin/nvme"
+            docker rm "$nvme_container" >/dev/null 2>&1
+        } || {
+            docker rm "$nvme_container" >/dev/null 2>&1 || true
             echo "Docker static build failed, trying to copy host nvme-cli with libs..."
             copy_nvme_with_libs
         }
