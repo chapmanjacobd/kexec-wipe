@@ -130,7 +130,8 @@ lib/main_body.sh   - Arg parsing, usage, main flow
 
 ### Releasing
 
-1. Update `INITRAMFS_VERSION` in `lib/kexec.sh`
+1. Bump `INITRAMFS_VERSION` (only when the initramfs content changes) and set
+   `INITRAMFS_RELEASE` to the tag you will release under, in `lib/kexec.sh`
 2. Build initramfs: `./initramfs/build.sh`
 3. Build wipe.sh: `./build.sh`
 4. Create a GitHub release and upload the initramfs as an asset
