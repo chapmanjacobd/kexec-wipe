@@ -200,7 +200,7 @@ jobs:
           timeout 180 qemu-system-x86_64 \
             -kernel /tmp/vmlinuz \
             -initrd /tmp/install-initramfs.cpio.gz \
-            -append "console=ttyS0 kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto kexec_wipe_install=1 kexec_wipe_fedora_url=http://10.0.2.2:8000/test.raw.xz kexec_wipe_fedora_sha256=$SHA" \
+            -append "console=ttyS0 kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto kexec_wipe_install=1 kexec_wipe_test=1 kexec_wipe_fedora_url=http://10.0.2.2:8000/test.raw.xz kexec_wipe_fedora_sha256=$SHA" \
             -nographic -no-reboot -m 512 \
             -netdev user,id=net0 \
             -device virtio-net-pci,netdev=net0 \

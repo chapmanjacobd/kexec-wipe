@@ -26,6 +26,21 @@ fatal() {
     reboot -f
 }
 
+# "Fatal" failure that still gives the operator a grace period to read the
+# message before the system is force-rebooted.
+fatal_reboot() {
+    echo "[kexec-wipe] FATAL: $*" >&2
+    echo "[kexec-wipe] The system will reboot in 30 seconds..."
+    i=30
+    while [ "$i" -gt 0 ]; do
+        printf '\r[kexec-wipe] Rebooting in %02d s (Ctrl-Alt-Del to abort where supported)   ' "$i"
+        sleep 1
+        i=$((i - 1))
+    done
+    echo ""
+    reboot -f
+}
+
 parse_cmdline() {
     local cmdline
     cmdline=$(cat /proc/cmdline)
@@ -33,6 +48,11 @@ parse_cmdline() {
     KEXEC_WIPE_DEV=""
     KEXEC_WIPE_METHOD="auto"
     KEXEC_WIPE_INSTALL=0
+    # Test-only mode: still attempt the real NVMe sanitize, but a full failure
+    # must not abort the script. Used by CI to exercise the install pipeline
+    # against QEMU's emulated NVMe, which does not implement the NVMe Sanitize
+    # command. Not for production use.
+    KEXEC_WIPE_TEST=0
     # Optional overrides for the Fedora install source (used by tests). When
     # empty, the pinned release/checksum above is used.
     KEXEC_WIPE_FEDORA_URL=""
@@ -48,6 +68,9 @@ parse_cmdline() {
                 ;;
             kexec_wipe_install=*)
                 KEXEC_WIPE_INSTALL="${arg#kexec_wipe_install=}"
+                ;;
+            kexec_wipe_test=*)
+                KEXEC_WIPE_TEST="${arg#kexec_wipe_test=}"
                 ;;
             kexec_wipe_fedora_url=*)
                 KEXEC_WIPE_FEDORA_URL="${arg#kexec_wipe_fedora_url=}"
@@ -119,23 +142,40 @@ try_overwrite() {
 }
 
 do_sanitize() {
+    # In test mode (e.g. QEMU's emulated NVMe, which does not implement the
+    # NVMe Sanitize command) we still attempt the real sanitize, but a full
+    # failure must not abort the script so CI can exercise the rest of the
+    # pipeline (install, switch_root).
+    local ok=1
+
     case "$KEXEC_WIPE_METHOD" in
         crypto)
-            try_crypto_erase || fatal "Crypto-erase failed."
+            try_crypto_erase || ok=0
             ;;
         block)
-            try_block_erase || fatal "Block-erase failed."
+            try_block_erase || ok=0
             ;;
         overwrite)
-            try_overwrite || fatal "Overwrite failed."
+            try_overwrite || ok=0
             ;;
         auto|"")
-            try_crypto_erase || try_block_erase || fatal "All sanitize methods failed."
+            try_crypto_erase || try_block_erase || ok=0
+            if [ "$ok" -eq 0 ]; then
+                log "All sanitize methods failed."
+            fi
             ;;
         *)
             fatal "Unknown method: $KEXEC_WIPE_METHOD"
             ;;
     esac
+
+    if [ "$ok" -eq 0 ]; then
+        if [ "$KEXEC_WIPE_TEST" = "1" ]; then
+            log "TEST MODE: sanitize failed but continuing (emulated device cannot sanitize)."
+            return 0
+        fi
+        fatal_reboot "All sanitize methods failed."
+    fi
 }
 
 wait_for_completion() {
@@ -144,6 +184,20 @@ wait_for_completion() {
     local interval=5
 
     log "Waiting for sanitize to complete (timeout: ${timeout}s)..."
+
+    # In test mode the wipe already failed (emulated device), so there is no
+    # sanitize to wait for; confirm nothing is in progress and move on.
+    if [ "$KEXEC_WIPE_TEST" = "1" ]; then
+        local t_status
+        t_status=$(nvme sanitize -H "$KEXEC_WIPE_DEV" -o xml 2>/dev/null) || true
+        local t_stat
+        t_stat=$(echo "$t_status" | sed -n 's/.*<stat>\(.*\)<\/stat>.*/\1/p' | head -1) || true
+        case "$t_stat" in
+            0x02) log "Previous sanitize result: success." ;;
+            *)    log "No sanitize in progress (emulated device); continuing." ;;
+        esac
+        return 0
+    fi
 
     while [ "$elapsed" -lt "$timeout" ]; do
         local status

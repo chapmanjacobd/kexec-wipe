@@ -320,9 +320,9 @@ build_initramfs() {
         echo "Building static nvme-cli via Docker..."
         docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache git gcc make musl-dev linux-headers json-c-dev openssl-dev python3 meson \
-            && git clone --depth 1 --branch v2.11.1 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
+            && git clone --depth 1 --branch v2.16 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
             && cd /tmp/nvme-cli \
-            && meson setup .build --buildtype=release --default-library=static -Ddocs=disabled \
+            && meson setup .build --buildtype=release --default-library=static -Ddocs=false \
             && meson compile -C .build nvme \
             && cp .build/nvme /output/bin/nvme \
             && chown -R $HOST_UID:$HOST_GID /output
