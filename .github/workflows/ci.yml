@@ -115,7 +115,7 @@ jobs:
           timeout 30 qemu-system-x86_64 \
             -kernel /tmp/vmlinuz \
             -initrd /tmp/initramfs-docker.cpio.gz \
-            -append "kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto" \
+            -append "console=ttyS0 kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto" \
             -nographic -no-reboot -m 512 \
             > /tmp/serial.log 2>&1 || true
 

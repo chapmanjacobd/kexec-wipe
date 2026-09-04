@@ -319,7 +319,7 @@ build_initramfs() {
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker &>/dev/null; then
         echo "Building static nvme-cli via Docker..."
         docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
-            apk add --no-cache git gcc make musl-dev linux-headers json-c-dev openssl-dev \
+            apk add --no-cache git gcc make musl-dev linux-headers json-c-dev openssl-dev python3 meson \
             && git clone --depth 1 https://github.com/linux-nvme/nvme-cli.git /tmp/nvme-cli \
             && cd /tmp/nvme-cli \
             && make STATIC=1 \
