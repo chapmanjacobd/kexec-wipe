@@ -185,13 +185,23 @@ run_qemu() {
 
 check() {
     local ok=1
-    grep -q "Fedora installation complete" "$OUT_DIR/install-serial.log" || ok=0
-    grep -q "KEXEC-WIPE-TEST-INSTALL-BOOT-OK" "$OUT_DIR/install-serial.log" || ok=0
-    grep -q "Sanitize was not performed" "$OUT_DIR/install-serial.log" || ok=0
+    local markers=(
+        "Fedora installation complete"
+        "KEXEC-WIPE-TEST-INSTALL-BOOT-OK"
+        "Sanitize was not performed"
+    )
+    for marker in "${markers[@]}"; do
+        if grep -q "$marker" "$OUT_DIR/install-serial.log"; then
+            echo "OK: found '$marker'"
+        else
+            echo "FAIL: missing '$marker'" >&2
+            ok=0
+        fi
+    done
     if [ "$ok" -eq 1 ]; then
         echo "PASS: full install pipeline verified."
     else
-        echo "FAIL: missing expected markers in serial output." >&2
+        echo "FAIL: one or more expected markers missing from serial output." >&2
         exit 1
     fi
 }

@@ -302,7 +302,8 @@ build_initramfs() {
             && cd /tmp/nvme-cli \
             && meson setup .build --buildtype=release --default-library=static -Dprefer_static=true -Dc_link_args=-static -Ddocs=false \
             && meson compile -C .build nvme \
-            && cp .build/nvme /tmp/nvme
+            && cp .build/nvme /tmp/nvme \
+            && strip /tmp/nvme
         ' && {
             mkdir -p "$BUILD_DIR/bin"
             docker cp "$nvme_container":/tmp/nvme "$BUILD_DIR/bin/nvme"

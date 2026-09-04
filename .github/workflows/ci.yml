@@ -216,9 +216,19 @@ jobs:
 
           # The init must have run the full install pipeline and booted the
           # freshly written root, which prints the marker before powering off.
-          grep -q "Fedora installation complete" /tmp/install-serial.log
-          grep -q "KEXEC-WIPE-TEST-INSTALL-BOOT-OK" /tmp/install-serial.log
-          grep -q "Sanitize was not performed" /tmp/install-serial.log
+          FAIL=0
+          for marker in "Fedora installation complete" "KEXEC-WIPE-TEST-INSTALL-BOOT-OK" "Sanitize was not performed"; do
+            if grep -q "$marker" /tmp/install-serial.log; then
+              echo "OK: found '$marker'"
+            else
+              echo "FAIL: missing '$marker'" >&2
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::QEMU Fedora install test: one or more expected markers missing from serial output"
+            exit 1
+          fi
           echo "QEMU Fedora install test passed."
 
   release:

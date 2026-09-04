@@ -340,6 +340,15 @@ write_fedora_image() {
         blockdev --rereadpt "$dev" 2>/dev/null || true
     done
 
+    # Fallback: if partition nodes still did not appear (e.g. emulated NVMe
+    # devices where sysfs rescan is not supported), try partprobe to ask the
+    # kernel to re-read and create the partition nodes.
+    if ! ls "${dev}p"* >/dev/null 2>&1; then
+        log "Partition nodes missing; trying partprobe..."
+        partprobe "$dev" 2>/dev/null || true
+        sleep 1
+    fi
+
     log "Fedora image written."
 }
 
