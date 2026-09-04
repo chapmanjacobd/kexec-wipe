@@ -133,6 +133,8 @@ jobs:
           # --- Prepare a test initramfs that can bring up an emulated NVMe.
           # The runner kernel exposes the nvme driver as modules, so stage them
           # (plus modprobe metadata) into a copy of our built initramfs.
+          # No network is needed inside the initramfs anymore: wipe.sh (and this
+          # test) pre-downloads the Fedora image on the host and embeds it.
           rm -rf /tmp/install-initramfs
           mkdir -p /tmp/install-initramfs
           cd /tmp/install-initramfs
@@ -145,11 +147,6 @@ jobs:
           if [ -d "$SRC_MODS/kernel/drivers/nvme" ]; then
             cp -a "$SRC_MODS/kernel/drivers/nvme"/* "$DST_MODS/kernel/drivers/nvme/"
           fi
-          # Stage virtio-net modules so the guest can bring up a NIC for DHCP.
-          mkdir -p "$DST_MODS/kernel/drivers/net"
-          for f in "$SRC_MODS"/kernel/drivers/net/virtio_net*; do
-            [ -e "$f" ] && cp -a "$f" "$DST_MODS/kernel/drivers/net/"
-          done
           # Overwrite with the full host module metadata so modprobe resolves.
           for f in modules.dep modules.dep.bin modules.builtin modules.builtin.bin modules.alias modules.alias.bin modules.symbols; do
             [ -f "$SRC_MODS/$f" ] && cp "$SRC_MODS/$f" "$DST_MODS/$f" 2>/dev/null || true
@@ -160,7 +157,7 @@ jobs:
           # --- Build a small bootable synthetic "Fedora" raw image.
           # A single ext4 partition seeded with a busybox init that prints a
           # marker and powers off, so the test validates the whole post-sanitize
-          # install path (network, download+checksum, write, switch_root).
+          # install path (pre-embedded image, write, switch_root).
           rm -f /tmp/fedora.raw /tmp/fedora.raw.xz
           dd if=/dev/zero of=/tmp/fedora.raw bs=1M count=96 status=none
           printf 'o\nn\np\n1\n\n+80M\nw\n' | fdisk /tmp/fedora.raw >/dev/null 2>&1
@@ -180,8 +177,8 @@ jobs:
           sudo touch /tmp/fedora-root/boot/grub2/grub.cfg
           printf '%s\n' '#!/bin/sh' \
             'echo "KEXEC-WIPE-TEST-INSTALL-BOOT-OK"' \
-            'sync' \
-            'sleep 1' \
+            '/bin/busybox sync' \
+            '/bin/busybox sleep 1' \
             '/bin/busybox poweroff -f' > /tmp/fedora-init
           sudo cp /tmp/fedora-init /tmp/fedora-root/sbin/init
           sudo chmod +x /tmp/fedora-root/sbin/init
@@ -189,31 +186,29 @@ jobs:
           sudo losetup -d "$LOOP"
 
           xz -c /tmp/fedora.raw > /tmp/fedora.raw.xz
-          SHA=$(sha256sum /tmp/fedora.raw.xz | awk '{print $1}')
-          echo "Test image sha256: $SHA"
 
-          # --- Serve the image over SLIRP (guest reaches host as 10.0.2.2).
-          mkdir -p /tmp/http
-          cp /tmp/fedora.raw.xz /tmp/http/test.raw.xz
-          ( cd /tmp/http && python3 -m http.server 8000 >/tmp/http.log 2>&1 ) &
-          HTTP_PID=$!
+          # --- Embed the Fedora image into the initramfs (mirrors lib/kexec.sh
+          # augment_initramfs: hand the image to the initramfs via cmdline).
+          rm -rf /tmp/augment
+          mkdir -p /tmp/augment
+          gzip -dc /tmp/install-initramfs.cpio.gz | ( cd /tmp/augment && cpio -idm 2>/dev/null )
+          mkdir -p /tmp/augment/opt
+          cp /tmp/fedora.raw.xz /tmp/augment/opt/fedora.raw.xz
+          ( cd /tmp/augment && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > /tmp/install-initramfs.cpio.gz )
+          rm -rf /tmp/augment
 
-          # --- Boot QEMU with an emulated NVMe device + user-mode networking.
+          # --- Boot QEMU with an emulated NVMe device. No networking needed.
           # QEMU's -drive needs the backing file to exist; create a blank one.
           rm -f /tmp/install-disk.qcow2
           qemu-img create -f qcow2 /tmp/install-disk.qcow2 128M >/dev/null
-          timeout 180 qemu-system-x86_64 \
+          timeout 240 qemu-system-x86_64 \
             -kernel /tmp/vmlinuz \
             -initrd /tmp/install-initramfs.cpio.gz \
-            -append "console=ttyS0 kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto kexec_wipe_install=1 kexec_wipe_test=1 kexec_wipe_fedora_url=http://10.0.2.2:8000/test.raw.xz kexec_wipe_fedora_sha256=$SHA" \
+            -append "console=ttyS0 kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto kexec_wipe_install=1 kexec_wipe_test=1 kexec_wipe_fedora_image=/opt/fedora.raw.xz" \
             -nographic -no-reboot -m 512 \
-            -netdev user,id=net0 \
-            -device virtio-net-pci,netdev=net0 \
             -drive file=/tmp/install-disk.qcow2,if=none,id=nvme0 \
             -device nvme,serial=deadbeef,drive=nvme0 \
             > /tmp/install-serial.log 2>&1 || true
-
-          kill "$HTTP_PID" 2>/dev/null || true
 
           echo "--- Install serial output ---"
           cat /tmp/install-serial.log

@@ -448,6 +448,63 @@ download_initramfs() {
     success "Initramfs downloaded ($(bytes_to_human "$(stat -c%s "$dest")"))."
 }
 
+# Download and verify the Fedora Cloud Base raw image on the host (full host
+# toolchain), before kexec. The initramfs itself is then network-free.
+download_fedora_image() {
+    local dest="$1"
+    local url="${2:-$(fedora_raw_url)}"
+    local expected="${3:-$(fedora_raw_sha256)}"
+
+    info "Downloading Fedora Cloud Base from ${url}..."
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL --retry 3 "$url" -o "$dest" || fatal "Failed to download Fedora image."
+    elif command -v wget &>/dev/null; then
+        wget -q -O "$dest" "$url" || fatal "Failed to download Fedora image."
+    else
+        fatal "Neither curl nor wget is available to download the Fedora image."
+    fi
+
+    if [ ! -s "$dest" ]; then
+        fatal "Downloaded Fedora image is empty."
+    fi
+
+    local got
+    got=$(sha256sum "$dest" | awk '{print $1}')
+    if [ "$got" != "$expected" ]; then
+        fatal "Fedora image checksum mismatch (got $got, expected $expected)."
+    fi
+
+    success "Fedora image downloaded and verified ($(bytes_to_human "$(stat -c%s "$dest")"))."
+}
+
+# Embed a file into a copy of the initramfs cpio archive. The kernel-initramfs is
+# itself an unpacked RAM filesystem, so appending a file to it makes that file
+# available to the initramfs/init as if it were on disk. Prints the augmented
+# initramfs path.
+#
+#   args: INITRAMFS_IN  (path to source cpio.gz)
+#         EMBEDDED_PATH (absolute path the file should appear at in the initramfs)
+#         FILE          (path to the file to embed)
+#         [OUT]         (optional output path; defaults to <dir>/augmented.cpio.gz)
+augment_initramfs() {
+    local src="$1" path="$2" file="$3" out="${4:-}"
+    local work
+
+    [ -n "$out" ] || out="${src%.gz}.augmented.cpio.gz"
+
+    work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
+    gzip -dc "$src" | ( cd "$work" && cpio -idm 2>/dev/null )
+
+    local dest="$work/${path#/}"
+    mkdir -p "$(dirname "$dest")"
+    cp "$file" "$dest"
+
+    ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
+
+    rm -rf "$work"
+}
+
 # Federation finds a kernel image (optionally with its initrd) suitable for kexec.
 # On classic setups this is vmlinuz + separate initrd, or a single UKI (Unified
 # Kernel Image, common on aarch64) that embeds linux+initrd. Prints "<kernel> [initrd]".
@@ -516,6 +573,20 @@ do_kexec_wipe() {
 
     download_initramfs "$initramfs_path"
 
+    # With --install-fedora the Fedora image is downloaded ON THE HOST (full
+    # toolchain) and embedded into the initramfs BEFORE kexec, so the minimal
+    # initramfs never needs network access or curl. The image path is handed to
+    # the initramfs via the kernel command line.
+    if [ "$install" -eq 1 ]; then
+        local fedora="${WIPE_TMPDIR}/fedora.raw.xz"
+        download_fedora_image "$fedora"
+        info "Embedding Fedora image into initramfs..."
+        local augmented
+        augmented=$(augment_initramfs "$initramfs_path" "/opt/fedora.raw.xz" "$fedora")
+        initramfs_path="$augmented"
+        info "  Augmented initramfs: $initramfs_path"
+    fi
+
     local kernel
     kernel=$(find_kernel)
     info "Using kernel: $kernel"
@@ -526,7 +597,8 @@ do_kexec_wipe() {
 
     if [ "$install" -eq 1 ]; then
         cmdline="${cmdline} kexec_wipe_install=1"
-        info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} after wipe"
+        cmdline="${cmdline} kexec_wipe_fedora_image=/opt/fedora.raw.xz"
+        info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after wipe"
     fi
 
     # For a classic kernel use the separate initrd. For a UKI (.efi) there is

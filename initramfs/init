@@ -20,6 +20,10 @@ log() {
     echo "[kexec-wipe] $*"
 }
 
+warn() {
+    echo "[kexec-wipe] WARNING: $*" >&2
+}
+
 fatal() {
     echo "[kexec-wipe] FATAL: $*" >&2
     sleep 5
@@ -57,6 +61,10 @@ parse_cmdline() {
     # empty, the pinned release/checksum above is used.
     KEXEC_WIPE_FEDORA_URL=""
     KEXEC_WIPE_FEDORA_SHA256=""
+    # Path of a pre-embedded Fedora image inside this initramfs (set by wipe.sh
+    # when it embeds the image before kexec). When present, no network/curl is
+    # needed inside the initramfs.
+    KEXEC_WIPE_FEDORA_IMAGE=""
 
     for arg in $cmdline; do
         case "$arg" in
@@ -77,6 +85,9 @@ parse_cmdline() {
                 ;;
             kexec_wipe_fedora_sha256=*)
                 KEXEC_WIPE_FEDORA_SHA256="${arg#kexec_wipe_fedora_sha256=}"
+                ;;
+            kexec_wipe_fedora_image=*)
+                KEXEC_WIPE_FEDORA_IMAGE="${arg#kexec_wipe_fedora_image=}"
                 ;;
         esac
     done
@@ -102,9 +113,15 @@ check_device() {
     # (e.g. not built into the running kernel), try to load it before checking.
     case "$KEXEC_WIPE_DEV" in
         /dev/nvme*)
-            modprobe nvme-core 2>/dev/null || modprobe nvme 2>/dev/null || true
-            # Probe is async; give the controller a moment to register.
-            sleep 1
+            # modprobe nvme pulls in nvme-core as a dependency and registers the
+            # block device; fall back to nvme-core alone just in case.
+            modprobe nvme 2>/dev/null || modprobe nvme-core 2>/dev/null || true
+            # Probe is async; wait for the device node to register (up to ~10s).
+            i=0
+            while [ "$i" -lt 10 ] && [ ! -b "$KEXEC_WIPE_DEV" ]; do
+                sleep 1
+                i=$((i + 1))
+            done
             ;;
     esac
 
@@ -292,9 +309,30 @@ setup_network() {
         cat > /etc/udhcpc.script <<'EOF'
 #!/bin/sh
 [ "$1" = "bound" ] || exit 0
-[ -n "$ip" ] && ip addr add "$ip/$( [ -n "$mask" ] && echo "$mask" || echo 24 )" dev "$interface" 2>/dev/null
+[ -n "$ip" ] || exit 0
+# Busybox udhcpc exposes the netmask as a dotted quad in $subnet. Convert it to
+# a CIDR prefix (255.255.255.0 -> 24). Fall back to 24 if unset/unparsable.
+prefix=24
+if [ -n "$subnet" ]; then
+    prefix=0
+    for o in $(echo "$subnet" | tr '.' ' '); do
+        case "$o" in 255) prefix=$((prefix + 8)) ;;
+                     254) prefix=$((prefix + 7)) ;;
+                     252) prefix=$((prefix + 6)) ;;
+                     248) prefix=$((prefix + 5)) ;;
+                     240) prefix=$((prefix + 4)) ;;
+                     224) prefix=$((prefix + 3)) ;;
+                     192) prefix=$((prefix + 2)) ;;
+                     128) prefix=$((prefix + 1)) ;;
+                     0)   : ;;
+                     *)   prefix=24; break ;;
+        esac
+    done
+fi
+ip addr add "$ip/$prefix" dev "$interface"
 [ -n "$router" ] && ip route add default via "$router" dev "$interface" 2>/dev/null
 [ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
+exit 0
 EOF
         chmod +x /etc/udhcpc.script
     fi
@@ -304,13 +342,14 @@ EOF
         log "Starting DHCP on all interfaces..."
         log "Network interfaces: $(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | tr '\n' ' ')"
         for iface in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do
+            ip link set "$iface" up
             log "  Running udhcpc on $iface..."
-            if timeout 10 udhcpc -i "$iface" -q -n -s /etc/udhcpc.script; then
-                log "  udhcpc succeeded on $iface."
+            timeout 10 udhcpc -i "$iface" -q -n -s /etc/udhcpc.script
+            if ip addr show dev "$iface" 2>/dev/null | grep -q "inet "; then
+                log "  Got an address via DHCP on $iface."
                 break
-            else
-                log "  udhcpc failed on $iface (exit $?)."
             fi
+            log "  No address yet on $iface; trying next."
         done
     fi
 
@@ -399,8 +438,9 @@ install_bootloader() {
 
     local rootpart
     rootpart=$(first_root_part "$dev")
+    # busybox blkid does not support -s/-o; parse TYPE from its full output.
     local rootfs=""
-    rootfs=$(blkid -s TYPE -o value "$rootpart" 2>/dev/null) || true
+    rootfs=$(blkid "$rootpart" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p')
 
     if [ -z "$rootfs" ]; then
         warn "Could not detect filesystem of $rootpart; skipping bootloader install."
@@ -417,10 +457,11 @@ install_bootloader() {
     local mnt
     mnt=/mnt/root
     mkdir -p "$mnt"
-    if ! mount -t "$rootfs" "$rootpart" "$mnt" 2>/dev/null; then
-        warn "Could not mount $rootpart; skipping bootloader install."
+    if ! mount -t "$rootfs" "$rootpart" "$mnt" 2>"$mnt/mouterr"; then
+        warn "Could not mount $rootpart: $(cat "$mnt/mouterr" 2>/dev/null)"
         return 0
     fi
+    rm -f "$mnt/mouterr"
 
     # Bind system pseudo-fses so chrooted tools work.
     mount -t proc proc "$mnt/proc" 2>/dev/null || true
@@ -470,22 +511,35 @@ install_fedora() {
         return 0
     fi
 
-    setup_network
+    local xzfile=""
 
-    # Allow a test to override the source/checksum; otherwise use the pinned
-    # release above.
-    local url="$KEXEC_WIPE_FEDORA_URL"
-    local sha="$KEXEC_WIPE_FEDORA_SHA256"
-    if [ -z "$url" ]; then
-        url=$(fedora_raw_url)
-    fi
-    if [ -z "$sha" ]; then
-        sha=$(fedora_raw_sha256)
+    if [ -n "$KEXEC_WIPE_FEDORA_IMAGE" ]; then
+        # wipe.sh pre-downloaded the image on the host and embedded it into this
+        # initramfs (see lib/kexec.sh augment_initramfs). No network needed.
+        xzfile="$KEXEC_WIPE_FEDORA_IMAGE"
+        if [ ! -f "$xzfile" ]; then
+            fatal "Pre-embedded Fedora image not found at $xzfile."
+        fi
+        log "Using pre-embedded Fedora image: $xzfile"
+    else
+        # Fallback (tests/legacy): download inside the initramfs.
+        setup_network
+
+        # Allow a test to override the source/checksum; otherwise use the pinned
+        # release above.
+        local url="$KEXEC_WIPE_FEDORA_URL"
+        local sha="$KEXEC_WIPE_FEDORA_SHA256"
+        if [ -z "$url" ]; then
+            url=$(fedora_raw_url)
+        fi
+        if [ -z "$sha" ]; then
+            sha=$(fedora_raw_sha256)
+        fi
+
+        xzfile=/tmp/fedora.raw.xz
+        download_fedora_image "$url" "$sha" "$xzfile"
     fi
 
-    local xzfile
-    xzfile=/tmp/fedora.raw.xz
-    download_fedora_image "$url" "$sha" "$xzfile"
     write_fedora_image "$xzfile" "$KEXEC_WIPE_DEV"
     install_bootloader "$KEXEC_WIPE_DEV"
     rm -f "$xzfile"
@@ -508,7 +562,7 @@ switch_to_fedora() {
     local rootpart
     rootpart=$(first_root_part "$KEXEC_WIPE_DEV")
     local rootfs=""
-    rootfs=$(blkid -s TYPE -o value "$rootpart" 2>/dev/null) || true
+    rootfs=$(blkid "$rootpart" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p')
 
     if [ -z "$rootfs" ]; then
         warn "Could not detect Fedora root filesystem; cannot switch_root."
@@ -523,10 +577,11 @@ switch_to_fedora() {
 
     local newroot=/sysroot
     mkdir -p "$newroot"
-    if ! mount -t "$rootfs" "$rootpart" "$newroot" 2>/dev/null; then
-        warn "Could not mount $rootpart for switch_root."
+    if ! mount -t "$rootfs" "$rootpart" "$newroot" 2>"$newroot/mouterr"; then
+        warn "Could not mount $rootpart for switch_root: $(cat "$newroot/mouterr" 2>/dev/null)"
         return 1
     fi
+    rm -f "$newroot/mouterr"
 
     [ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null || true
     sync

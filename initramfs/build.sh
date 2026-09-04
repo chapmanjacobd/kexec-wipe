@@ -69,6 +69,30 @@ install_busybox() {
 
 # Copy a dynamically-linked binary plus its shared libraries into the build dir.
 # Reuses the ldd-parsing approach also used for nvme-cli.
+# Copy a shared library into the build, preserving the soname symlink that the
+# dynamic loader needs. `resolved` is the soname path from ldd (e.g.
+# /usr/lib64/libcurl.so.4); we copy the real versioned file and add a symlink
+# from the soname to it (libcurl.so.4 -> libcurl.so.4.8.0).
+copy_lib() {
+    local resolved="$1"
+    local lib_dir="$BUILD_DIR/lib"
+
+    [ -f "$resolved" ] || return 0
+
+    local real soname
+    real=$(readlink -f "$resolved" 2>/dev/null || echo "$resolved")
+    soname=$(basename "$resolved")
+    local realname
+    realname=$(basename "$real")
+
+    if [ -f "$real" ] && [ ! -e "$lib_dir/$realname" ]; then
+        cp -L "$real" "$lib_dir/$realname"
+    fi
+    if [ "$soname" != "$realname" ] && [ ! -e "$lib_dir/$soname" ]; then
+        ln -sf "$realname" "$lib_dir/$soname"
+    fi
+}
+
 copy_bin_with_libs() {
     local bin="$1"
     local target="$2"
@@ -92,14 +116,7 @@ copy_bin_with_libs() {
             /*) ;;
             *) continue ;;
         esac
-        [ -f "$resolved" ] || continue
-        local real
-        real=$(readlink -f "$resolved" 2>/dev/null || echo "$resolved")
-        local name
-        name=$(basename "$real")
-        if [ -f "$real" ] && [ ! -e "$lib_dir/$name" ]; then
-            cp -L "$real" "$lib_dir/$name"
-        fi
+        copy_lib "$resolved"
     done
     return 0
 }
@@ -257,18 +274,7 @@ copy_nvme_with_libs() {
             *) continue ;;
         esac
 
-        [ -f "$resolved" ] || continue
-
-        local lib_name
-        lib_name=$(basename "$resolved")
-
-        # Resolve symlinks to the actual file
-        local real_path
-        real_path=$(readlink -f "$resolved" 2>/dev/null || echo "$resolved")
-
-        if [ -f "$real_path" ] && [ ! -e "$lib_dir/$lib_name" ]; then
-            cp -L "$real_path" "$lib_dir/$lib_name"
-        fi
+        copy_lib "$resolved"
     done
 
     # Copy ld-linux-x86-64.so.2 (the dynamic linker) into the right place
@@ -302,8 +308,10 @@ build_initramfs() {
     cd "$BUILD_DIR/bin"
     for cmd in sh bash mount umount mkdir cat echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
-               lsblk blkid fdisk parted sync dd chroot sha256sum chmod \
-               udhcpc ip xz unlzma lzcat modprobe awk switch_root timeout; do
+               lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
+               lsmod insmod rmmod modinfo \
+               udhcpc ip xz unlzma lzcat modprobe awk switch_root timeout \
+               cut sort basename dirname expr printf seq stat touch; do
         ln -sf busybox "$cmd"
     done
     cd "$REPO_DIR"
