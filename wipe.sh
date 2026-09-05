@@ -639,11 +639,23 @@ do_kexec_wipe() {
         local fedora="${WIPE_TMPDIR}/fedora.raw.xz"
         download_fedora_image "$fedora"
 
-        # Capture the host's hostname and authorized_keys for user provisioning.
+        # Capture the host hostname and the user to provision on the fresh install.
+        # The provision user prefers the invoking user ($SUDO_USER) so the new
+        # account matches the person running the wipe, falling back to the
+        # hostname when there is no sudo user (e.g. run directly as root).
         local host_hostname
         host_hostname=$(hostname)
         echo "$host_hostname" > "${WIPE_TMPDIR}/hostname"
         info "  Hostname:  $host_hostname"
+
+        local provision_user
+        if [ -n "${SUDO_USER:-}" ]; then
+            provision_user="$SUDO_USER"
+        else
+            provision_user="$host_hostname"
+        fi
+        echo "$provision_user" > "${WIPE_TMPDIR}/user"
+        info "  User:       $provision_user"
 
         local auth_keys=""
         if [ -f "${HOME:-/root}/.ssh/authorized_keys" ]; then
@@ -663,6 +675,7 @@ do_kexec_wipe() {
         local augmented
         augmented=$(augment_initramfs "$initramfs_path" "/opt/fedora.raw.xz" "$fedora")
         augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-hostname" "${WIPE_TMPDIR}/hostname")
+        augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-user" "${WIPE_TMPDIR}/user")
         augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-authorized_keys" "${WIPE_TMPDIR}/authorized_keys")
         initramfs_path="$augmented"
         info "  Augmented initramfs: $initramfs_path"

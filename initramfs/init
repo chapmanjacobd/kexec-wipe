@@ -57,6 +57,7 @@ parse_cmdline() {
     # empty, the pinned release/checksum above is used.
     KEXEC_WIPE_FEDORA_IMAGE=""
     KEXEC_WIPE_HOSTNAME=""
+    KEXEC_WIPE_USER=""
 
     for arg in $cmdline; do
         case "$arg" in
@@ -82,9 +83,14 @@ parse_cmdline() {
         fatal "No target device specified in kernel command line."
     fi
 
-    # Read the hostname from the embedded file (written by the host-side script).
+    # Read the host hostname and the provision user from the embedded files
+    # (written by the host-side script). Either file may be absent (e.g. older
+    # images only embed one of them); tolerate a missing file.
     if [ -f /opt/kexec-wipe-hostname ]; then
         KEXEC_WIPE_HOSTNAME=$(cat /opt/kexec-wipe-hostname)
+    fi
+    if [ -f /opt/kexec-wipe-user ]; then
+        KEXEC_WIPE_USER=$(cat /opt/kexec-wipe-user)
     fi
 }
 
@@ -568,22 +574,30 @@ sanitize_username() {
 }
 
 # Configure a user account and SSH access on the freshly written Fedora image.
-# The hostname is used as the username; authorized_keys is read from the
-# embedded file at /opt/kexec-wipe-authorized_keys.
+# The provision user (embedded at /opt/kexec-wipe-user) is used as the
+# username, falling back to the hostname file when no separate user was
+# embedded. authorized_keys is read from the embedded file at
+# /opt/kexec-wipe-authorized_keys.
 configure_fedora_user() {
-    if [ -z "$KEXEC_WIPE_HOSTNAME" ]; then
-        warn "No hostname; skipping user provisioning."
+    # Prefer the provision user; fall back to the hostname for images that only
+    # embed one of the two.
+    local provision_user="$KEXEC_WIPE_USER"
+    if [ -z "$provision_user" ]; then
+        provision_user="$KEXEC_WIPE_HOSTNAME"
+    fi
+    if [ -z "$provision_user" ]; then
+        warn "No provision user; skipping user provisioning."
         return 0
     fi
 
     local username
-    username=$(sanitize_username "$KEXEC_WIPE_HOSTNAME")
+    username=$(sanitize_username "$provision_user")
     if [ -z "$username" ]; then
-        warn "Hostname '$KEXEC_WIPE_HOSTNAME' produced empty username; skipping user provisioning."
+        warn "Provision user '$provision_user' produced empty username; skipping user provisioning."
         return 0
     fi
 
-    log "Configuring user '$username' (from hostname '$KEXEC_WIPE_HOSTNAME')..."
+    log "Configuring user '$username' (source: '$provision_user')..."
 
     local rootpart
     rootpart=$(first_root_part "$KEXEC_WIPE_DEV")
