@@ -4,13 +4,8 @@ Sanitize an NVMe device and permanently destroy its data. kexec-wipe works on a 
 
 ## Quick start
 
-Download the script, inspect it, then run it as root.
-
 ```bash
-# 1. Download
 curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
-
-# 2. Run (type YES to confirm)
 sudo bash wipe.sh /dev/nvme0n1
 ```
 
