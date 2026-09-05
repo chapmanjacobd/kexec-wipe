@@ -376,60 +376,38 @@ try_overwrite() {
     return 1
 }
 
-# Query the NVMe sanitize log and echo "<state> <progress>", where <state> is
-# one of: in-progress, success, failure, none. <progress> is the raw SPROG
-# value (0-65535). Returns 1 if the log could not be read.
+# Query the NVMe sanitize log and echo the sanitize state: one of "success",
+# "in-progress", "failure", or "none". Returns 1 if the log could not be read.
+#
+# The drive's own sanitize-log output is forwarded to the terminal verbatim and
+# only the stable human-readable "(SSTAT)" line is parsed for the state.
+# nvme-cli's JSON layout is not stable across versions (1.x nests sstat as an
+# object whose status is a human-readable string, 2.x emits flat integers), so
+# JSON is not parsed.
 #
 # NOTE: This whole function is intentionally duplicated in initramfs/init.
 # This library runs under bash on the host (assembled into wipe.sh), while
-# initramfs/init runs under busybox sh in the in-memory environment, so the two
-# cannot share code. Keep both copies identical when changing the SPROG/SSTAT
-# parsing.
+# initramfs/init runs under busybox ash in the in-memory environment, so the two
+# cannot share code. Keep both copies identical when changing the SSTAT parsing.
 sanitize_log_state() {
     local dev="$1"
-    local log sprog sstat status
+    local out sstat status
 
-    log=$(nvme sanitize-log "$dev" -o json 2>/dev/null) || return 1
+    out=$(nvme sanitize-log "$dev" 2>&1) || return 1
+    printf '%s\n' "$out" >&2
 
-    # Extract SPROG/SSTAT robustly. nvme-cli versions differ: some emit flat
-    # decimal integers, some hex ("0x.."), and 1.x nests sstat as an object with
-    # a human-readable "status" string. The awk handles all three forms. Values
-    # may be hex; bash arithmetic interprets the "0x" prefix directly.
-    read -r sprog sstat <<EOF
-$(printf '%s' "$log" | awk '
-    BEGIN { sprog=""; sstat=""; instat=0 }
-    {
-        line=$0
-        if (sprog=="" && match(line, /"sprog"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
-            v=substr(line,RSTART,RLENGTH); sub(/^"sprog"[^0-9a-fA-Fx]*/,"",v); sprog=v
-        }
-        if (match(line, /"sstat"[ \t]*:/)) {
-            tail=substr(line,RSTART+RLENGTH)
-            if (tail ~ /^[ \t]*\{/) {
-                instat=1
-            } else if (sstat=="" && match(tail, /^[ \t]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
-                v=substr(tail,RSTART,RLENGTH); sub(/^[ \t]*/,"",v); sstat=v; instat=0
-            }
-        }
-        if (instat==1 && sstat=="" && match(line, /"status"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
-            v=substr(line,RSTART,RLENGTH); sub(/^"status"[^0-9a-fA-Fx]*/,"",v); sstat=v; instat=0
-        }
-    }
-    END { print sprog, sstat }
-')
-EOF
-
+    sstat=$(printf '%s\n' "$out" | sed -n 's/.*(SSTAT)[[:space:]]*:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
     [ -n "$sstat" ] || return 1
-    [ -n "$sprog" ] || sprog=0
 
     # SSTAT status is in bits [2:0]: 0x1 success, 0x2 in progress,
-    # 0x3 failure, 0x4 no-deallocate success.
+    # 0x3 failure, 0x4 no-deallocate success. Values may be hex ("0x..");
+    # bash arithmetic interprets the "0x" prefix directly.
     status=$((sstat & 0x7))
     case "$status" in
-        1|4) echo "success $sprog" ;;
-        2)   echo "in-progress $sprog" ;;
-        3)   echo "failure $sprog" ;;
-        *)   echo "none $sprog" ;;   # never sanitized / no status yet
+        1|4) echo "success" ;;
+        2)   echo "in-progress" ;;
+        3)   echo "failure" ;;
+        *)   echo "none" ;;   # never sanitized / no status yet
     esac
 }
 
@@ -442,35 +420,17 @@ wait_for_sanitize() {
     info "Waiting for sanitize to complete (timeout: ${timeout}s)..."
 
     while [ "$elapsed" -lt "$timeout" ]; do
-        local state progress result
-        result=$(sanitize_log_state "$dev") || result="none 0"
-        state=${result%% *}
-        progress=${result#* }
+        local state
+        state=$(sanitize_log_state "$dev") || state="none"
 
         case "$state" in
-            in-progress)
-                local pct=0
-                # SPROG is a fraction of 0x10000 (65536); progress is its numerator.
-                pct=$(( progress * 100 / 65536 ))
-                printf "\r  Sanitizing... %d%% " "$pct"
-                ;;
             success)
-                echo ""
                 success "Sanitize completed successfully ($SANITIZE_METHOD)."
                 return 0
                 ;;
             failure)
-                echo ""
                 error "Sanitize completed with failure."
                 return 1
-                ;;
-            none|*)
-                # No sanitize reported yet: the command may just have started and
-                # the controller has not updated the log. Keep polling.
-                if [ "$elapsed" -eq 0 ]; then
-                    echo ""
-                    warn "No sanitize reported in progress yet."
-                fi
                 ;;
         esac
 
@@ -478,7 +438,6 @@ wait_for_sanitize() {
         elapsed=$((elapsed + interval))
     done
 
-    echo ""
     error "Sanitize timed out after ${timeout}s."
     return 1
 }
@@ -993,7 +952,7 @@ main "$@"
 # --- begin embedded: initramfs/init ---
 write_embedded_initramfs_init() {
     cat > "$1" <<'KW_EMBED_init_EOF'
-#!/bin/sh
+#!/bin/ash
 #
 # kexec-wipe initramfs init script
 #
@@ -1189,58 +1148,37 @@ do_sanitize() {
     fi
 }
 
-# Query the NVMe sanitize log and echo "<state> <progress>", where <state> is
-# one of: in-progress, success, failure, none. <progress> is the raw SPROG
-# value (0-65535). Returns 1 if the log could not be read.
+# Query the NVMe sanitize log and echo the sanitize state: one of "success",
+# "in-progress", "failure", or "none". Returns 1 if the log could not be read.
+#
+# The drive's own sanitize-log output is forwarded to the terminal verbatim and
+# only the stable human-readable "(SSTAT)" line is parsed for the state.
+# nvme-cli's JSON layout is not stable across versions (1.x nests sstat as an
+# object whose status is a human-readable string, 2.x emits flat integers), so
+# JSON is not parsed.
 #
 # NOTE: This whole function is intentionally duplicated in lib/sanitize.sh.
-# This init runs under busybox sh inside the in-memory environment, while
+# This init runs under busybox ash inside the in-memory environment, while
 # lib/sanitize.sh runs under bash on the host, so the two cannot share code.
-# Keep both copies identical when changing the SPROG/SSTAT parsing.
+# Keep both copies identical when changing the SSTAT parsing.
 sanitize_log_state() {
-    local log sstat sprog status
+    local out sstat status
 
-    log=$(nvme sanitize-log "$KEXEC_WIPE_DEV" -o json 2>/dev/null) || return 1
+    out=$(nvme sanitize-log "$KEXEC_WIPE_DEV" 2>&1) || return 1
+    printf '%s\n' "$out" >&2
 
-    # Extract SPROG/SSTAT robustly. nvme-cli versions differ: some emit flat
-    # decimal integers, some hex ("0x.."), and 1.x nests sstat as an object with
-    # a human-readable "status" string. The awk handles all three forms. Values
-    # may be hex; shell arithmetic interprets the "0x" prefix directly.
-    read -r sprog sstat <<EOF
-$(printf '%s' "$log" | awk '
-    BEGIN { sprog=""; sstat=""; instat=0 }
-    {
-        line=$0
-        if (sprog=="" && match(line, /"sprog"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
-            v=substr(line,RSTART,RLENGTH); sub(/^"sprog"[^0-9a-fA-Fx]*/,"",v); sprog=v
-        }
-        if (match(line, /"sstat"[ \t]*:/)) {
-            tail=substr(line,RSTART+RLENGTH)
-            if (tail ~ /^[ \t]*\{/) {
-                instat=1
-            } else if (sstat=="" && match(tail, /^[ \t]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
-                v=substr(tail,RSTART,RLENGTH); sub(/^[ \t]*/,"",v); sstat=v; instat=0
-            }
-        }
-        if (instat==1 && sstat=="" && match(line, /"status"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
-            v=substr(line,RSTART,RLENGTH); sub(/^"status"[^0-9a-fA-Fx]*/,"",v); sstat=v; instat=0
-        }
-    }
-    END { print sprog, sstat }
-')
-EOF
-
+    sstat=$(printf '%s\n' "$out" | sed -n 's/.*(SSTAT)[[:space:]]*:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
     [ -n "$sstat" ] || return 1
-    [ -n "$sprog" ] || sprog=0
 
     # SSTAT status is in bits [2:0]: 0x1 success, 0x2 in progress,
-    # 0x3 failure, 0x4 no-deallocate success.
+    # 0x3 failure, 0x4 no-deallocate success. Values may be hex ("0x..");
+    # ash arithmetic interprets the "0x" prefix directly.
     status=$((sstat & 0x7))
     case "$status" in
-        1|4) echo "success $sprog" ;;
-        2)   echo "in-progress $sprog" ;;
-        3)   echo "failure $sprog" ;;
-        *)   echo "none $sprog" ;;   # never sanitized / no status yet
+        1|4) echo "success" ;;
+        2)   echo "in-progress" ;;
+        3)   echo "failure" ;;
+        *)   echo "none" ;;   # never sanitized / no status yet
     esac
 }
 
@@ -1252,34 +1190,17 @@ wait_for_completion() {
     log "Waiting for sanitize to complete (timeout: ${timeout}s)..."
 
     while [ "$elapsed" -lt "$timeout" ]; do
-        local state progress result pct
-        result=$(sanitize_log_state) || result="none 0"
-        state=${result%% *}
-        progress=${result#* }
+        local state
+        state=$(sanitize_log_state) || state="none"
 
         case "$state" in
-            in-progress)
-                # SPROG is a fraction of 0x10000 (65536); progress is its numerator.
-                pct=$(( progress * 100 / 65536 ))
-                printf "\r  Sanitizing... %d%% " "$pct"
-                ;;
             success)
-                echo ""
                 log "Sanitize completed successfully."
                 return 0
                 ;;
             failure)
-                echo ""
                 log "Sanitize completed with FAILURE."
                 return 1
-                ;;
-            none|*)
-                # No sanitize reported yet: the command may just have started and
-                # the controller has not updated the log. Keep polling.
-                if [ "$elapsed" -eq 0 ]; then
-                    echo ""
-                    log "No sanitize reported in progress yet."
-                fi
                 ;;
         esac
 
@@ -1287,7 +1208,6 @@ wait_for_completion() {
         elapsed=$((elapsed + interval))
     done
 
-    echo ""
     log "Timed out waiting for sanitize."
     return 1
 }
@@ -1458,7 +1378,9 @@ write_fedora_image() {
 # are the only candidates that could hold the OS root.
 candidate_root_parts() {
     local dev="$1"
-    blkid "$dev"* 2>/dev/null | grep -iE 'TYPE="(xfs|ext4|ext3|ext2|btrfs)"' | cut -d: -f1
+    # Match only partitions ("pN") of this namespace, not sibling namespaces
+    # (e.g. nvme0n10) that happen to share the "nvme0n1" prefix.
+    blkid "${dev}"p* 2>/dev/null | grep -iE 'TYPE="(xfs|ext4|ext3|ext2|btrfs)"' | cut -d: -f1
 }
 
 # Try mounting each candidate partition under $1 (mountpoint) and return the
@@ -1911,10 +1833,10 @@ main() {
         configure_fedora_user
         log "Booting into freshly installed Fedora..."
         sleep 3
-        if switch_to_fedora; then
-            # switch_root exec's into systemd; we only reach here on failure.
-            :
-        fi
+        # switch_to_fedora exec's switch_root into systemd on success (it never
+        # returns); reaching this point means it returned non-zero, so fall back
+        # to a plain reboot.
+        switch_to_fedora || true
         log "switch_root failed; falling back to reboot."
         sleep 2
     else
@@ -2237,7 +2159,7 @@ build_initramfs() {
 
     # Create busybox symlinks
     cd "$BUILD_DIR/bin"
-    for cmd in sh bash mount umount mountpoint mkdir cat cp echo ls grep sed mknod sleep \
+    for cmd in ash sh bash mount umount mountpoint mkdir cat cp echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
                lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
                xz unlzma lzcat modprobe awk switch_root timeout \

@@ -302,7 +302,7 @@ build_initramfs() {
 
     # Create busybox symlinks
     cd "$BUILD_DIR/bin"
-    for cmd in sh bash mount umount mountpoint mkdir cat cp echo ls grep sed mknod sleep \
+    for cmd in ash sh bash mount umount mountpoint mkdir cat cp echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
                lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
                xz unlzma lzcat modprobe awk switch_root timeout \
