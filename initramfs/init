@@ -651,7 +651,7 @@ configure_fedora_user() {
         chroot "$mnt" /bin/bash -c "mkdir -p /etc/sudoers.d && echo '$username ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/$username && chmod 0440 /etc/sudoers.d/$username" 2>/dev/null || warn "Could not configure sudo for '$username'."
 
         # Set up SSH authorized_keys.
-        chroot "$mnt" /bin/bash -c "mkdir -p /home/$username/.ssh && chmod 0700 /home/$username/.ssh" 2>/dev/null || true
+        chroot "$mnt" /bin/bash -c "mkdir -p /home/$username/.ssh && chown $username:$username /home/$username/.ssh && chmod 0700 /home/$username/.ssh" 2>/dev/null || true
         if [ -f /opt/kexec-wipe-authorized_keys ] && [ -s /opt/kexec-wipe-authorized_keys ]; then
             cp /opt/kexec-wipe-authorized_keys "$mnt/home/$username/.ssh/authorized_keys"
             chroot "$mnt" /bin/bash -c "chown $username:$username /home/$username/.ssh/authorized_keys && chmod 0600 /home/$username/.ssh/authorized_keys" 2>/dev/null || true
@@ -748,6 +748,17 @@ switch_to_fedora() {
             warn "Could not mount $rootpart for switch_root."
             return 1
         fi
+    fi
+
+    # The provisioning chroot ran without a loaded SELinux policy, so the files
+    # it touched (/etc/passwd, /etc/shadow, /home/..., ...) are unlabeled. On
+    # SELinux-enforcing systems that breaks confined services (dbus-broker,
+    # sshd) on the first real boot. Schedule a relabel via the installed
+    # system's standard /.autorelabel mechanism.
+    if [ -f "$newroot/etc/selinux/config" ] && \
+       grep -qE '^SELINUX=(enforcing|permissive)' "$newroot/etc/selinux/config" 2>/dev/null; then
+        touch "$newroot/.autorelabel"
+        log "SELinux relabel scheduled (/.autorelabel)."
     fi
 
     [ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null || true

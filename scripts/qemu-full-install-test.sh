@@ -155,6 +155,9 @@ users:
     ssh_authorized_keys:
       - $(cat "$SSH_PUBKEY")
     shell: /bin/bash
+  - name: root
+    ssh_authorized_keys:
+      - $(cat "$SSH_PUBKEY")
 chpasswd:
   list: |
     root:kexecwipetest
@@ -215,16 +218,24 @@ stop_vm() {
     QEMU_PID=""
 }
 
-guest_ssh() {
+root_ssh() {
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o IdentitiesOnly=yes -i "$SSH_PRIVKEY" \
-        -o ConnectTimeout=6 "$GUEST_USER@127.0.0.1" -p "$PORT" "$@"
+        -o ConnectTimeout=6 root@127.0.0.1 -p "$PORT" "$@"
+}
+
+user_ssh() {
+    local user="$1"
+    shift
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o IdentitiesOnly=yes -i "$SSH_PRIVKEY" \
+        -o ConnectTimeout=6 "$user@127.0.0.1" -p "$PORT" "$@"
 }
 
 wait_guest_ssh() {
-    echo "==> Waiting for guest ssh"
+    echo "==> Waiting for guest ssh (root)"
     local tries=0
-    until guest_ssh 'echo UP' 2>/dev/null; do
+    until root_ssh 'echo UP' 2>/dev/null; do
         tries=$((tries + 1))
         [ "$tries" -gt 90 ] && { echo "ERROR: guest ssh did not come up" >&2; exit 1; }
         sleep 5
@@ -234,7 +245,7 @@ wait_guest_ssh() {
 wait_phase1() {
     echo "==> Waiting for Phase-1 setup (kexec-tools/nvme-cli)"
     local tries=0
-    until guest_ssh 'sudo grep -q PHASE1-SETUP-DONE /var/log/cloud-init-output.log' 2>/dev/null; do
+    until root_ssh 'grep -q PHASE1-SETUP-DONE /var/log/cloud-init-output.log' 2>/dev/null; do
         tries=$((tries + 1))
         [ "$tries" -gt 60 ] && { echo "ERROR: Phase-1 setup timed out" >&2; exit 1; }
         sleep 5
@@ -247,29 +258,32 @@ prepare_guest() {
     ( cd "$REPO_DIR" && ./build.sh >/dev/null )
 
     echo "==> Building initramfs in guest (matches guest kernel)"
-    tar czf - -C "$REPO_DIR" initramfs | guest_ssh \
-        'sudo rm -rf /opt/kw-initramfs && sudo mkdir -p /opt/kw-initramfs && sudo tar xzf - -C /opt/kw-initramfs && \
-         cd /opt/kw-initramfs/initramfs && sudo bash build.sh --output=/root/kexec-wipe-initramfs-x86_64.cpio.gz' \
+    tar czf - -C "$REPO_DIR" initramfs | root_ssh \
+        'rm -rf /opt/kw-initramfs && mkdir -p /opt/kw-initramfs && \
+         tar xzf - -C /opt/kw-initramfs && cd /opt/kw-initramfs/initramfs && \
+         bash build.sh --output=/root/kexec-wipe-initramfs-x86_64.cpio.gz' \
         | tail -2
 
     echo "==> Installing wipe.sh in guest"
     local newsha
-    newsha=$(guest_ssh 'sudo sha256sum /root/kexec-wipe-initramfs-x86_64.cpio.gz' | awk '{print $1}')
-    cat "$REPO_DIR/wipe.sh" | guest_ssh \
-        "sudo tee /root/wipe.sh > /dev/null && sudo chmod +x /root/wipe.sh && \
-         sudo sed -i 's|^INITRAMFS_URL_x86_64=.*|INITRAMFS_URL_x86_64=\"file:///root/kexec-wipe-initramfs-x86_64.cpio.gz\"|; \
-                 s|^INITRAMFS_SHA256_x86_64=.*|INITRAMFS_SHA256_x86_64=\"$newsha\"|; \
-                 s|cmdline=\"root=/dev/ram rw quiet panic=10\"|cmdline=\"root=/dev/ram rw quiet panic=10 console=ttyS0,115200n8\"|' \
-         /root/wipe.sh && sudo bash -n /root/wipe.sh"
+    newsha=$(root_ssh 'sha256sum /root/kexec-wipe-initramfs-x86_64.cpio.gz' | awk '{print $1}')
+    # Build a guest-local variant of wipe.sh that points at the locally built,
+    # kernel-matched initramfs and puts the kexec console on ttyS0.
+    sed -e "s|^INITRAMFS_URL_x86_64=.*|INITRAMFS_URL_x86_64=\"file:///root/kexec-wipe-initramfs-x86_64.cpio.gz\"|" \
+        -e "s|^INITRAMFS_SHA256_x86_64=.*|INITRAMFS_SHA256_x86_64=\"$newsha\"|" \
+        -e 's|cmdline="root=/dev/ram rw quiet panic=10"|cmdline="root=/dev/ram rw quiet panic=10 console=ttyS0,115200n8"|' \
+        "$REPO_DIR/wipe.sh" \
+        | root_ssh 'cat > /root/wipe.sh && chmod +x /root/wipe.sh && bash -n /root/wipe.sh'
 
     echo "==> Ensuring /root/.ssh/authorized_keys is present for user provisioning"
-    cat "$SSH_PUBKEY" | guest_ssh \
-        'sudo mkdir -p /root/.ssh && sudo tee /root/.ssh/authorized_keys > /dev/null && sudo chmod 600 /root/.ssh/authorized_keys'
+    cat "$SSH_PUBKEY" | root_ssh \
+        'mkdir -p /root/.ssh && cat > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys'
 }
 
 run_wipe() {
     echo "==> Running wipe.sh /dev/nvme0n1 --install-fedora --test-mode"
-    guest_ssh "echo YES | sudo nohup bash -c 'bash /root/wipe.sh /dev/nvme0n1 --install-fedora --test-mode > /root/wipe-run.log 2>&1' &" \
+    # Run as root, but with SUDO_USER set so the provisioned user is $PROVISION_USER.
+    root_ssh "echo YES | SUDO_USER=$PROVISION_USER nohup bash -c 'bash /root/wipe.sh /dev/nvme0n1 --install-fedora --test-mode > /root/wipe-run.log 2>&1' &" \
         >/dev/null 2>&1 || true
 }
 
@@ -305,13 +319,16 @@ check_serial() {
     local switch_line
     switch_line=$(grep -n "Switching root into Fedora" "$SERIAL_LOG" | tail -1 | cut -d: -f1)
     tries=0
+    # Accept either the login banner or a reboot (the first boot may run the
+    # SELinux autorelabel and reboot before getty prints the banner).
     until grep -n "Fedora Linux 44" "$SERIAL_LOG" 2>/dev/null \
-            | awk -F: -v s="$switch_line" '$1 > s' | grep -q .; do
+            | awk -F: -v s="$switch_line" '$1 > s' | grep -q . \
+          || ! kill -0 "$QEMU_PID" 2>/dev/null; do
         tries=$((tries + 1))
-        [ "$tries" -gt 60 ] && { echo "ERROR: fresh Fedora did not boot" >&2; exit 1; }
+        [ "$tries" -gt 90 ] && { echo "ERROR: fresh Fedora did not boot" >&2; exit 1; }
         sleep 5
     done
-    echo "PASS: install pipeline complete, fresh Fedora booted"
+    echo "PASS: install pipeline complete, fresh Fedora started booting"
 }
 
 verify_boot() {
@@ -320,17 +337,29 @@ verify_boot() {
     sleep 3
     boot_vm 0
 
-    echo "==> Waiting for clean boot + ssh as '$PROVISION_USER'"
+    # The first boot may run the SELinux autorelabel (scheduled by the tool),
+    # which relabels the filesystem and reboots, exiting QEMU (-no-reboot).
+    # Detect that and relaunch once.
     local tries=0
-    until ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -o IdentitiesOnly=yes -i "$SSH_PRIVKEY" -o ConnectTimeout=6 \
-              "$PROVISION_USER@127.0.0.1" -p "$PORT" \
-              'test -d /home/'"$PROVISION_USER"' && sudo whoami' 2>/dev/null | grep -q root; do
+    while [ "$tries" -lt 90 ]; do
+        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            echo "==> VM exited (autorelabel reboot); relaunching"
+            sleep 3
+            boot_vm 0
+            tries=$((tries + 1))
+            sleep 5
+            continue
+        fi
+        if user_ssh "$PROVISION_USER" \
+                'test -d "$HOME" && sudo whoami' 2>/dev/null | grep -q root; then
+            echo "PASS: installed Fedora boots cleanly and ssh as '$PROVISION_USER' works"
+            return 0
+        fi
         tries=$((tries + 1))
-        [ "$tries" -gt 90 ] && { echo "ERROR: installed Fedora ssh verification failed" >&2; exit 1; }
         sleep 5
     done
-    echo "PASS: installed Fedora boots cleanly and ssh as '$PROVISION_USER' works"
+    echo "ERROR: installed Fedora ssh verification failed" >&2
+    exit 1
 }
 
 cleanup() {
