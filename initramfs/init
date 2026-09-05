@@ -462,6 +462,20 @@ mount_sibling_subvolumes() {
     done < "$mnt/etc/fstab"
 }
 
+# Unmount everything mounted beneath a mount point (deepest first), leaving the
+# top mount itself intact. Used so sibling subvolumes do not leave the root
+# mount busy, and so switch_root hands a clean tree to systemd.
+unmount_tree() {
+    local top="$1" tmp="/tmp/unmount-tree.$$"
+    awk -v top="$top" 'index($2, top "/") == 1 { print length($2), $2 }' \
+        /proc/mounts 2>/dev/null | sort -rn | awk '{ print $2 }' > "$tmp"
+    local m
+    while IFS= read -r m; do
+        umount "$m" 2>/dev/null || true
+    done < "$tmp"
+    rm -f "$tmp"
+}
+
 # Install a bootloader into the Fedora image so it boots on bare metal.
 # We chroot into the image's root and run its own grub2-install, which keeps the
 # image's normal boot config and covers both UEFI and legacy BIOS targets.
@@ -527,9 +541,7 @@ install_bootloader() {
     fi
 
     sync
-    umount "$mnt/dev" 2>/dev/null || true
-    umount "$mnt/sys" 2>/dev/null || true
-    umount "$mnt/proc" 2>/dev/null || true
+    unmount_tree "$mnt"
     umount "$mnt" 2>/dev/null || true
 }
 
@@ -641,9 +653,7 @@ configure_fedora_user() {
     fi
 
     sync
-    umount "$mnt/dev" 2>/dev/null || true
-    umount "$mnt/sys" 2>/dev/null || true
-    umount "$mnt/proc" 2>/dev/null || true
+    unmount_tree "$mnt"
     umount "$mnt" 2>/dev/null || true
 
     log "User provisioning complete."
@@ -728,6 +738,9 @@ switch_to_fedora() {
 
     [ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null || true
     sync
+
+    # Drop the sibling subvolumes so systemd mounts them itself per /etc/fstab.
+    unmount_tree "$newroot"
 
     log "Switching root into Fedora ($rootpart)..."
     exec switch_root -c /dev/console "$newroot" /sbin/init
