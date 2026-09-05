@@ -421,11 +421,45 @@ mount_root_part() {
             mount -t btrfs -o "subvol=$sub" "$dev" "$mnt" 2>/dev/null
         fi
         if [ $? -eq 0 ] && [ -e "$mnt/sbin/init" ]; then
+            mount_sibling_subvolumes "$dev" "$mnt"
             return 0
         fi
         umount "$mnt" 2>/dev/null || true
     done
     return 1
+}
+
+# Fedora Cloud Base images also keep /boot, /home and /var in their own btrfs
+# subvolumes. Mount those (as listed in the image's /etc/fstab) underneath the
+# mounted OS root so that chroot operations (grub2-mkconfig, user provisioning)
+# see the real filesystem layout instead of the empty mount-point directories.
+mount_sibling_subvolumes() {
+    local dev="$1" mnt="$2"
+    [ -f "$mnt/etc/fstab" ] || return 0
+
+    local line
+    while IFS= read -r line; do
+        case "$line" in \#*|"") continue ;; esac
+        set -- $line
+        [ $# -lt 4 ] && continue
+        [ "$3" = "btrfs" ] || continue
+        case "$2" in
+            /boot|/home|/var|/opt|/srv|/root) ;;
+            *) continue ;;
+        esac
+        local subvol=""
+        case "$4" in
+            *subvol=*) subvol=$(echo "$4" | sed -n 's/.*subvol=\([^,]*\).*/\1/p') ;;
+            *) continue ;;
+        esac
+        [ -n "$subvol" ] || continue
+        local target="$mnt$2"
+        [ -d "$target" ] || mkdir -p "$target"
+        mountpoint -q "$target" 2>/dev/null && continue
+        if mount -t btrfs -o "subvol=$subvol" "$dev" "$target" 2>/dev/null; then
+            log "  Mounted subvolume $subvol at $2"
+        fi
+    done < "$mnt/etc/fstab"
 }
 
 # Install a bootloader into the Fedora image so it boots on bare metal.
