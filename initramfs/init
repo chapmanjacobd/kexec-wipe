@@ -528,35 +528,82 @@ mount_root_part() {
     return 1
 }
 
+# Resolve an fstab source field ("UUID=...", "LABEL=..." or "/dev/...") to the
+# matching partition device node on the target disk. Echoes the node on success;
+# returns 1 if nothing matches. Used to mount non-btrfs sibling partitions (e.g.
+# the EFI System Partition) inside the chroot.
+resolve_fstab_source() {
+    local src="$1" want val part
+    case "$src" in
+        UUID=*)
+            want=${src#UUID=}
+            for part in /dev/"$(basename "$KEXEC_WIPE_DEV")"p*; do
+                [ -b "$part" ] || continue
+                val=$(blkid "$part" 2>/dev/null | sed -n 's/.*UUID="\([^"]*\)".*/\1/p')
+                [ -n "$val" ] && [ "$val" = "$want" ] && { echo "$part"; return 0; }
+            done
+            ;;
+        LABEL=*)
+            want=${src#LABEL=}
+            for part in /dev/"$(basename "$KEXEC_WIPE_DEV")"p*; do
+                [ -b "$part" ] || continue
+                val=$(blkid "$part" 2>/dev/null | sed -n 's/.*LABEL="\([^"]*\)".*/\1/p')
+                [ -n "$val" ] && [ "$val" = "$want" ] && { echo "$part"; return 0; }
+            done
+            ;;
+        /dev/*)
+            [ -b "$src" ] && { echo "$src"; return 0; }
+            ;;
+    esac
+    return 1
+}
+
 # Fedora Cloud Base images also keep /boot, /home and /var in their own btrfs
-# subvolumes. Mount those (as listed in the image's /etc/fstab) underneath the
-# mounted OS root so that chroot operations (grub2-mkconfig, user provisioning)
-# see the real filesystem layout instead of the empty mount-point directories.
+# subvolumes, and the EFI System Partition at /boot/efi. Mount those (as listed
+# in the image's /etc/fstab) underneath the mounted OS root so that chroot
+# operations (grub2-install, grub2-mkconfig, user provisioning) see the real
+# filesystem layout instead of the empty mount-point directories.
 mount_sibling_subvolumes() {
     local dev="$1" mnt="$2"
     [ -f "$mnt/etc/fstab" ] || return 0
 
-    local line
+    local line src fspath fstype opts subvol target srcdev
     while IFS= read -r line; do
         case "$line" in \#*|"") continue ;; esac
         set -- $line
         [ $# -lt 4 ] && continue
-        [ "$3" = "btrfs" ] || continue
-        case "$2" in
-            /boot|/home|/var|/opt|/srv|/root) ;;
-            *) continue ;;
-        esac
-        local subvol=""
-        case "$4" in
-            *subvol=*) subvol=$(echo "$4" | sed -n 's/.*subvol=\([^,]*\).*/\1/p') ;;
-            *) continue ;;
-        esac
-        [ -n "$subvol" ] || continue
-        local target="$mnt$2"
-        [ -d "$target" ] || mkdir -p "$target"
-        mountpoint -q "$target" 2>/dev/null && continue
-        if mount -t btrfs -o "subvol=$subvol" "$dev" "$target" 2>/dev/null; then
-            log "  Mounted subvolume $subvol at $2"
+        src="$1"; fspath="$2"; fstype="$3"; opts="$4"
+
+        if [ "$fstype" = "btrfs" ]; then
+            case "$fspath" in
+                /boot|/home|/var|/opt|/srv|/root) ;;
+                *) continue ;;
+            esac
+            subvol=""
+            case "$opts" in
+                *subvol=*) subvol=$(echo "$opts" | sed -n 's/.*subvol=\([^,]*\).*/\1/p') ;;
+                *) continue ;;
+            esac
+            [ -n "$subvol" ] || continue
+            target="$mnt$fspath"
+            [ -d "$target" ] || mkdir -p "$target"
+            mountpoint -q "$target" 2>/dev/null && continue
+            if mount -t btrfs -o "subvol=$subvol" "$dev" "$target" 2>/dev/null; then
+                log "  Mounted subvolume $subvol at $fspath"
+            fi
+        elif [ "$fspath" = "/boot/efi" ]; then
+            # The EFI System Partition is a separate non-btrfs partition.
+            # Mount it so chrooted grub2-install can write the bootloader.
+            srcdev=$(resolve_fstab_source "$src") || continue
+            target="$mnt$fspath"
+            [ -d "$target" ] || mkdir -p "$target"
+            mountpoint -q "$target" 2>/dev/null && continue
+            modprobe vfat 2>/dev/null || true
+            if mount -t "$fstype" "$srcdev" "$target" 2>/dev/null; then
+                log "  Mounted EFI partition $srcdev at $fspath"
+            else
+                warn "Could not mount EFI partition $srcdev at $fspath."
+            fi
         fi
     done < "$mnt/etc/fstab"
 }
@@ -600,6 +647,13 @@ install_bootloader() {
         uefi=1
     fi
 
+    # Expose UEFI NVRAM variables to the chroot so grub2-install can register a
+    # boot entry. Not fatal if unavailable; the install falls back to --no-nvram.
+    if [ "$uefi" -eq 1 ] && [ -d "$mnt/sys/firmware/efi" ]; then
+        mkdir -p "$mnt/sys/firmware/efi/efivars"
+        mount -t efivarfs efivarfs "$mnt/sys/firmware/efi/efivars" 2>/dev/null || true
+    fi
+
     if [ -x "$mnt/sbin/grub2-install" ] || [ -x "$mnt/usr/sbin/grub2-install" ]; then
         local grub_target
         grub_target=$(detect_grub_target "$uefi")
@@ -608,7 +662,19 @@ install_bootloader() {
         # grub2-install is the real bootloader install; mkconfig only regenerates
         # the config and is NOT a fallback for a failed install. Report success
         # only when the bootloader was actually written to the disk.
-        if chroot "$mnt" /bin/bash -c "grub2-install --target=$grub_target --no-floppy '$dev' 2>/dev/null || grub2-install --no-floppy '$dev' 2>/dev/null"; then
+        #
+        # Fedora patches grub2-install to refuse EFI installs unless --force is
+        # given (plain grub2-install would replace the image's signed shim/grub
+        # EFI binaries with unsigned ones and break Secure Boot). This is a
+        # fresh install where we explicitly want the bootloader written, so
+        # --force is correct. If efibootmgr cannot register an NVRAM entry (no
+        # efivarfs in the initramfs chroot), retry with --no-nvram: the EFI
+        # files are still written and the disk remains bootable via the
+        # removable-media fallback (EFI/BOOT/BOOTX64.EFI).
+        if chroot "$mnt" /bin/bash -c \
+                "grub2-install --target=$grub_target --no-floppy --force '$dev' 2>/dev/null || \
+                 grub2-install --target=$grub_target --no-floppy --force --no-nvram '$dev' 2>/dev/null || \
+                 grub2-install --no-floppy --force '$dev' 2>/dev/null"; then
             chroot "$mnt" /bin/bash -c "grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1" || true
             log "GRUB installed successfully."
         else

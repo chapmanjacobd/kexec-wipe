@@ -181,11 +181,12 @@ copy_module_with_deps() {
     done
 }
 
-# Stage kernel filesystem modules (xfs/btrfs/ext4) and the NVMe driver modules
-# so the chroot bootloader step can mount the written Fedora image and so the
-# target NVMe is visible after kexec even when the running kernel has NVMe
-# support as modules (e.g. Fedora). Modules are kernel-version-specific, so the
-# build host's matching modules are copied as a reasonable default.
+# Stage kernel filesystem modules (xfs/btrfs/ext4 and fat/vfat) and the NVMe
+# driver modules so the chroot bootloader step can mount the written Fedora
+# image (including its EFI System Partition) and so the target NVMe is visible
+# after kexec even when the running kernel has NVMe support as modules (e.g.
+# Fedora). Modules are kernel-version-specific, so the build host's matching
+# modules are copied as a reasonable default.
 stage_fs_modules() {
     local kver
     kver=$(uname -r)
@@ -199,10 +200,15 @@ stage_fs_modules() {
 
     echo "Staging kernel modules ($kver)..."
     mkdir -p "$dst/kernel/fs"
-    for fs in xfs btrfs ext4; do
-        if [ -d "$src/kernel/fs/$fs" ]; then
-            echo "  - $fs"
-            cp -a "$src/kernel/fs/$fs" "$dst/kernel/fs/"
+    # xfs/btrfs/ext4: the OS root and its btrfs sibling subvolumes.
+    # fat (contains fat.ko + vfat.ko): the EFI System Partition that
+    # grub2-install writes the bootloader to.
+    local deps=0 fsdir
+    for fsdir in xfs btrfs ext4 fat; do
+        if [ -d "$src/kernel/fs/$fsdir" ]; then
+            echo "  - $fsdir"
+            cp -a "$src/kernel/fs/$fsdir" "$dst/kernel/fs/"
+            deps=1
         fi
     done
     # NVMe driver (nvme-core, nvme, nvme-auth, nvme-keyring, ...). Without
@@ -212,19 +218,22 @@ stage_fs_modules() {
         echo "  - nvme (drivers)"
         mkdir -p "$dst/kernel/drivers"
         cp -a "$src/kernel/drivers/nvme" "$dst/kernel/drivers/"
-        # Resolve and copy any dependencies of the NVMe driver modules (e.g.
-        # kernel/crypto/hkdf on kernels where nvme-auth is modular), otherwise
-        # busybox modprobe cannot load nvme after kexec.
-        local mod
-        for mod in $(cd "$dst" && find kernel/drivers/nvme -name '*.ko*' 2>/dev/null); do
-            copy_module_with_deps "$mod" "$src" "$dst"
-        done
+        deps=1
     fi
     # Minimal metadata so modprobe can resolve the staged modules.
     mkdir -p "$dst"
     for f in modules.dep modules.dep.bin modules.builtin modules.builtin.bin modules.alias modules.alias.bin modules.symbols; do
         [ -f "$src/$f" ] && cp "$src/$f" "$dst/$f" 2>/dev/null || true
     done
+    # Resolve and copy transitive module dependencies (e.g. nls_cp437/nls_ascii
+    # for vfat, hkdf for nvme-auth) so busybox modprobe can load them after
+    # kexec.
+    if [ "$deps" -eq 1 ]; then
+        local mod
+        for mod in $(cd "$dst" && find kernel -name '*.ko*' 2>/dev/null); do
+            copy_module_with_deps "$mod" "$src" "$dst"
+        done
+    fi
 }
 
 parse_args() {
