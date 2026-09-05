@@ -398,6 +398,36 @@ first_root_part() {
     echo "${dev}p1"
 }
 
+# Mount the OS root partition, selecting the correct btrfs subvolume when the
+# default subvolume is not the OS root. Fedora Cloud Base images keep the OS in
+# a "root" subvolume while the default subvolume is the (empty) btrfs top
+# level, so a plain "mount -t btrfs" would expose no /usr, /etc or /sbin/init.
+# Returns 0 when the mount point contains a valid OS root.
+mount_root_part() {
+    local dev="$1" mnt="$2" fs="$3"
+
+    if [ "$fs" != "btrfs" ]; then
+        mount -t "$fs" "$dev" "$mnt" 2>/dev/null
+        return $?
+    fi
+
+    modprobe btrfs 2>/dev/null || true
+
+    local sub
+    for sub in "" "root" "@" "@root" "ROOT"; do
+        if [ -z "$sub" ]; then
+            mount -t btrfs "$dev" "$mnt" 2>/dev/null
+        else
+            mount -t btrfs -o "subvol=$sub" "$dev" "$mnt" 2>/dev/null
+        fi
+        if [ $? -eq 0 ] && [ -e "$mnt/sbin/init" ]; then
+            return 0
+        fi
+        umount "$mnt" 2>/dev/null || true
+    done
+    return 1
+}
+
 # Install a bootloader into the Fedora image so it boots on bare metal.
 # We chroot into the image's root and run its own grub2-install, which keeps the
 # image's normal boot config and covers both UEFI and legacy BIOS targets.
@@ -432,11 +462,10 @@ install_bootloader() {
     local mnt
     mnt=/mnt/root
     mkdir -p "$mnt"
-    if ! mount -t "$rootfs" "$rootpart" "$mnt" 2>"$mnt/mouterr"; then
-        warn "Could not mount $rootpart: $(cat "$mnt/mouterr" 2>/dev/null)"
+    if ! mount_root_part "$rootpart" "$mnt" "$rootfs"; then
+        warn "Could not mount $rootpart; skipping bootloader install."
         return 0
     fi
-    rm -f "$mnt/mouterr"
 
     # Bind system pseudo-fses so chrooted tools work.
     mount -t proc proc "$mnt/proc" 2>/dev/null || true
@@ -533,11 +562,10 @@ configure_fedora_user() {
 
     local mnt=/mnt/root
     mkdir -p "$mnt"
-    if ! mount -t "$rootfs" "$rootpart" "$mnt" 2>"$mnt/mouterr"; then
-        warn "Could not mount $rootpart for user provisioning: $(cat "$mnt/mouterr" 2>/dev/null)"
+    if ! mount_root_part "$rootpart" "$mnt" "$rootfs"; then
+        warn "Could not mount $rootpart for user provisioning; skipping."
         return 0
     fi
-    rm -f "$mnt/mouterr"
 
     mount -t proc proc "$mnt/proc" 2>/dev/null || true
     mount -t sysfs sys "$mnt/sys" 2>/dev/null || true
@@ -658,11 +686,10 @@ switch_to_fedora() {
     mkdir -p "$newroot"
     # If the mount fallback already mounted it, don't mount again.
     if ! mountpoint -q "$newroot" 2>/dev/null; then
-        if ! mount -t "$rootfs" "$rootpart" "$newroot" 2>"$newroot/mouterr"; then
-            warn "Could not mount $rootpart for switch_root: $(cat "$newroot/mouterr" 2>/dev/null)"
+        if ! mount_root_part "$rootpart" "$newroot" "$rootfs"; then
+            warn "Could not mount $rootpart for switch_root."
             return 1
         fi
-        rm -f "$newroot/mouterr"
     fi
 
     [ -e /dev/console ] || mknod /dev/console c 5 1 2>/dev/null || true
