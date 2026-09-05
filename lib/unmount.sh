@@ -8,21 +8,25 @@ unmount_device() {
 
     info "Unmounting partitions on $dev..."
 
-    # Unmount deepest paths first (longest mount point first)
+    # lsblk reports the mount points of the whole disk, every partition, and
+    # each subvolume (e.g. "/" and "/home" from one btrfs partition) on separate
+    # lines. findmnt on the whole-disk device does NOT enumerate child
+    # partitions, so we use lsblk instead.
     local mounts
-    mounts=$(findmnt -rno TARGET "/dev/$devname" 2>/dev/null \
-        | awk '{ print length, $0 }' | sort -rn | awk '{ $1=""; print }' | xargs) || true
+    mounts=$(lsblk -lno MOUNTPOINTS "/dev/$devname" 2>/dev/null | grep -E '^/' || true)
 
+    # Unmount deepest paths first (longest mount point first)
     if [ -n "$mounts" ]; then
-        for tgt in $mounts; do
+        local tgt
+        for tgt in $(printf '%s\n' "$mounts" | awk '{ print length, $0 }' | sort -rn | awk '{ $1=""; print }'); do
             [ -z "$tgt" ] && continue
             info "  Unmounting $tgt"
             umount -f "$tgt" 2>/dev/null || umount -l "$tgt" 2>/dev/null || true
         done
     fi
 
-    # Also check the device itself
-    if mount | grep -q "^$dev "; then
+    # Fallback if lsblk is unavailable: check the device node itself.
+    if ! command -v lsblk >/dev/null 2>&1 && mount | grep -q "^$dev "; then
         info "  Unmounting $dev"
         umount -f "$dev" 2>/dev/null || umount -l "$dev" 2>/dev/null || true
     fi
@@ -34,7 +38,12 @@ deactivate_swap() {
     devname=$(basename "$dev")
 
     info "Deactivating swap on $dev..."
-    swapoff "/dev/$devname"* 2>/dev/null || true
+    local part
+    for part in /dev/"$devname"*; do
+        [ -b "$part" ] || continue
+        [ "$part" = "$dev" ] && continue
+        swapoff "$part" 2>/dev/null || true
+    done
 }
 
 remove_lvm() {
@@ -71,8 +80,9 @@ remove_raid() {
 
     info "Checking for MD RAID on $dev..."
 
-    local md_paths
-    md_paths=$(cat /proc/mdstat 2>/dev/null | grep "$(basename "$dev")" | awk '{print $1}' || true) || true
+    local md_paths=""
+    # grep exits 1 when no array uses this disk; turn that into an empty list.
+    md_paths=$(cat /proc/mdstat 2>/dev/null | grep "$(basename "$dev")" | awk '{print $1}') || md_paths=""
 
     if [ -n "$md_paths" ]; then
         for md in $md_paths; do
@@ -93,6 +103,8 @@ detach_device() {
     # Unmount first so LVM/RAID teardown doesn't fail with "device is busy".
     unmount_device "$dev"
     deactivate_swap "$dev"
-    remove_raid "$dev"
+    # Deactivate LVM before stopping MD arrays: an active VG on an MD member
+    # keeps the array busy and mdadm --stop will fail until the VG is inactive.
     remove_lvm "$dev"
+    remove_raid "$dev"
 }

@@ -28,8 +28,8 @@ get_device_info() {
 
     local model="" serial="" size_bytes=""
 
-    model=$(nvme id-ctrl "$dev" -o xml 2>/dev/null | sed -n 's/.*<mn>\(.*\)<\/mn>.*/\1/p' | head -1) || true
-    serial=$(nvme id-ctrl "$dev" -o xml 2>/dev/null | sed -n 's/.*<sn>\(.*\)<\/sn>.*/\1/p' | head -1) || true
+    model=$(nvme id-ctrl "$dev" -o json 2>/dev/null | sed -n 's/.*"mn"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
+    serial=$(nvme id-ctrl "$dev" -o json 2>/dev/null | sed -n 's/.*"sn"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
     size_bytes=$(blockdev --getsize64 "$dev" 2>/dev/null) || true
 
     # Fallbacks via sysfs
@@ -47,30 +47,45 @@ get_device_info() {
     echo "Path:     $dev"
 }
 
+# Return 0 (true) if the given device is the disk backing the root filesystem.
+# If the root device cannot be determined, it conservatively returns 0 so the
+# caller picks the (safer) kexec wipe path rather than wiping a mounted disk in
+# place.
 is_root_device() {
     local dev="$1"
     local devname
     devname=$(basename "$dev")
 
-    # Get the device name of the root filesystem (strip partition suffix).
     # findmnt reports btrfs subvolume roots as "/dev/nvme0n1p3[/root]"; strip
     # the "[...]" suffix so the path is the plain block device.
-    local root_dev
-    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null) || return 1
-    root_dev="${root_dev%%\[*\]}"
-    root_dev=$(basename "$root_dev")
-    # Use lsblk to find the parent (disk) device. This correctly handles
-    # NVMe (nvme0n1p2 -> nvme0n1), mmcblk (mmcblk0p1 -> mmcblk0), and
-    # traditional (sda1 -> sda) partition naming.
-    local parent
-    parent=$(lsblk -n -o PKNAME "/dev/$root_dev" 2>/dev/null | head -1) || true
-    if [ -n "$parent" ]; then
-        root_dev="$parent"
-    else
-        # Fallback: best-effort string stripping
-        root_dev="${root_dev%%p[0-9]*}"
-        root_dev="${root_dev%%[0-9]*}"
+    local src
+    src=$(findmnt -n -o SOURCE / 2>/dev/null) || return 0
+    src="${src%%\[*\]}"
+
+    if ! command -v lsblk >/dev/null 2>&1; then
+        return 0
     fi
 
-    [ "$root_dev" = "$devname" ]
+    # Walk up to the whole-disk device backing the root mount. A single lsblk
+    # PKNAME hop is not enough when the root sits on a dm/partition (e.g. LVM
+    # on nvme0n1p2), so walk until lsblk reports no further parent.
+    local parent=""
+    local node="$src"
+    local hops=8
+    while [ "$hops" -gt 0 ]; do
+        local p
+        p=$(lsblk -n -o PKNAME "$node" 2>/dev/null | head -1) || true
+        [ -n "$p" ] || break
+        parent="$p"
+        node="/dev/$p"
+        hops=$((hops - 1))
+    done
+
+    # If the root sits directly on a whole disk (no partition parent), the walk
+    # breaks immediately and $src itself is the disk.
+    if [ -z "$parent" ]; then
+        parent=$(basename "$src")
+    fi
+
+    [ "$parent" = "$devname" ]
 }

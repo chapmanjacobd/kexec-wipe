@@ -2,10 +2,11 @@
 
 usage() {
     cat <<EOF
-kexec-wipe - Securely wipe NVMe drives
+kexec-wipe - Sanitize NVMe devices
 
 Usage:
-  curl -sL https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
+  curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
+  sudo bash wipe.sh /dev/nvme0n1
   sudo ./wipe.sh /dev/nvme0n1 [OPTIONS]
 
 Arguments:
@@ -14,13 +15,13 @@ Arguments:
 Options:
   --method=METHOD       Sanitize method (default: auto)
                         auto       - Try crypto-erase, then block-erase
-                        crypto     - Crypto-erase only (fastest for SED drives)
+                        crypto     - Crypto-erase only (fastest for self-encrypting devices)
                         block      - Block-erase only
                         overwrite  - Overwrite (slowest, most thorough)
   --dry-run             Show what would be done without making changes
-  --install-fedora      After sanitizing the root disk via kexec, write a
-                        Fedora Cloud Base image and install a bootloader so it
-                        can boot. Requires the root-disk (kexec) path.
+  --install-fedora      After sanitizing the device via kexec, write a Fedora
+                        Cloud Base image and install a bootloader so it can boot.
+                        Works on the root device or any other device.
   --test-mode           TESTING ONLY: continue even if the sanitize command is
                         not supported by the device (e.g. QEMU's emulated
                         NVMe). Never use on real hardware.
@@ -33,8 +34,8 @@ Examples:
   sudo bash wipe.sh /dev/nvme0n1 --dry-run
 
 How it works:
-  Non-root disk: unmounts partitions, runs nvme sanitize directly.
-  Root disk: kexec's into a minimal in-memory environment to sanitize
+  Non-root device: unmounts partitions, runs nvme sanitize directly.
+  Root device: kexec's into a minimal in-memory environment to sanitize
   without any mounted filesystems, then reboots.
 EOF
 }
@@ -89,7 +90,7 @@ parse_args() {
 print_banner() {
     echo ""
     echo -e "${BOLD}kexec-wipe v${WIPE_VERSION}${RESET}"
-    echo -e "${BOLD}Secure NVMe Drive Sanitization${RESET}"
+    echo -e "${BOLD}Secure NVMe Device Sanitization${RESET}"
     echo ""
 }
 
@@ -100,22 +101,34 @@ main() {
     check_root
     validate_device "$TARGET_DEVICE"
 
-    # Non-root path needs nvme-cli on the host; root path gets it from initramfs
+    # Non-root path needs nvme-cli on the host; the kexec path gets it from the
+    # initramfs. --install-fedora also takes the kexec path on any disk: it
+    # writes an image, installs a bootloader and switch_roots into the fresh
+    # OS, all of which happen inside the minimal environment.
     local is_root=0
     if is_root_device "$TARGET_DEVICE"; then
         is_root=1
-    else
-        if ! command -v nvme &>/dev/null; then
-            fatal "nvme-cli is required but not found. Install it with your package manager."
-        fi
-        if [ "$INSTALL_FEDORA" -eq 1 ]; then
-            fatal "--install-fedora requires targeting the root disk (it runs inside the kexec initramfs)."
-        fi
+    fi
+
+    local use_kexec=0
+    if [ "$is_root" -eq 1 ] || [ "$INSTALL_FEDORA" -eq 1 ]; then
+        use_kexec=1
+    fi
+
+    if [ "$use_kexec" -eq 1 ]; then
+        # Fail fast on unsupported architectures before any destructive action.
+        check_arch
+    elif ! command -v nvme &>/dev/null; then
+        fatal "nvme-cli is required but not found. Install it with your package manager."
     fi
 
     if [ "$is_root" -eq 1 ]; then
-        warn "TARGET DEVICE IS THE ROOT DISK!"
+        warn "TARGET DEVICE IS THE ROOT DEVICE!"
         warn "This will kexec into a minimal environment to sanitize."
+        warn "THE SYSTEM WILL REBOOT as part of this process."
+    elif [ "$INSTALL_FEDORA" -eq 1 ]; then
+        warn "TARGET IS NOT THE ROOT DEVICE, but --install-fedora sanitizes and replaces"
+        warn "its contents, installs a bootloader, and boots into the fresh install."
         warn "THE SYSTEM WILL REBOOT as part of this process."
     fi
 
@@ -133,7 +146,7 @@ main() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         info "DRY RUN - no changes will be made."
-        if [ "$is_root" -eq 1 ]; then
+        if [ "$use_kexec" -eq 1 ]; then
             info "Would kexec into minimal environment and sanitize $TARGET_DEVICE."
             if [ "$INSTALL_FEDORA" -eq 1 ]; then
                 info "Would then install Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} on $TARGET_DEVICE."
@@ -146,7 +159,7 @@ main() {
 
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
-    if [ "$is_root" -eq 1 ]; then
+    if [ "$use_kexec" -eq 1 ]; then
         do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA" "$TEST_MODE"
     else
         detach_device "$TARGET_DEVICE"

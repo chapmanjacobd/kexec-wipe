@@ -130,7 +130,7 @@ check_device() {
 
 try_crypto_erase() {
     log "Attempting crypto-erase..."
-    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-crypto-erase -f 2>/dev/null; then
+    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-crypto-erase 2>/dev/null; then
         return 0
     fi
     log "Crypto-erase failed or not supported."
@@ -139,7 +139,7 @@ try_crypto_erase() {
 
 try_block_erase() {
     log "Attempting block-erase..."
-    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-block-erase -f 2>/dev/null; then
+    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-block-erase 2>/dev/null; then
         return 0
     fi
     log "Block-erase failed."
@@ -148,7 +148,7 @@ try_block_erase() {
 
 try_overwrite() {
     log "Attempting overwrite (this may take a while)..."
-    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-overwrite -f 2>/dev/null; then
+    if nvme sanitize "$KEXEC_WIPE_DEV" -a start-overwrite 2>/dev/null; then
         return 0
     fi
     log "Overwrite failed."
@@ -194,57 +194,96 @@ do_sanitize() {
     fi
 }
 
+# Query the NVMe sanitize log and echo "<state> <progress>", where <state> is
+# one of: in-progress, success, failure, none. <progress> is the raw SPROG
+# value (0-65535). Returns 1 if the log could not be read.
+#
+# NOTE: This whole function is intentionally duplicated in lib/sanitize.sh.
+# This init runs under busybox sh inside the in-memory environment, while
+# lib/sanitize.sh runs under bash on the host, so the two cannot share code.
+# Keep both copies identical when changing the SPROG/SSTAT parsing.
+sanitize_log_state() {
+    local log sstat sprog status
+
+    log=$(nvme sanitize-log "$KEXEC_WIPE_DEV" -o json 2>/dev/null) || return 1
+
+    # Extract SPROG/SSTAT robustly. nvme-cli versions differ: some emit flat
+    # decimal integers, some hex ("0x.."), and 1.x nests sstat as an object with
+    # a human-readable "status" string. The awk handles all three forms. Values
+    # may be hex; shell arithmetic interprets the "0x" prefix directly.
+    read -r sprog sstat <<EOF
+$(printf '%s' "$log" | awk '
+    BEGIN { sprog=""; sstat=""; instat=0 }
+    {
+        line=$0
+        if (sprog=="" && match(line, /"sprog"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
+            v=substr(line,RSTART,RLENGTH); sub(/^"sprog"[^0-9a-fA-Fx]*/,"",v); sprog=v
+        }
+        if (match(line, /"sstat"[ \t]*:/)) {
+            tail=substr(line,RSTART+RLENGTH)
+            if (tail ~ /^[ \t]*\{/) {
+                instat=1
+            } else if (sstat=="" && match(tail, /^[ \t]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
+                v=substr(tail,RSTART,RLENGTH); sub(/^[ \t]*/,"",v); sstat=v; instat=0
+            }
+        }
+        if (instat==1 && sstat=="" && match(line, /"status"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
+            v=substr(line,RSTART,RLENGTH); sub(/^"status"[^0-9a-fA-Fx]*/,"",v); sstat=v; instat=0
+        }
+    }
+    END { print sprog, sstat }
+')
+EOF
+
+    [ -n "$sstat" ] || return 1
+    [ -n "$sprog" ] || sprog=0
+
+    # SSTAT status is in bits [2:0]: 0x1 success, 0x2 in progress,
+    # 0x3 failure, 0x4 no-deallocate success.
+    status=$((sstat & 0x7))
+    case "$status" in
+        1|4) echo "success $sprog" ;;
+        2)   echo "in-progress $sprog" ;;
+        3)   echo "failure $sprog" ;;
+        *)   echo "none $sprog" ;;   # never sanitized / no status yet
+    esac
+}
+
 wait_for_completion() {
-    local sanitize_status="${1:-0}"
     local timeout=7200
     local elapsed=0
     local interval=5
 
-    # If do_sanitize returned 2 (test-mode-skip), nothing to wait for.
-    if [ "$sanitize_status" -eq 2 ]; then
-        return 0
-    fi
-
     log "Waiting for sanitize to complete (timeout: ${timeout}s)..."
 
     while [ "$elapsed" -lt "$timeout" ]; do
-        local status
-        status=$(nvme sanitize -H "$KEXEC_WIPE_DEV" -o xml 2>/dev/null) || true
+        local state progress result pct
+        result=$(sanitize_log_state) || result="none 0"
+        state=${result%% *}
+        progress=${result#* }
 
-        local san_stat
-        san_stat=$(echo "$status" | sed -n 's/.*<stat>\(.*\)<\/stat>.*/\1/p' | head -1) || true
-
-        local progress
-        progress=$(echo "$status" | sed -n 's/.*<sprog>\(.*\)<\/sprog>.*/\1/p' | head -1) || true
-
-        local pct="0"
-        if [ -n "$progress" ]; then
-            pct=$((progress / 100))
-        fi
-
-        case "$san_stat" in
-            0x01)
+        case "$state" in
+            in-progress)
+                # SPROG is a fraction of 0x10000 (65536); progress is its numerator.
+                pct=$(( progress * 100 / 65536 ))
                 printf "\r  Sanitizing... %d%% " "$pct"
                 ;;
-            0x02)
+            success)
                 echo ""
                 log "Sanitize completed successfully."
                 return 0
                 ;;
-            0x03)
+            failure)
                 echo ""
                 log "Sanitize completed with FAILURE."
                 return 1
                 ;;
-            0x04)
+            none|*)
+                # No sanitize reported yet: the command may just have started and
+                # the controller has not updated the log. Keep polling.
                 if [ "$elapsed" -eq 0 ]; then
-                    log "No sanitize in progress."
-                    local ssrc
-                    ssrc=$(echo "$status" | sed -n 's/.*<ssrc>\(.*\)<\/ssrc>.*/\1/p' | head -1) || true
-                    if [ "$ssrc" = "0x02" ]; then
-                        log "Previous sanitize result: success."
-                        return 0
-                    fi
+                    echo ""
+                    log "No sanitize reported in progress yet."
                 fi
                 ;;
         esac
@@ -256,6 +295,28 @@ wait_for_completion() {
     echo ""
     log "Timed out waiting for sanitize."
     return 1
+}
+
+# Run the sanitize and wait for completion, producing a single verdict:
+#   - runs do_sanitize (which handles method selection and test-mode skipping)
+#   - waits for completion for a real sanitize
+#   - returns 4 on test-mode-skip (sanitize not performed), 0 on success.
+# On any genuine failure it never returns (calls fatal_reboot internally).
+sanitize_and_wait() {
+    # do_sanitize returns 2 (test-mode-skip), which is non-zero: guard it so
+    # `set -e` does not kill the shell before we can inspect $rc.
+    local rc=0
+    do_sanitize || rc=$?
+    if [ "$rc" -eq 2 ]; then
+        log "Sanitize was not performed (test/emulated device)."
+        return 4
+    fi
+    # rc is 0 here: a real failure never returns from do_sanitize.
+    if wait_for_completion; then
+        log "Device $KEXEC_WIPE_DEV has been sanitized."
+        return 0
+    fi
+    fatal_reboot "Sanitize failed or did not complete."
 }
 
 # --- Partition / filesystem helpers ------------------------------------
@@ -277,9 +338,8 @@ wait_for_partition() {
 # retries; returns 1 if detection fails.
 detect_fs_type() {
     local part="$1"
-    local attempt
+    local attempt fs
     for attempt in 1 2 3; do
-        local fs
         fs=$(blkid "$part" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p')
         if [ -n "$fs" ]; then
             echo "$fs"
@@ -305,15 +365,21 @@ write_fedora_image() {
     local dev="$2"
 
     log "Writing Fedora image to $dev (this can take a while)..."
+    # Decompress (xz, or busybox's unlzma/lzcat applets) and write with dd.
+    # `conv=fsync` forces dd to flush before returning so we know the image is
+    # actually on disk. `status=none` is GNU-only; retry without it (busybox dd
+    # prints to stderr, which we already suppress on the first attempt) if it
+    # fails.
+    write_with_dd() {
+        local dec="$1"
+        ( $dec | dd of="$dev" bs=4M conv=fsync status=none ) 2>/dev/null \
+        || ( $dec | dd of="$dev" bs=4M conv=fsync ) \
+        || ( $dec | dd of="$dev" bs=4M ) || fatal "Failed to write Fedora image."
+    }
     if command -v xz >/dev/null 2>&1; then
-        # Try with GNU-only options first, then a plain write as fallback.
-        ( xz -dc "$xzfile" | dd of="$dev" bs=4M conv=fsync status=none ) 2>/dev/null || \
-        ( xz -dc "$xzfile" | dd of="$dev" bs=4M conv=fsync ) || \
-        ( xz -dc "$xzfile" | dd of="$dev" bs=4M ) || fatal "Failed to write Fedora image."
+        write_with_dd "xz -dc $xzfile"
     else
-        # busybox provides xz decompression via unlzma/lzcat applets.
-        ( unlzma -dc "$xzfile" | dd of="$dev" bs=4M conv=fsync ) 2>/dev/null || \
-        ( lzcat -dc "$xzfile" | dd of="$dev" bs=4M ) || fatal "Failed to write Fedora image."
+        write_with_dd "unlzma -dc $xzfile"
     fi
 
     sync
@@ -364,44 +430,71 @@ write_fedora_image() {
     # Fallback: if partition nodes remain absent (e.g. emulated NVMe
     # devices where sysfs rescan is not supported), create the partition device
     # nodes manually. The kernel has usually already re-read the partition
-    # table via BLKRRPART; devtmpfs fails to materialize the nodes. We
-    # parse fdisk and mknod the partition nodes directly. NVMe minor numbers
-    # and partition indices happen to coincide (pN -> minor N), which holds for
-    # the first namespace of a single disk.
+    # table via BLKRRPART and registered the partitions in sysfs; only the
+    # devtmpfs node materialization failed. Read each partition's real
+    # major:minor from sysfs (/sys/block/<dev>/<part>/dev) and mknod it. This is
+    # correct for any namespace/controller layout, unlike guessing that the
+    # partition index equals the minor number.
     if ! ls "${dev}p"* >/dev/null 2>&1; then
-        log "Partition nodes missing; creating them manually via fdisk/mknod..."
-        local devmajor=""
-        if [ -f "/sys/block/$devname/dev" ]; then
-            devmajor=$(cut -d: -f1 "/sys/block/$devname/dev")
-        fi
-        if [ -n "$devmajor" ]; then
-            local part
-            for part in $(fdisk -l "$dev" 2>/dev/null | awk -v d="$dev" '$1 ~ d"p[0-9]+" {print $1}'); do
-                local minor="${part##*p}"
-                if [ ! -b "$part" ]; then
-                    mknod "$part" b "$devmajor" "$minor" 2>/dev/null || true
-                fi
-            done
-            if ls "${dev}p"* >/dev/null 2>&1; then
-                log "Partition nodes created manually."
+        log "Partition nodes missing; creating them manually from sysfs..."
+        local part
+        for part in /sys/block/"$devname"/"$devname"p*; do
+            [ -e "$part" ] || continue
+            local name partdev major minor node
+            name=$(basename "$part")
+            partdev=$(cat "$part/dev" 2>/dev/null) || continue
+            major="${partdev%:*}"
+            minor="${partdev#*:}"
+            node="/dev/$name"
+            [ -n "$major" ] && [ -n "$minor" ] || continue
+            if [ ! -b "$node" ]; then
+                mknod "$node" b "$major" "$minor" 2>/dev/null || true
             fi
+        done
+        if ls "${dev}p"* >/dev/null 2>&1; then
+            log "Partition nodes created manually."
         fi
     fi
 
     log "Fedora image written."
 }
 
-# Find an ext/xfs/btrfs partition in the written image and return its device.
-first_root_part() {
+# Echo the ext/xfs/btrfs partitions in the written image (one per line). They
+# are the only candidates that could hold the OS root.
+candidate_root_parts() {
     local dev="$1"
-    local part
-    part=$(blkid "$dev"* 2>/dev/null | grep -iE 'TYPE="(xfs|ext4|ext3|ext2|btrfs)"' | cut -d: -f1 | head -1)
-    if [ -n "$part" ]; then
-        echo "$part"
-        return 0
-    fi
-    # Fallback: assume the root is the first partition.
-    echo "${dev}p1"
+    blkid "$dev"* 2>/dev/null | grep -iE 'TYPE="(xfs|ext4|ext3|ext2|btrfs)"' | cut -d: -f1
+}
+
+# Try mounting each candidate partition under $1 (mountpoint) and return the
+# first one that is actually a bootable OS root (has /etc/fstab or /sbin/init).
+# This avoids mistaking a separate /boot or /boot/efi partition for the root:
+# the real root is identified by content, not position. On success sets
+# ROOT_PART and ROOT_FS for the caller and returns 0 (leaves the partition
+# mounted at $1). Returns 1 if no candidate qualifies.
+mount_os_root() {
+    local mnt="$1"
+    local part fs
+
+    for part in $(candidate_root_parts "$KEXEC_WIPE_DEV"); do
+        fs=$(detect_fs_type "$part") || continue
+        case "$fs" in
+            xfs)   [ -d /sys/fs/xfs ] || modprobe xfs 2>/dev/null || true ;;
+            btrfs) modprobe btrfs 2>/dev/null || true ;;
+            ext*|*) modprobe "$fs" 2>/dev/null || true ;;
+        esac
+        if mount_root_part "$part" "$mnt" "$fs"; then
+            if [ -e "$mnt/etc/fstab" ] || [ -e "$mnt/sbin/init" ]; then
+                ROOT_PART="$part"
+                ROOT_FS="$fs"
+                log "  OS root on $part ($fs)"
+                return 0
+            fi
+            # Not the OS root (e.g. a separate /boot partition); try the next one.
+            umount "$mnt" 2>/dev/null || true
+        fi
+    done
+    return 1
 }
 
 # Mount the OS root partition, selecting the correct btrfs subvolume when the
@@ -490,34 +583,10 @@ install_bootloader() {
 
     log "Installing bootloader on $dev..."
 
-    local rootpart
-    rootpart=$(first_root_part "$dev")
-
-    if ! wait_for_partition "$rootpart" 15; then
-        warn "Partition $rootpart not found; skipping bootloader install."
-        return 0
-    fi
-
-    local rootfs=""
-    rootfs=$(detect_fs_type "$rootpart") || true
-
-    if [ -z "$rootfs" ]; then
-        warn "Could not detect filesystem of $rootpart; skipping bootloader install."
-        return 0
-    fi
-
-    # Load kernel module for the root filesystem if not already available.
-    case "$rootfs" in
-        xfs)   [ -d /sys/fs/xfs ] || modprobe xfs 2>/dev/null || true ;;
-        btrfs) modprobe btrfs 2>/dev/null || true ;;
-        ext*|*) modprobe "$rootfs" 2>/dev/null || true ;;
-    esac
-
-    local mnt
-    mnt=/mnt/root
+    local mnt=/mnt/root
     mkdir -p "$mnt"
-    if ! mount_root_part "$rootpart" "$mnt" "$rootfs"; then
-        warn "Could not mount $rootpart; skipping bootloader install."
+    if ! mount_os_root "$mnt"; then
+        warn "Could not find and mount the OS root; skipping bootloader install."
         return 0
     fi
 
@@ -536,7 +605,10 @@ install_bootloader() {
         grub_target=$(detect_grub_target "$uefi")
 
         log "Using GRUB (target: $grub_target) from the installed image..."
-        if chroot "$mnt" /bin/bash -c "grub2-install --target=$grub_target --no-floppy '$dev' 2>/dev/null || grub2-install --no-floppy '$dev' 2>/dev/null || grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1"; then
+        # grub2-install is the real bootloader install; mkconfig only regenerates
+        # the config and is NOT a fallback for a failed install. Report success
+        # only when the bootloader was actually written to the disk.
+        if chroot "$mnt" /bin/bash -c "grub2-install --target=$grub_target --no-floppy '$dev' 2>/dev/null || grub2-install --no-floppy '$dev' 2>/dev/null"; then
             chroot "$mnt" /bin/bash -c "grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1" || true
             log "GRUB installed successfully."
         else
@@ -599,37 +671,39 @@ configure_fedora_user() {
 
     log "Configuring user '$username' (source: '$provision_user')..."
 
-    local rootpart
-    rootpart=$(first_root_part "$KEXEC_WIPE_DEV")
-
-    if ! wait_for_partition "$rootpart" 15; then
-        warn "Partition $rootpart not found; skipping user provisioning."
-        return 0
-    fi
-
-    local rootfs=""
-    rootfs=$(detect_fs_type "$rootpart") || true
-    if [ -z "$rootfs" ]; then
-        warn "Could not detect filesystem of $rootpart; skipping user provisioning."
-        return 0
-    fi
-
-    case "$rootfs" in
-        xfs)   [ -d /sys/fs/xfs ] || modprobe xfs 2>/dev/null || true ;;
-        btrfs) modprobe btrfs 2>/dev/null || true ;;
-        ext*|*) modprobe "$rootfs" 2>/dev/null || true ;;
-    esac
-
     local mnt=/mnt/root
     mkdir -p "$mnt"
-    if ! mount_root_part "$rootpart" "$mnt" "$rootfs"; then
-        warn "Could not mount $rootpart for user provisioning; skipping."
+    if ! mount_os_root "$mnt"; then
+        warn "Could not find and mount the OS root; skipping user provisioning."
         return 0
     fi
 
     mount -t proc proc "$mnt/proc" 2>/dev/null || true
     mount -t sysfs sys "$mnt/sys" 2>/dev/null || true
     mount -t devtmpfs dev "$mnt/dev" 2>/dev/null || true
+
+    if [ "$username" = "root" ]; then
+        # Provisioning the root account: no useradd or sudoers needed (root
+        # already has full access), just install the SSH keys and enable sshd.
+        if [ -f /opt/kexec-wipe-authorized_keys ] && [ -s /opt/kexec-wipe-authorized_keys ]; then
+            mkdir -p "$mnt/root/.ssh"
+            chmod 0700 "$mnt/root/.ssh"
+            cp /opt/kexec-wipe-authorized_keys "$mnt/root/.ssh/authorized_keys"
+            chroot "$mnt" /bin/bash -c "chown root:root /root/.ssh/authorized_keys && chmod 0600 /root/.ssh/authorized_keys" 2>/dev/null || true
+            log "Copied authorized_keys for root."
+        else
+            warn "No authorized_keys found; SSH key access not configured."
+        fi
+        chroot "$mnt" /bin/bash -c "systemctl enable sshd" 2>/dev/null || \
+        chroot "$mnt" /bin/bash -c "ln -sf /usr/lib/systemd/system/sshd.service /etc/systemd/system/multi-user.target.wants/sshd.service" 2>/dev/null || \
+        warn "Could not enable sshd; you may need to enable it manually."
+
+        sync
+        unmount_tree "$mnt"
+        umount "$mnt" 2>/dev/null || true
+        log "User provisioning complete."
+        return 0
+    fi
 
     local chroot_ok=1
 
@@ -674,7 +748,7 @@ configure_fedora_user() {
 }
 
 install_fedora() {
-    log "=== Installing Fedora after wipe ==="
+    log "=== Installing Fedora after sanitize ==="
     if [ "$KEXEC_WIPE_INSTALL" != "1" ]; then
         return 0
     fi
@@ -705,47 +779,29 @@ cleanup_and_reboot() {
 # filesystems (/dev, /proc, /sys, /run) itself early in boot, so we only need
 # to provide a console and the mounted root partition.
 switch_to_fedora() {
-    local rootpart
-    rootpart=$(first_root_part "$KEXEC_WIPE_DEV")
-
-    if ! wait_for_partition "$rootpart" 10; then
-        warn "Partition $rootpart not found; cannot switch_root."
-        return 1
-    fi
-
-    local rootfs=""
-    rootfs=$(detect_fs_type "$rootpart") || true
-
-    if [ -z "$rootfs" ]; then
-        # Fallback: try mounting with known filesystem types.
-        warn "blkid could not detect filesystem; trying mount fallback..."
-        local newroot=/sysroot
-        mkdir -p "$newroot"
-        for try_fs in ext4 ext3 ext2 xfs btrfs; do
-            if mount -t "$try_fs" "$rootpart" "$newroot" 2>/dev/null; then
-                rootfs="$try_fs"
-                log "Detected $rootfs via mount fallback."
-                break
-            fi
-        done
-        if [ -z "$rootfs" ]; then
-            warn "Could not detect Fedora root filesystem; cannot switch_root."
-            return 1
-        fi
-    fi
-
-    case "$rootfs" in
-        xfs)   modprobe xfs 2>/dev/null || true ;;
-        btrfs) modprobe btrfs 2>/dev/null || true ;;
-        *)     modprobe "$rootfs" 2>/dev/null || true ;;
-    esac
-
     local newroot=/sysroot
+
+    # Mount the OS root (identifies the real root partition by content). If
+    # blkid cannot detect any filesystem, fall back to blind-probing known fs
+    # types on the first partition.
     mkdir -p "$newroot"
-    # If the mount fallback already mounted it, don't mount again.
-    if ! mountpoint -q "$newroot" 2>/dev/null; then
-        if ! mount_root_part "$rootpart" "$newroot" "$rootfs"; then
-            warn "Could not mount $rootpart for switch_root."
+    if ! mount_os_root "$newroot"; then
+        warn "blkid could not identify the OS root; trying mount fallback..."
+        local found=""
+        for part in /dev/"$(basename "$KEXEC_WIPE_DEV")"p*; do
+            [ -b "$part" ] || continue
+            for try_fs in ext4 ext3 ext2 xfs btrfs; do
+                if mount -t "$try_fs" "$part" "$newroot" 2>/dev/null; then
+                    ROOT_PART="$part"
+                    ROOT_FS="$try_fs"
+                    found=1
+                    log "Detected $try_fs via mount fallback."
+                    break 2
+                fi
+            done
+        done
+        if [ -z "$found" ]; then
+            warn "Could not detect Fedora root filesystem; cannot switch_root."
             return 1
         fi
     fi
@@ -767,7 +823,7 @@ switch_to_fedora() {
     # Drop the sibling subvolumes so systemd mounts them itself per /etc/fstab.
     unmount_tree "$newroot"
 
-    log "Switching root into Fedora ($rootpart)..."
+    log "Switching root into Fedora ($ROOT_PART)..."
     exec switch_root -c /dev/console "$newroot" /sbin/init
 }
 
@@ -782,18 +838,10 @@ main() {
 
     log "Sanitize method: $KEXEC_WIPE_METHOD"
 
-    local sanitize_rc=0
-    do_sanitize || sanitize_rc=$?
-    wait_for_completion "$sanitize_rc"
-
-    if [ "$sanitize_rc" -eq 2 ]; then
-        log "Sanitize was not performed (test/emulated device)."
-    elif [ "$sanitize_rc" -eq 0 ]; then
-        echo ""
-        log "Drive $KEXEC_WIPE_DEV has been sanitized."
-    else
-        fatal_reboot "Sanitize failed."
-    fi
+    # sanitize_and_wait logs the outcome and only ever returns 0 (sanitized) or
+    # 4 (test-mode-skip: sanitize not performed); on a genuine failure it never
+    # returns (fatal_reboot). The `|| true` guards the 4 against set -e.
+    sanitize_and_wait || true
 
     install_fedora
 

@@ -1,52 +1,59 @@
 # kexec-wipe
 
-Securely wipe NVMe drives with a single command. Supports both non-root drives (direct sanitization) and root drives (via kexec into a minimal in-memory environment).
+Sanitize an NVMe device and permanently destroy its data. kexec-wipe works on a device that holds the root filesystem and on one that does not. It can also install Fedora afterward.
 
-## Quick Wipe
+## Quick start
+
+Download the script, inspect it, then run it as root.
 
 ```bash
-curl -sL https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
+# 1. Download
+curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
+
+# 2. Run (type YES to confirm)
+sudo bash wipe.sh /dev/nvme0n1
 ```
 
-## How It Works
+## How it works
 
-### Non-root drives
-If the target NVMe is **not** your root filesystem:
-1. All partitions on the device are unmounted
-2. LVM volumes, swap, and MD RAID are deactivated
-3. `nvme sanitize` is executed directly on the device
+kexec-wipe runs the NVMe `sanitize` command on the target device.
 
-### Root drives
-If the target NVMe **is** your root filesystem:
-1. A pre-built initramfs (busybox + nvme-cli) is downloaded
-2. The running kernel is loaded via `kexec` with the custom initramfs
-3. The system kexec's into a minimal in-memory environment
-4. `nvme sanitize` is executed with no mounted filesystems
-5. Optionally (`--install-fedora`) a Fedora image is written and made bootable
-6. The system reboots
+### Device that is not the root device
 
-## Sanitize Methods
+1. Unmount all partitions on the device.
+2. Deactivate swap, LVM volumes, and MD RAID on the device.
+3. Run `nvme sanitize` on the device.
 
-| Method | Speed | Compatibility | Description |
-|--------|-------|---------------|-------------|
-| `crypto` | Fastest | SED/encrypted NVMe | Cryptographic erase |
-| `block` | Fast | All NVMe | Physical block erase |
-| `overwrite` | Slow | All NVMe | Full overwrite |
-| `auto` | - | - | Tries crypto, falls back to block (default) |
+### Root device
+
+1. Download a prebuilt initramfs (busybox + nvme-cli).
+2. Load the running kernel and the initramfs with `kexec`.
+3. Boot into a minimal in-memory environment.
+4. Run `nvme sanitize` with no filesystems mounted.
+5. Reboot. With `--install-fedora`, write a Fedora image and make it bootable before the reboot.
+
+## Sanitize methods
+
+| Method | Speed | Requirement | NVMe action |
+|--------|-------|-------------|-------------|
+| `crypto` | Fastest | Self-encrypting drive | `crypto-erase` |
+| `block` | Fast | All NVMe | `block-erase` |
+| `overwrite` | Slow | All NVMe | `overwrite` |
+| `auto` | — | — | Try `crypto`, then `block` (default) |
 
 ## Usage
 
 ```bash
-# Auto-detect best sanitize method (default)
+# Sanitize with the default method (auto)
 sudo bash wipe.sh /dev/nvme0n1
 
-# Force a specific method
+# Sanitize with a specific method
 sudo bash wipe.sh /dev/nvme0n1 --method=block
 
-# Sanitize the root disk, then install Fedora on it and make it bootable
+# Sanitize the device, then install Fedora
 sudo bash wipe.sh /dev/nvme0n1 --install-fedora
 
-# Preview without making changes
+# Show the actions without doing them
 sudo bash wipe.sh /dev/nvme0n1 --dry-run
 ```
 
@@ -56,107 +63,80 @@ sudo bash wipe.sh /dev/nvme0n1 --dry-run
 |----------|-------------|
 | `/dev/nvmeXnY` | Target NVMe device (required) |
 | `--method=METHOD` | Sanitize method: `auto`, `crypto`, `block`, `overwrite` |
-| `--install-fedora` | After wiping the root disk, write a Fedora Cloud Base image and install a bootloader (kexec/root path only) |
-| `--dry-run` | Show what would be done without making changes |
-| `--help` | Show help message |
+| `--install-fedora` | After sanitizing, write a Fedora Cloud Base image and install a bootloader. Uses the kexec path on any device. |
+| `--dry-run` | Show the actions without doing them |
+| `--test-mode` | Continue when the device does not support sanitize (testing only) |
+| `--help` | Show the help message |
 
-## Install Fedora Afterward
+## Install Fedora afterward
 
-`--install-fedora` turns a root-disk wipe into a full reinstall: after the kexec
-initramfs sanitizes the drive, it:
+`--install-fedora` turns a sanitize into a full reinstall. After the initramfs sanitizes the device, it:
 
-1. Brings up networking (DHCP) and downloads the pinned Fedora Cloud Base
-   `raw.xz` image for your architecture.
-2. Verifies the image SHA256.
-3. Decompresses the raw image and writes it to the target (it never writes the
-   compressed stream directly to the disk).
-4. Detects UEFI vs BIOS and architecture, chroots into the installed OS, and
-   runs `grub2-install`/`grub2-mkconfig` so the fresh Fedora boots on bare metal
-   on subsequent boots.
-5. Provisions a user account named after the invoking user (`$SUDO_USER`,
-   or the hostname when run without sudo), copies the source
-   `~/.ssh/authorized_keys` into it, grants sudo, and enables `sshd`.
-6. `switch_root`s directly into the fresh Fedora in the same boot — no redundant
-   reboot. (If switch_root fails it falls back to a plain reboot.)
+1. Starts networking (DHCP) and downloads the pinned Fedora Cloud Base `raw.xz` image.
+2. Verifies the image SHA256 checksum.
+3. Decompresses the image and writes it to the device. It never writes the compressed stream directly.
+4. Detects UEFI or BIOS and the architecture, chroots into the new OS, and runs `grub2-install` and `grub2-mkconfig`.
+5. Creates a user account from `$SUDO_USER`. When run as root, it provisions the root account instead.
+6. Copies `~/.ssh/authorized_keys` into the account, grants sudo, and enables `sshd`.
+7. Runs `switch_root` into the new Fedora in the same boot. If `switch_root` fails, it reboots.
 
-The image URL, release, and checksum are pinned in `lib/kexec.sh` and bumped by
-the maintainer per Fedora release.
+The image URL, release, and checksum are pinned in `lib/kexec.sh`.
 
-**Caveat:** Fedora Cloud Base images are built for virtualized/cloud environments
-and carry cloud-init assumptions. Even with a bootloader installed, first boot on
-physical hardware may require minor post-boot configuration. This feature makes
-the write and bootloader correct; it does not guarantee cloud-init parity on metal.
+**Caveat:** Fedora Cloud Base images are for virtualized and cloud environments and use cloud-init. First boot on physical hardware may need configuration after boot. This feature writes the image and bootloader correctly. It does not guarantee cloud-init behavior on metal.
 
-## Architecture Support
+## Architecture support
 
-x86_64 and aarch64 are supported. Each architecture uses a separate initramfs
-asset because its busybox, nvme-cli, libraries, and kernel modules are
-architecture-specific. The initramfs build picks the correct busybox and the
-release workflow builds the assets on native x86_64 and aarch64 runners.
-The Fedora image, GRUB target, and kernel candidates are also selected per
-architecture. On aarch64, where Fedora ships Unified Kernel Images (UKI), kexec
-attempts a direct UKI load and falls back to extracting the embedded initrd
-(`objcopy`) if needed.
+x86_64 and aarch64 are supported. Each architecture uses a separate initramfs with its own busybox, nvme-cli, libraries, and kernel modules. The Fedora image, GRUB target, and kernel candidates are also selected per architecture. On aarch64, Fedora uses Unified Kernel Images (UKI). kexec-wipe loads a UKI directly and falls back to extracting the embedded initrd with `objcopy`.
 
 ## Requirements
 
 - Linux with NVMe support (x86_64 or aarch64)
 - Root privileges
-- `nvme-cli` (for non-root drives; included in initramfs for root drives)
-- `kexec-tools` (for root drive sanitization only)
-- `curl` or `wget` (for downloading initramfs)
-- `awk` (for `bytes_to_human` formatting)
-- `--install-fedora` additionally needs network access from the kexec initramfs
-  and, at build time, Docker (to build busybox/curl/xz for non-x86_64 and to
-  bundle CA certs)
+- `nvme-cli` (for a non-root device; included in the initramfs for the root device)
+- `kexec-tools` (for the root device only)
+- `curl` or `wget` (to download the initramfs)
+- `awk` (to format byte sizes)
+- For `--install-fedora`: network access from the initramfs and Docker at build time
 
 ## Development
 
-The project is modular for development. `wipe.sh` is built from source files:
+`wipe.sh` is assembled from modules in `lib/`:
 
 ```
 lib/common.sh      - Logging, colors, cleanup, byte formatting
 lib/sanity.sh      - Root check, device validation, NVMe detection
 lib/unmount.sh     - Unmount, swap/LVM/MD teardown
-lib/sanitize.sh    - nvme sanitize with crypto->block fallback
-lib/kexec.sh       - Download initramfs, kexec into minimal env
-lib/main_body.sh   - Arg parsing, usage, main flow
+lib/sanitize.sh    - nvme sanitize with crypto -> block fallback
+lib/kexec.sh       - Download initramfs, kexec into the minimal environment
+lib/main_body.sh   - Argument parsing, usage, main flow
 ```
 
-### Building
+### Build
 
 ```bash
-# Assemble self-contained wipe.sh from lib/*.sh modules
-./build.sh
-
-# Build the initramfs (requires Docker for static nvme-cli)
-./initramfs/build.sh
+./build.sh            # assemble wipe.sh from lib/*.sh
+./initramfs/build.sh  # build the initramfs (Docker for static nvme-cli)
 ```
 
-### Releasing
+### Release
 
-1. Update the explicit architecture-specific initramfs URLs and SHA256 checksums
-   in `lib/kexec.sh` when the content or release changes.
-2. Build wipe.sh: `./build.sh`
-3. Push a version tag; CI builds native x86_64 and aarch64 initramfs assets and
-   uploads them to the GitHub release.
-
-Initramfs downloads use the pinned HTTPS URLs and SHA256 checksums in
-`lib/kexec.sh`.
+1. Update the architecture-specific initramfs URLs and SHA256 checksums in `lib/kexec.sh`.
+2. Run `./build.sh`.
+3. Push a version tag. CI builds the x86_64 and aarch64 initramfs and uploads them to the release.
 
 ## Safety
 
 - Requires root privileges
-- Validates the target is a real NVMe device
-- Shows device model, serial, and size before proceeding
-- Requires interactive confirmation (type `YES`) before wiping
-- Detects root disk and warns before kexec
-- Polls sanitize progress with timeout
+- Validates that the target is an NVMe device
+- Shows the device model, serial, and size before it continues
+- Requires confirmation (type `YES`)
+- Detects the root device and warns before kexec
+- Polls sanitize progress with a timeout
 - Verifies sanitize completion
 
 ## Disclaimer
 
-**THIS TOOL PERMANENTLY DESTROYS DATA.** There is no undo. Make absolutely sure you are targeting the correct device. Always double-check with `lsblk` before confirming. The authors are not responsible for any data loss.
+This tool permanently destroys data. There is no undo. Verify the target device with `lsblk` before you confirm. The authors are not responsible for data loss.
 
 ## License
 

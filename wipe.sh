@@ -3,14 +3,15 @@
 # kexec-wipe - Securely wipe NVMe drives
 #
 # Usage:
-#   curl -sL https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
+#   curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
+#   sudo bash wipe.sh /dev/nvme0n1
 #
 # This file is assembled by build.sh from lib/*.sh modules.
 # For development, edit the files in lib/ and run ./build.sh.
 #
 set -euo pipefail
 
-WIPE_VERSION="0.1.0"
+WIPE_VERSION="0.2.1"
 
 # --- begin lib/common.sh ---
 #!/bin/bash
@@ -105,8 +106,8 @@ get_device_info() {
 
     local model="" serial="" size_bytes=""
 
-    model=$(nvme id-ctrl "$dev" -o xml 2>/dev/null | sed -n 's/.*<mn>\(.*\)<\/mn>.*/\1/p' | head -1) || true
-    serial=$(nvme id-ctrl "$dev" -o xml 2>/dev/null | sed -n 's/.*<sn>\(.*\)<\/sn>.*/\1/p' | head -1) || true
+    model=$(nvme id-ctrl "$dev" -o json 2>/dev/null | sed -n 's/.*"mn"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
+    serial=$(nvme id-ctrl "$dev" -o json 2>/dev/null | sed -n 's/.*"sn"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
     size_bytes=$(blockdev --getsize64 "$dev" 2>/dev/null) || true
 
     # Fallbacks via sysfs
@@ -124,32 +125,47 @@ get_device_info() {
     echo "Path:     $dev"
 }
 
+# Return 0 (true) if the given device is the disk backing the root filesystem.
+# If the root device cannot be determined, it conservatively returns 0 so the
+# caller picks the (safer) kexec wipe path rather than wiping a mounted disk in
+# place.
 is_root_device() {
     local dev="$1"
     local devname
     devname=$(basename "$dev")
 
-    # Get the device name of the root filesystem (strip partition suffix).
     # findmnt reports btrfs subvolume roots as "/dev/nvme0n1p3[/root]"; strip
     # the "[...]" suffix so the path is the plain block device.
-    local root_dev
-    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null) || return 1
-    root_dev="${root_dev%%\[*\]}"
-    root_dev=$(basename "$root_dev")
-    # Use lsblk to find the parent (disk) device. This correctly handles
-    # NVMe (nvme0n1p2 -> nvme0n1), mmcblk (mmcblk0p1 -> mmcblk0), and
-    # traditional (sda1 -> sda) partition naming.
-    local parent
-    parent=$(lsblk -n -o PKNAME "/dev/$root_dev" 2>/dev/null | head -1) || true
-    if [ -n "$parent" ]; then
-        root_dev="$parent"
-    else
-        # Fallback: best-effort string stripping
-        root_dev="${root_dev%%p[0-9]*}"
-        root_dev="${root_dev%%[0-9]*}"
+    local src
+    src=$(findmnt -n -o SOURCE / 2>/dev/null) || return 0
+    src="${src%%\[*\]}"
+
+    if ! command -v lsblk >/dev/null 2>&1; then
+        return 0
     fi
 
-    [ "$root_dev" = "$devname" ]
+    # Walk up to the whole-disk device backing the root mount. A single lsblk
+    # PKNAME hop is not enough when the root sits on a dm/partition (e.g. LVM
+    # on nvme0n1p2), so walk until lsblk reports no further parent.
+    local parent=""
+    local node="$src"
+    local hops=8
+    while [ "$hops" -gt 0 ]; do
+        local p
+        p=$(lsblk -n -o PKNAME "$node" 2>/dev/null | head -1) || true
+        [ -n "$p" ] || break
+        parent="$p"
+        node="/dev/$p"
+        hops=$((hops - 1))
+    done
+
+    # If the root sits directly on a whole disk (no partition parent), the walk
+    # breaks immediately and $src itself is the disk.
+    if [ -z "$parent" ]; then
+        parent=$(basename "$src")
+    fi
+
+    [ "$parent" = "$devname" ]
 }
 # --- end lib/sanity.sh ---
 
@@ -164,21 +180,25 @@ unmount_device() {
 
     info "Unmounting partitions on $dev..."
 
-    # Unmount deepest paths first (longest mount point first)
+    # lsblk reports the mount points of the whole disk, every partition, and
+    # each subvolume (e.g. "/" and "/home" from one btrfs partition) on separate
+    # lines. findmnt on the whole-disk device does NOT enumerate child
+    # partitions, so we use lsblk instead.
     local mounts
-    mounts=$(findmnt -rno TARGET "/dev/$devname" 2>/dev/null \
-        | awk '{ print length, $0 }' | sort -rn | awk '{ $1=""; print }' | xargs) || true
+    mounts=$(lsblk -lno MOUNTPOINTS "/dev/$devname" 2>/dev/null | grep -E '^/' || true)
 
+    # Unmount deepest paths first (longest mount point first)
     if [ -n "$mounts" ]; then
-        for tgt in $mounts; do
+        local tgt
+        for tgt in $(printf '%s\n' "$mounts" | awk '{ print length, $0 }' | sort -rn | awk '{ $1=""; print }'); do
             [ -z "$tgt" ] && continue
             info "  Unmounting $tgt"
             umount -f "$tgt" 2>/dev/null || umount -l "$tgt" 2>/dev/null || true
         done
     fi
 
-    # Also check the device itself
-    if mount | grep -q "^$dev "; then
+    # Fallback if lsblk is unavailable: check the device node itself.
+    if ! command -v lsblk >/dev/null 2>&1 && mount | grep -q "^$dev "; then
         info "  Unmounting $dev"
         umount -f "$dev" 2>/dev/null || umount -l "$dev" 2>/dev/null || true
     fi
@@ -190,7 +210,12 @@ deactivate_swap() {
     devname=$(basename "$dev")
 
     info "Deactivating swap on $dev..."
-    swapoff "/dev/$devname"* 2>/dev/null || true
+    local part
+    for part in /dev/"$devname"*; do
+        [ -b "$part" ] || continue
+        [ "$part" = "$dev" ] && continue
+        swapoff "$part" 2>/dev/null || true
+    done
 }
 
 remove_lvm() {
@@ -227,8 +252,9 @@ remove_raid() {
 
     info "Checking for MD RAID on $dev..."
 
-    local md_paths
-    md_paths=$(cat /proc/mdstat 2>/dev/null | grep "$(basename "$dev")" | awk '{print $1}' || true) || true
+    local md_paths=""
+    # grep exits 1 when no array uses this disk; turn that into an empty list.
+    md_paths=$(cat /proc/mdstat 2>/dev/null | grep "$(basename "$dev")" | awk '{print $1}') || md_paths=""
 
     if [ -n "$md_paths" ]; then
         for md in $md_paths; do
@@ -249,8 +275,10 @@ detach_device() {
     # Unmount first so LVM/RAID teardown doesn't fail with "device is busy".
     unmount_device "$dev"
     deactivate_swap "$dev"
-    remove_raid "$dev"
+    # Deactivate LVM before stopping MD arrays: an active VG on an MD member
+    # keeps the array busy and mdadm --stop will fail until the VG is inactive.
     remove_lvm "$dev"
+    remove_raid "$dev"
 }
 # --- end lib/unmount.sh ---
 
@@ -264,7 +292,7 @@ try_crypto_erase() {
     local dev="$1"
     info "Attempting crypto-erase on $dev..."
 
-    if nvme sanitize "$dev" -a start-crypto-erase -f 2>/dev/null; then
+    if nvme sanitize "$dev" -a start-crypto-erase 2>/dev/null; then
         SANITIZE_METHOD="crypto-erase"
         return 0
     fi
@@ -277,7 +305,7 @@ try_block_erase() {
     local dev="$1"
     info "Attempting block-erase on $dev..."
 
-    if nvme sanitize "$dev" -a start-block-erase -f 2>/dev/null; then
+    if nvme sanitize "$dev" -a start-block-erase 2>/dev/null; then
         SANITIZE_METHOD="block-erase"
         return 0
     fi
@@ -290,13 +318,70 @@ try_overwrite() {
     local dev="$1"
     info "Attempting overwrite on $dev (this may take a while)..."
 
-    if nvme sanitize "$dev" -a start-overwrite -f 2>/dev/null; then
+    if nvme sanitize "$dev" -a start-overwrite 2>/dev/null; then
         SANITIZE_METHOD="overwrite"
         return 0
     fi
 
     error "Overwrite also failed."
     return 1
+}
+
+# Query the NVMe sanitize log and echo "<state> <progress>", where <state> is
+# one of: in-progress, success, failure, none. <progress> is the raw SPROG
+# value (0-65535). Returns 1 if the log could not be read.
+#
+# NOTE: This whole function is intentionally duplicated in initramfs/init.
+# This library runs under bash on the host (assembled into wipe.sh), while
+# initramfs/init runs under busybox sh in the in-memory environment, so the two
+# cannot share code. Keep both copies identical when changing the SPROG/SSTAT
+# parsing.
+sanitize_log_state() {
+    local dev="$1"
+    local log sprog sstat status
+
+    log=$(nvme sanitize-log "$dev" -o json 2>/dev/null) || return 1
+
+    # Extract SPROG/SSTAT robustly. nvme-cli versions differ: some emit flat
+    # decimal integers, some hex ("0x.."), and 1.x nests sstat as an object with
+    # a human-readable "status" string. The awk handles all three forms. Values
+    # may be hex; bash arithmetic interprets the "0x" prefix directly.
+    read -r sprog sstat <<EOF
+$(printf '%s' "$log" | awk '
+    BEGIN { sprog=""; sstat=""; instat=0 }
+    {
+        line=$0
+        if (sprog=="" && match(line, /"sprog"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
+            v=substr(line,RSTART,RLENGTH); sub(/^"sprog"[^0-9a-fA-Fx]*/,"",v); sprog=v
+        }
+        if (match(line, /"sstat"[ \t]*:/)) {
+            tail=substr(line,RSTART+RLENGTH)
+            if (tail ~ /^[ \t]*\{/) {
+                instat=1
+            } else if (sstat=="" && match(tail, /^[ \t]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
+                v=substr(tail,RSTART,RLENGTH); sub(/^[ \t]*/,"",v); sstat=v; instat=0
+            }
+        }
+        if (instat==1 && sstat=="" && match(line, /"status"[^0-9a-fA-Fx]*((0x[0-9a-fA-F]+)|([0-9]+))/) ) {
+            v=substr(line,RSTART,RLENGTH); sub(/^"status"[^0-9a-fA-Fx]*/,"",v); sstat=v; instat=0
+        }
+    }
+    END { print sprog, sstat }
+')
+EOF
+
+    [ -n "$sstat" ] || return 1
+    [ -n "$sprog" ] || sprog=0
+
+    # SSTAT status is in bits [2:0]: 0x1 success, 0x2 in progress,
+    # 0x3 failure, 0x4 no-deallocate success.
+    status=$((sstat & 0x7))
+    case "$status" in
+        1|4) echo "success $sprog" ;;
+        2)   echo "in-progress $sprog" ;;
+        3)   echo "failure $sprog" ;;
+        *)   echo "none $sprog" ;;   # never sanitized / no status yet
+    esac
 }
 
 wait_for_sanitize() {
@@ -308,50 +393,34 @@ wait_for_sanitize() {
     info "Waiting for sanitize to complete (timeout: ${timeout}s)..."
 
     while [ "$elapsed" -lt "$timeout" ]; do
-        local status
-        status=$(nvme sanitize -H "$dev" -o xml 2>/dev/null) || true
+        local state progress result
+        result=$(sanitize_log_state "$dev") || result="none 0"
+        state=${result%% *}
+        progress=${result#* }
 
-        local san_stat
-        san_stat=$(echo "$status" | sed -n 's/.*<stat>\(.*\)<\/stat>.*/\1/p' | head -1) || true
-
-        local progress
-        progress=$(echo "$status" | sed -n 's/.*<sprog>\(.*\)<\/sprog>.*/\1/p' | head -1) || true
-
-        # sprog is in 0.01% increments (0-10000)
-        local pct="0"
-        if [ -n "$progress" ]; then
-            pct=$((progress / 100))
-        fi
-
-        case "$san_stat" in
-            0x01)
+        case "$state" in
+            in-progress)
+                local pct=0
+                # SPROG is a fraction of 0x10000 (65536); progress is its numerator.
+                pct=$(( progress * 100 / 65536 ))
                 printf "\r  Sanitizing... %d%% " "$pct"
                 ;;
-            0x02)
+            success)
                 echo ""
                 success "Sanitize completed successfully ($SANITIZE_METHOD)."
                 return 0
                 ;;
-            0x03)
+            failure)
                 echo ""
                 error "Sanitize completed with failure."
                 return 1
                 ;;
-            0x04)
+            none|*)
+                # No sanitize reported yet: the command may just have started and
+                # the controller has not updated the log. Keep polling.
                 if [ "$elapsed" -eq 0 ]; then
                     echo ""
-                    warn "No sanitize in progress. Checking previous result..."
-                    local prev_stat
-                    prev_stat=$(echo "$status" | sed -n 's/.*<ssrc>\(.*\)<\/ssrc>.*/\1/p' | head -1) || true
-                    if [ "$prev_stat" = "0x02" ]; then
-                        success "Previous sanitize completed successfully."
-                        return 0
-                    fi
-                fi
-                ;;
-            *)
-                if [ "$elapsed" -gt 0 ]; then
-                    printf "\r  Sanitizing... %d%% " "$pct"
+                    warn "No sanitize reported in progress yet."
                 fi
                 ;;
         esac
@@ -391,7 +460,7 @@ do_sanitize() {
         fatal "Sanitize operation did not complete successfully."
     fi
 
-    success "Drive $dev has been sanitized ($SANITIZE_METHOD)."
+    success "Device $dev has been sanitized ($SANITIZE_METHOD)."
 }
 # --- end lib/sanitize.sh ---
 
@@ -418,8 +487,15 @@ platform_arch() {
     case "$(uname -m)" in
         aarch64|arm64) echo "aarch64" ;;
         x86_64|amd64) echo "x86_64" ;;
-        *) echo "x86_64" ;;
+        *) fatal "Unsupported architecture: $(uname -m) (supported: x86_64, aarch64)" ;;
     esac
+}
+
+# Fail fast if the running architecture is unsupported. The return value is 0
+# on success (unsupported arches make platform_arch fatal), so callers use this
+# purely to validate before any destructive action.
+check_arch() {
+    platform_arch >/dev/null
 }
 
 initramfs_file() {
@@ -458,7 +534,7 @@ fedora_raw_sha256() {
 
 check_kexec() {
     if ! command -v kexec &>/dev/null; then
-        fatal "kexec is required for root disk sanitization but not found.
+        fatal "kexec is required for root device sanitization but not found.
 Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf install kexec-tools')."
     fi
 }
@@ -563,8 +639,8 @@ augment_initramfs() {
     echo "$out"
 }
 
-# Federation finds a kernel image (optionally with its initrd) suitable for kexec.
-# On classic setups this is vmlinuz + separate initrd, or a single UKI (Unified
+# Find a kernel image (optionally with its initrd) suitable for kexec. On
+# classic setups this is vmlinuz + separate initrd, or a single UKI (Unified
 # Kernel Image, common on aarch64) that embeds linux+initrd. Prints "<kernel> [initrd]".
 find_kernel() {
     local kver
@@ -590,34 +666,6 @@ find_kernel() {
     fatal "Could not find kernel image for ${kver}. Searched: ${candidates[*]}"
 }
 
-# Locate the initrd (if any) accompanying a classic kernel image. UKIs embed
-# their initrd, so nothing to return there.
-find_initrd() {
-    local kernel="$1"
-    local kver
-    kver=$(uname -r)
-
-    # .efi is a UKI; the initrd is within the binary.
-    case "$kernel" in
-        *.efi) return 0 ;;
-    esac
-
-    local candidates=(
-        "/boot/initramfs-${kver}.img"
-        "/boot/initrd.img-${kver}"
-        "/boot/initramfs-${kver}"
-        "/initramfs-${kver}.img"
-    )
-
-    for c in "${candidates[@]}"; do
-        if [ -f "$c" ]; then
-            echo "$c"
-            return 0
-        fi
-    done
-
-    warn "No separate initrd found for ${kernel}; using kernel as-is (UKI assumes embedded initrd)."
-}
 
 do_kexec_wipe() {
     local dev="$1"
@@ -641,18 +689,20 @@ do_kexec_wipe() {
 
         # Capture the host hostname and the user to provision on the fresh install.
         # The provision user prefers the invoking user ($SUDO_USER) so the new
-        # account matches the person running the wipe, falling back to the
-        # hostname when there is no sudo user (e.g. run directly as root).
+        # account matches the person running the wipe. When the wipe is run as
+        # root (no SUDO_USER) or via "sudo ... as root", we provision the root
+        # account itself: no user is created, only /root/.ssh/authorized_keys is
+        # copied over.
         local host_hostname
         host_hostname=$(hostname)
         echo "$host_hostname" > "${WIPE_TMPDIR}/hostname"
         info "  Hostname:  $host_hostname"
 
         local provision_user
-        if [ -n "${SUDO_USER:-}" ]; then
+        if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
             provision_user="$SUDO_USER"
         else
-            provision_user="$host_hostname"
+            provision_user="root"
         fi
         echo "$provision_user" > "${WIPE_TMPDIR}/user"
         info "  User:       $provision_user"
@@ -692,7 +742,7 @@ do_kexec_wipe() {
     if [ "$install" -eq 1 ]; then
         cmdline="${cmdline} kexec_wipe_install=1"
         cmdline="${cmdline} kexec_wipe_fedora_image=/opt/fedora.raw.xz"
-        info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after wipe"
+        info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after sanitize"
     fi
 
     # Test-only: don't abort the initramfs if the device does not implement the
@@ -703,42 +753,29 @@ do_kexec_wipe() {
         warn "  TEST MODE: sanitize failure will be ignored (device cannot be sanitized)."
     fi
 
-    # For a classic kernel, pass the separate initrd. For a UKI (.efi), the
-    # initrd is embedded; no --initrd is needed.
-    local initrd
-    initrd=$(find_initrd "$kernel")
-
+    # A .efi kernel is a Unified Kernel Image (UKI): linux + initrd are embedded
+    # in one PE binary. A classic kernel (vmlinuz/bzImage/...) has no embedded
+    # initrd, so we hand it our wipe initramfs as the initrd.
     info "Loading kernel into memory..."
     info "  Kernel:    $kernel"
-    if [ -n "$initrd" ]; then
-        info "  Initrd:    $initrd"
-    else
-        info "  Initrd:    (embedded in UKI)"
-    fi
     info "  Initramfs: $initramfs_path"
     info "  Target:    $dev"
 
-    if [ -n "$initrd" ]; then
-        # Classic kernel: load with the wipe initramfs.
+    if [[ "$kernel" == *.efi ]]; then
+        # UKI: load its .linux section with our wipe initramfs as the initrd.
+        # We deliberately use ONLY our initramfs (not the UKI's embedded one) so
+        # our /init runs the wipe. Do not try to concatenate the UKI's embedded
+        # initrd with ours: both are compressed cpio streams and the kernel
+        # unpacks only the first gzip member, so the appended initramfs (and its
+        # /init) would be silently dropped.
+        info "  Boot image: UKI (.efi, embedded initrd)"
+        kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
+            || fatal "Failed to load UKI kernel into memory via kexec."
+    else
+        # Classic kernel: load with the wipe initramfs as the initrd.
+        info "  Boot image: classic kernel (wipe initramfs as initrd)"
         kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
             || fatal "Failed to load kernel into memory via kexec."
-    else
-        # UKI (.efi): try loading the UKI with our initramfs directly. If kexec
-        # cannot parse the PE, extract the embedded initrd (objcopy) and
-        # concatenate it with ours.
-        if kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" 2>/dev/null; then
-            : # loaded UKI directly
-        else
-            local kinitrd="${WIPE_TMPDIR}/uki-initrd"
-            info "Direct UKI load failed; extracting embedded initrd for a combined initramfs..."
-            if extract_uki_initrd "$kernel" "$kinitrd"; then
-                cat "$kinitrd" "$initramfs_path" > "${WIPE_TMPDIR}/combined-initrd"
-            else
-                cat "$initramfs_path" > "${WIPE_TMPDIR}/combined-initrd"
-            fi
-            kexec -l "$kernel" --initrd="${WIPE_TMPDIR}/combined-initrd" --command-line="$cmdline" \
-                || fatal "Failed to load kernel into memory via kexec."
-        fi
     fi
 
     success "Kernel loaded. System will now kexec into minimal environment."
@@ -750,34 +787,17 @@ do_kexec_wipe() {
     sync
     kexec -e || fatal "kexec -e failed. System may need manual reboot."
 }
-
-# Extract the initrd payload from a UKI (.efi) file. UKIs are PE images with a
-# .linux/.initrd section pair; objcopy can dump arbitrary sections.
-extract_uki_initrd() {
-    local uki="$1"
-    local out="$2"
-
-    if command -v objcopy &>/dev/null; then
-        if objcopy --dump-section .initrd="$out" "$uki" 2>/dev/null && [ -s "$out" ]; then
-            return 0
-        fi
-        # Some UKIs use a different section name; fall through and warn.
-        warn "Could not extract .initrd from UKI ${uki}."
-    else
-        warn "objcopy not available to extract UKI initrd."
-    fi
-    return 1
-}
 # --- end lib/kexec.sh ---
 
 #!/bin/bash
 
 usage() {
     cat <<EOF
-kexec-wipe - Securely wipe NVMe drives
+kexec-wipe - Sanitize NVMe devices
 
 Usage:
-  curl -sL https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh | sudo bash -s /dev/nvme0n1
+  curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
+  sudo bash wipe.sh /dev/nvme0n1
   sudo ./wipe.sh /dev/nvme0n1 [OPTIONS]
 
 Arguments:
@@ -786,13 +806,13 @@ Arguments:
 Options:
   --method=METHOD       Sanitize method (default: auto)
                         auto       - Try crypto-erase, then block-erase
-                        crypto     - Crypto-erase only (fastest for SED drives)
+                        crypto     - Crypto-erase only (fastest for self-encrypting devices)
                         block      - Block-erase only
                         overwrite  - Overwrite (slowest, most thorough)
   --dry-run             Show what would be done without making changes
-  --install-fedora      After sanitizing the root disk via kexec, write a
-                        Fedora Cloud Base image and install a bootloader so it
-                        can boot. Requires the root-disk (kexec) path.
+  --install-fedora      After sanitizing the device via kexec, write a Fedora
+                        Cloud Base image and install a bootloader so it can boot.
+                        Works on the root device or any other device.
   --test-mode           TESTING ONLY: continue even if the sanitize command is
                         not supported by the device (e.g. QEMU's emulated
                         NVMe). Never use on real hardware.
@@ -805,8 +825,8 @@ Examples:
   sudo bash wipe.sh /dev/nvme0n1 --dry-run
 
 How it works:
-  Non-root disk: unmounts partitions, runs nvme sanitize directly.
-  Root disk: kexec's into a minimal in-memory environment to sanitize
+  Non-root device: unmounts partitions, runs nvme sanitize directly.
+  Root device: kexec's into a minimal in-memory environment to sanitize
   without any mounted filesystems, then reboots.
 EOF
 }
@@ -861,7 +881,7 @@ parse_args() {
 print_banner() {
     echo ""
     echo -e "${BOLD}kexec-wipe v${WIPE_VERSION}${RESET}"
-    echo -e "${BOLD}Secure NVMe Drive Sanitization${RESET}"
+    echo -e "${BOLD}Secure NVMe Device Sanitization${RESET}"
     echo ""
 }
 
@@ -872,22 +892,34 @@ main() {
     check_root
     validate_device "$TARGET_DEVICE"
 
-    # Non-root path needs nvme-cli on the host; root path gets it from initramfs
+    # Non-root path needs nvme-cli on the host; the kexec path gets it from the
+    # initramfs. --install-fedora also takes the kexec path on any disk: it
+    # writes an image, installs a bootloader and switch_roots into the fresh
+    # OS, all of which happen inside the minimal environment.
     local is_root=0
     if is_root_device "$TARGET_DEVICE"; then
         is_root=1
-    else
-        if ! command -v nvme &>/dev/null; then
-            fatal "nvme-cli is required but not found. Install it with your package manager."
-        fi
-        if [ "$INSTALL_FEDORA" -eq 1 ]; then
-            fatal "--install-fedora requires targeting the root disk (it runs inside the kexec initramfs)."
-        fi
+    fi
+
+    local use_kexec=0
+    if [ "$is_root" -eq 1 ] || [ "$INSTALL_FEDORA" -eq 1 ]; then
+        use_kexec=1
+    fi
+
+    if [ "$use_kexec" -eq 1 ]; then
+        # Fail fast on unsupported architectures before any destructive action.
+        check_arch
+    elif ! command -v nvme &>/dev/null; then
+        fatal "nvme-cli is required but not found. Install it with your package manager."
     fi
 
     if [ "$is_root" -eq 1 ]; then
-        warn "TARGET DEVICE IS THE ROOT DISK!"
+        warn "TARGET DEVICE IS THE ROOT DEVICE!"
         warn "This will kexec into a minimal environment to sanitize."
+        warn "THE SYSTEM WILL REBOOT as part of this process."
+    elif [ "$INSTALL_FEDORA" -eq 1 ]; then
+        warn "TARGET IS NOT THE ROOT DEVICE, but --install-fedora sanitizes and replaces"
+        warn "its contents, installs a bootloader, and boots into the fresh install."
         warn "THE SYSTEM WILL REBOOT as part of this process."
     fi
 
@@ -905,7 +937,7 @@ main() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         info "DRY RUN - no changes will be made."
-        if [ "$is_root" -eq 1 ]; then
+        if [ "$use_kexec" -eq 1 ]; then
             info "Would kexec into minimal environment and sanitize $TARGET_DEVICE."
             if [ "$INSTALL_FEDORA" -eq 1 ]; then
                 info "Would then install Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} on $TARGET_DEVICE."
@@ -918,7 +950,7 @@ main() {
 
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
-    if [ "$is_root" -eq 1 ]; then
+    if [ "$use_kexec" -eq 1 ]; then
         do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA" "$TEST_MODE"
     else
         detach_device "$TARGET_DEVICE"

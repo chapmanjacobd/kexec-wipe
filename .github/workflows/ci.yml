@@ -304,20 +304,28 @@ jobs:
 
       - name: Prepare release assets
         run: |
-          X86_ASSET=$(sed -n 's/^INITRAMFS_URL_x86_64="[^"]*\/\([^/]*\)"$/\1/p' lib/kexec.sh)
-          test -n "$X86_ASSET"
-          if [ "$X86_ASSET" != "kexec-wipe-initramfs-x86_64.cpio.gz" ]; then
-            cp "kexec-wipe-initramfs-x86_64.cpio.gz" "$X86_ASSET"
-          fi
+          set -euo pipefail
+          # Rename each arch's built artifact to the exact filename referenced by
+          # the pinned URL in lib/kexec.sh, so the checksums match the release.
+          for arch in x86_64 aarch64; do
+            asset=$(sed -n "s/^INITRAMFS_URL_${arch}=\"[^\"]*\/\([^/]*\)\"$/\1/p" lib/kexec.sh)
+            test -n "$asset" || { echo "::error::Could not determine asset name for $arch" >&2; exit 1; }
+            if [ "$asset" != "kexec-wipe-initramfs-${arch}.cpio.gz" ]; then
+              cp "kexec-wipe-initramfs-${arch}.cpio.gz" "$asset"
+            fi
+          done
 
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME}"
+          X86_ASSET=$(sed -n 's/^INITRAMFS_URL_x86_64="[^"]*\/\([^/]*\)"$/\1/p' lib/kexec.sh)
+          ARM_ASSET=$(sed -n 's/^INITRAMFS_URL_aarch64="[^"]*\/\([^/]*\)"$/\1/p' lib/kexec.sh)
 
           gh release upload "${VERSION}" \
             wipe.sh \
-            kexec-wipe-initramfs-*.cpio.gz \
+            "$X86_ASSET" \
+            "$ARM_ASSET" \
             --clobber \
             --repo "${GITHUB_REPOSITORY}"

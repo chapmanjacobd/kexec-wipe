@@ -20,8 +20,15 @@ platform_arch() {
     case "$(uname -m)" in
         aarch64|arm64) echo "aarch64" ;;
         x86_64|amd64) echo "x86_64" ;;
-        *) echo "x86_64" ;;
+        *) fatal "Unsupported architecture: $(uname -m) (supported: x86_64, aarch64)" ;;
     esac
+}
+
+# Fail fast if the running architecture is unsupported. The return value is 0
+# on success (unsupported arches make platform_arch fatal), so callers use this
+# purely to validate before any destructive action.
+check_arch() {
+    platform_arch >/dev/null
 }
 
 initramfs_file() {
@@ -60,7 +67,7 @@ fedora_raw_sha256() {
 
 check_kexec() {
     if ! command -v kexec &>/dev/null; then
-        fatal "kexec is required for root disk sanitization but not found.
+        fatal "kexec is required for root device sanitization but not found.
 Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf install kexec-tools')."
     fi
 }
@@ -165,8 +172,8 @@ augment_initramfs() {
     echo "$out"
 }
 
-# Federation finds a kernel image (optionally with its initrd) suitable for kexec.
-# On classic setups this is vmlinuz + separate initrd, or a single UKI (Unified
+# Find a kernel image (optionally with its initrd) suitable for kexec. On
+# classic setups this is vmlinuz + separate initrd, or a single UKI (Unified
 # Kernel Image, common on aarch64) that embeds linux+initrd. Prints "<kernel> [initrd]".
 find_kernel() {
     local kver
@@ -192,34 +199,6 @@ find_kernel() {
     fatal "Could not find kernel image for ${kver}. Searched: ${candidates[*]}"
 }
 
-# Locate the initrd (if any) accompanying a classic kernel image. UKIs embed
-# their initrd, so nothing to return there.
-find_initrd() {
-    local kernel="$1"
-    local kver
-    kver=$(uname -r)
-
-    # .efi is a UKI; the initrd is within the binary.
-    case "$kernel" in
-        *.efi) return 0 ;;
-    esac
-
-    local candidates=(
-        "/boot/initramfs-${kver}.img"
-        "/boot/initrd.img-${kver}"
-        "/boot/initramfs-${kver}"
-        "/initramfs-${kver}.img"
-    )
-
-    for c in "${candidates[@]}"; do
-        if [ -f "$c" ]; then
-            echo "$c"
-            return 0
-        fi
-    done
-
-    warn "No separate initrd found for ${kernel}; using kernel as-is (UKI assumes embedded initrd)."
-}
 
 do_kexec_wipe() {
     local dev="$1"
@@ -243,18 +222,20 @@ do_kexec_wipe() {
 
         # Capture the host hostname and the user to provision on the fresh install.
         # The provision user prefers the invoking user ($SUDO_USER) so the new
-        # account matches the person running the wipe, falling back to the
-        # hostname when there is no sudo user (e.g. run directly as root).
+        # account matches the person running the wipe. When the wipe is run as
+        # root (no SUDO_USER) or via "sudo ... as root", we provision the root
+        # account itself: no user is created, only /root/.ssh/authorized_keys is
+        # copied over.
         local host_hostname
         host_hostname=$(hostname)
         echo "$host_hostname" > "${WIPE_TMPDIR}/hostname"
         info "  Hostname:  $host_hostname"
 
         local provision_user
-        if [ -n "${SUDO_USER:-}" ]; then
+        if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
             provision_user="$SUDO_USER"
         else
-            provision_user="$host_hostname"
+            provision_user="root"
         fi
         echo "$provision_user" > "${WIPE_TMPDIR}/user"
         info "  User:       $provision_user"
@@ -294,7 +275,7 @@ do_kexec_wipe() {
     if [ "$install" -eq 1 ]; then
         cmdline="${cmdline} kexec_wipe_install=1"
         cmdline="${cmdline} kexec_wipe_fedora_image=/opt/fedora.raw.xz"
-        info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after wipe"
+        info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after sanitize"
     fi
 
     # Test-only: don't abort the initramfs if the device does not implement the
@@ -305,42 +286,29 @@ do_kexec_wipe() {
         warn "  TEST MODE: sanitize failure will be ignored (device cannot be sanitized)."
     fi
 
-    # For a classic kernel, pass the separate initrd. For a UKI (.efi), the
-    # initrd is embedded; no --initrd is needed.
-    local initrd
-    initrd=$(find_initrd "$kernel")
-
+    # A .efi kernel is a Unified Kernel Image (UKI): linux + initrd are embedded
+    # in one PE binary. A classic kernel (vmlinuz/bzImage/...) has no embedded
+    # initrd, so we hand it our wipe initramfs as the initrd.
     info "Loading kernel into memory..."
     info "  Kernel:    $kernel"
-    if [ -n "$initrd" ]; then
-        info "  Initrd:    $initrd"
-    else
-        info "  Initrd:    (embedded in UKI)"
-    fi
     info "  Initramfs: $initramfs_path"
     info "  Target:    $dev"
 
-    if [ -n "$initrd" ]; then
-        # Classic kernel: load with the wipe initramfs.
+    if [[ "$kernel" == *.efi ]]; then
+        # UKI: load its .linux section with our wipe initramfs as the initrd.
+        # We deliberately use ONLY our initramfs (not the UKI's embedded one) so
+        # our /init runs the wipe. Do not try to concatenate the UKI's embedded
+        # initrd with ours: both are compressed cpio streams and the kernel
+        # unpacks only the first gzip member, so the appended initramfs (and its
+        # /init) would be silently dropped.
+        info "  Boot image: UKI (.efi, embedded initrd)"
+        kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
+            || fatal "Failed to load UKI kernel into memory via kexec."
+    else
+        # Classic kernel: load with the wipe initramfs as the initrd.
+        info "  Boot image: classic kernel (wipe initramfs as initrd)"
         kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
             || fatal "Failed to load kernel into memory via kexec."
-    else
-        # UKI (.efi): try loading the UKI with our initramfs directly. If kexec
-        # cannot parse the PE, extract the embedded initrd (objcopy) and
-        # concatenate it with ours.
-        if kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" 2>/dev/null; then
-            : # loaded UKI directly
-        else
-            local kinitrd="${WIPE_TMPDIR}/uki-initrd"
-            info "Direct UKI load failed; extracting embedded initrd for a combined initramfs..."
-            if extract_uki_initrd "$kernel" "$kinitrd"; then
-                cat "$kinitrd" "$initramfs_path" > "${WIPE_TMPDIR}/combined-initrd"
-            else
-                cat "$initramfs_path" > "${WIPE_TMPDIR}/combined-initrd"
-            fi
-            kexec -l "$kernel" --initrd="${WIPE_TMPDIR}/combined-initrd" --command-line="$cmdline" \
-                || fatal "Failed to load kernel into memory via kexec."
-        fi
     fi
 
     success "Kernel loaded. System will now kexec into minimal environment."
@@ -351,22 +319,4 @@ do_kexec_wipe() {
 
     sync
     kexec -e || fatal "kexec -e failed. System may need manual reboot."
-}
-
-# Extract the initrd payload from a UKI (.efi) file. UKIs are PE images with a
-# .linux/.initrd section pair; objcopy can dump arbitrary sections.
-extract_uki_initrd() {
-    local uki="$1"
-    local out="$2"
-
-    if command -v objcopy &>/dev/null; then
-        if objcopy --dump-section .initrd="$out" "$uki" 2>/dev/null && [ -s "$out" ]; then
-            return 0
-        fi
-        # Some UKIs use a different section name; fall through and warn.
-        warn "Could not extract .initrd from UKI ${uki}."
-    else
-        warn "objcopy not available to extract UKI initrd."
-    fi
-    return 1
 }
