@@ -94,7 +94,27 @@ require_tools() {
 }
 
 iso_tool() {
-    command -v genisoimage || command -v mkisofs || command -v xorriso
+    if command -v genisoimage >/dev/null 2>&1; then
+        echo "genisoimage"
+    elif command -v mkisofs >/dev/null 2>&1; then
+        echo "mkisofs"
+    elif command -v xorriso >/dev/null 2>&1; then
+        echo "xorriso"
+    fi
+}
+
+# Build a cloud-init seed ISO. xorriso needs `-as mkisofs`; genisoimage/mkisofs
+# take the flags directly.
+make_iso() {
+    local output="$1"
+    shift
+    local tool
+    tool=$(iso_tool) || { echo "ERROR: no ISO tool available" >&2; exit 1; }
+    if [ "$tool" = "xorriso" ]; then
+        xorriso -as mkisofs -output "$output" -volid cidata -joliet -rock "$@" >/dev/null 2>&1
+    else
+        "$tool" -output "$output" -volid cidata -joliet -rock "$@" >/dev/null 2>&1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -166,12 +186,11 @@ ssh_pwauth: true
 runcmd:
   - systemctl enable serial-getty@ttyS0.service
   - grubby --update-kernel=ALL --args="console=ttyS0,115200n8" || true
-  - dnf -y install kexec-tools nvme-cli xz
+  - dnf -y install kexec-tools nvme-cli xz cpio gzip parted
   - echo "PHASE1-SETUP-DONE"
 EOF
     printf 'instance-id: kexec-wipe-full-test\nlocal-hostname: qemu-host\n' > "$seeddir/meta-data"
-    $(iso_tool) -output "$WORKDIR/seed.iso" -volid cidata -joliet -rock \
-        "$seeddir/user-data" "$seeddir/meta-data" >/dev/null 2>&1
+    make_iso "$WORKDIR/seed.iso" "$seeddir/user-data" "$seeddir/meta-data"
 }
 
 # QEMU_PID, QEMU_MON, SERIAL_LOG are globals set by boot_vm.
@@ -257,33 +276,21 @@ prepare_guest() {
     echo "==> Building wipe.sh"
     ( cd "$REPO_DIR" && ./build.sh >/dev/null )
 
-    echo "==> Building initramfs in guest (matches guest kernel)"
-    tar czf - -C "$REPO_DIR" initramfs | root_ssh \
-        'rm -rf /opt/kw-initramfs && mkdir -p /opt/kw-initramfs && \
-         tar xzf - -C /opt/kw-initramfs && cd /opt/kw-initramfs/initramfs && \
-         bash build.sh --output=/root/kexec-wipe-initramfs-x86_64.cpio.gz' \
-        | tail -2
-
     echo "==> Installing wipe.sh in guest"
-    local newsha
-    newsha=$(root_ssh 'sha256sum /root/kexec-wipe-initramfs-x86_64.cpio.gz' | awk '{print $1}')
-    # Build a guest-local variant of wipe.sh that points at the locally built,
-    # kernel-matched initramfs and puts the kexec console on ttyS0.
-    sed -e "s|^INITRAMFS_URL_x86_64=.*|INITRAMFS_URL_x86_64=\"file:///root/kexec-wipe-initramfs-x86_64.cpio.gz\"|" \
-        -e "s|^INITRAMFS_SHA256_x86_64=.*|INITRAMFS_SHA256_x86_64=\"$newsha\"|" \
-        -e 's|cmdline="root=/dev/ram rw quiet panic=10"|cmdline="root=/dev/ram rw quiet panic=10 console=ttyS0,115200n8"|' \
+    # wipe.sh now builds its initramfs on the host (guest) at runtime, so no
+    # prebuilt initramfs needs to be shipped or pointed at. Only the kexec
+    # command line is patched so the wipe logs to the serial console.
+    sed -e 's|cmdline="root=/dev/ram rw quiet panic=10"|cmdline="root=/dev/ram rw quiet panic=10 console=ttyS0,115200n8"|' \
         "$REPO_DIR/wipe.sh" \
         | root_ssh 'cat > /root/wipe.sh && chmod +x /root/wipe.sh && bash -n /root/wipe.sh'
-
-    echo "==> Ensuring /root/.ssh/authorized_keys is present for user provisioning"
-    cat "$SSH_PUBKEY" | root_ssh \
-        'mkdir -p /root/.ssh && cat > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys'
 }
 
 run_wipe() {
-    echo "==> Running wipe.sh /dev/nvme0n1 --install-fedora --test-mode"
-    # Run as root, but with SUDO_USER set so the provisioned user is $PROVISION_USER.
-    root_ssh "echo YES | SUDO_USER=$PROVISION_USER nohup bash -c 'bash /root/wipe.sh /dev/nvme0n1 --install-fedora --test-mode > /root/wipe-run.log 2>&1' &" \
+    echo "==> Running wipe.sh /dev/nvme0n1 --install-fedora (test mode)"
+    # Run as root, with SUDO_USER set so the provisioned user is $PROVISION_USER.
+    # KEXEC_WIPE_TEST_MODE=1 lets the kexec'd initramfs continue when QEMU's
+    # emulated NVMe does not implement the Sanitize command.
+    root_ssh "echo YES | KEXEC_WIPE_TEST_MODE=1 SUDO_USER=$PROVISION_USER nohup bash -c 'bash /root/wipe.sh /dev/nvme0n1 --install-fedora > /root/wipe-run.log 2>&1' &" \
         >/dev/null 2>&1 || true
 }
 

@@ -26,7 +26,7 @@ kexec-wipe runs the NVMe `sanitize` command on the target device.
 
 ### Root device
 
-1. Download a prebuilt initramfs (busybox + nvme-cli).
+1. Build a minimal initramfs on the host (busybox + nvme-cli + the running kernel's modules), so it always matches the kernel being kexec'd.
 2. Load the running kernel and the initramfs with `kexec`.
 3. Boot into a minimal in-memory environment.
 4. Run `nvme sanitize` with no filesystems mounted.
@@ -65,20 +65,17 @@ sudo bash wipe.sh /dev/nvme0n1 --dry-run
 | `--method=METHOD` | Sanitize method: `auto`, `crypto`, `block`, `overwrite` |
 | `--install-fedora` | After sanitizing, write a Fedora Cloud Base image and install a bootloader. Uses the kexec path on any device. |
 | `--dry-run` | Show the actions without doing them |
-| `--test-mode` | Continue when the device does not support sanitize (testing only) |
 | `--help` | Show the help message |
 
 ## Install Fedora afterward
 
-`--install-fedora` turns a sanitize into a full reinstall. After the initramfs sanitizes the device, it:
+`--install-fedora` turns a sanitize into a full reinstall. The host pre-downloads the pinned Fedora Cloud Base `raw.xz` image and embeds it in the initramfs. After the initramfs sanitizes the device, it:
 
-1. Starts networking (DHCP) and downloads the pinned Fedora Cloud Base `raw.xz` image.
-2. Verifies the image SHA256 checksum.
-3. Decompresses the image and writes it to the device. It never writes the compressed stream directly.
-4. Detects UEFI or BIOS and the architecture, chroots into the new OS, and runs `grub2-install` and `grub2-mkconfig`.
-5. Creates a user account from `$SUDO_USER`. When run as root, it provisions the root account instead.
-6. Copies `~/.ssh/authorized_keys` into the account, grants sudo, and enables `sshd`.
-7. Runs `switch_root` into the new Fedora in the same boot. If `switch_root` fails, it reboots.
+1. Decompresses the image and writes it to the device. It never writes the compressed stream directly.
+2. Detects UEFI or BIOS and the architecture, chroots into the new OS, and runs `grub2-install` and `grub2-mkconfig`.
+3. Creates a user account from `$SUDO_USER`. When run as root, it provisions the root account instead.
+4. Copies the account's `~/.ssh/authorized_keys`, grants sudo, and enables `sshd`.
+5. Runs `switch_root` into the new Fedora in the same boot. If `switch_root` fails, it reboots.
 
 The image URL, release, and checksum are pinned in `lib/kexec.sh`.
 
@@ -86,17 +83,18 @@ The image URL, release, and checksum are pinned in `lib/kexec.sh`.
 
 ## Architecture support
 
-x86_64 and aarch64 are supported. Each architecture uses a separate initramfs with its own busybox, nvme-cli, libraries, and kernel modules. The Fedora image, GRUB target, and kernel candidates are also selected per architecture. On aarch64, Fedora uses Unified Kernel Images (UKI). kexec-wipe loads a UKI directly and falls back to extracting the embedded initrd with `objcopy`.
+x86_64 and aarch64 are supported. The initramfs is built on the host at run time from the running kernel, so its modules (nvme, xfs, btrfs, ext4) always match the kernel being kexec'd. On aarch64, Fedora uses Unified Kernel Images (UKI); kexec-wipe loads a UKI directly with `kexec -l --initrd` (verified by a QEMU test in CI).
 
 ## Requirements
 
 - Linux with NVMe support (x86_64 or aarch64)
 - Root privileges
-- `nvme-cli` (for a non-root device; included in the initramfs for the root device)
+- `nvme-cli` (or Docker to build a static nvme-cli when using the kexec path)
 - `kexec-tools` (for the root device only)
-- `curl` or `wget` (to download the initramfs)
+- `cpio` and `gzip` (to build the initramfs on the host, for the root device)
+- `bash` (the script is a bash script)
 - `awk` (to format byte sizes)
-- For `--install-fedora`: network access from the initramfs and Docker at build time
+- For `--install-fedora`: network access on the host to download the Fedora image
 
 ## Development
 
@@ -120,9 +118,8 @@ lib/main_body.sh   - Argument parsing, usage, main flow
 
 ### Release
 
-1. Update the architecture-specific initramfs URLs and SHA256 checksums in `lib/kexec.sh`.
-2. Run `./build.sh`.
-3. Push a version tag. CI builds the x86_64 and aarch64 initramfs and uploads them to the release.
+1. Run `./build.sh` (embeds the current initramfs source into wipe.sh).
+2. Push a version tag. CI assembles wipe.sh, runs the static checks, the QEMU integration tests (including the UKI kexec test), and uploads wipe.sh to the release.
 
 ## Safety
 

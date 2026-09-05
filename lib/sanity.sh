@@ -58,11 +58,22 @@ is_root_device() {
 
     # findmnt reports btrfs subvolume roots as "/dev/nvme0n1p3[/root]"; strip
     # the "[...]" suffix so the path is the plain block device.
+    if ! command -v findmnt >/dev/null 2>&1; then
+        warn "Cannot determine the root device (findmnt missing); assuming '$dev' is the root device."
+        sleep 10
+        return 0
+    fi
     local src
-    src=$(findmnt -n -o SOURCE / 2>/dev/null) || return 0
+    src=$(findmnt -n -o SOURCE / 2>/dev/null) || {
+        warn "Cannot determine the root device (findmnt failed); assuming '$dev' is the root device."
+        sleep 10
+        return 0
+    }
     src="${src%%\[*\]}"
 
     if ! command -v lsblk >/dev/null 2>&1; then
+        warn "Cannot determine the root device (lsblk missing); assuming '$dev' is the root device."
+        sleep 10
         return 0
     fi
 

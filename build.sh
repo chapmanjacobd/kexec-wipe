@@ -65,6 +65,21 @@ HEADER
     echo ""
     cat "$MAIN_BODY"
 
+    # Embed the initramfs source (the init script and its builder) so wipe.sh
+    # can build the initramfs on the target host at runtime, guaranteeing the
+    # staged kernel modules match the kernel that will be kexec'd. Emitted as
+    # quoted heredocs so nothing in the embedded content is expanded.
+    for name in init build.sh; do
+        echo ""
+        echo "# --- begin embedded: initramfs/${name} ---"
+        echo "write_embedded_initramfs_$(echo "$name" | tr . _)() {"
+        echo "    cat > \"\$1\" <<'KW_EMBED_$(echo "$name" | tr . _)_EOF'"
+        cat "${SCRIPT_DIR}/initramfs/${name}"
+        echo "KW_EMBED_$(echo "$name" | tr . _)_EOF"
+        echo "}"
+        echo "# --- end embedded: initramfs/${name} ---"
+    done
+
 } > "${OUTPUT}.tmp"
 
 mv "${OUTPUT}.tmp" "$OUTPUT"

@@ -22,9 +22,6 @@ Options:
   --install-fedora      After sanitizing the device via kexec, write a Fedora
                         Cloud Base image and install a bootloader so it can boot.
                         Works on the root device or any other device.
-  --test-mode           TESTING ONLY: continue even if the sanitize command is
-                        not supported by the device (e.g. QEMU's emulated
-                        NVMe). Never use on real hardware.
   --help                Show this help message
 
 Examples:
@@ -45,7 +42,6 @@ parse_args() {
     METHOD="auto"
     DRY_RUN=0
     INSTALL_FEDORA=0
-    TEST_MODE=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -61,9 +57,6 @@ parse_args() {
                 ;;
             --install-fedora)
                 INSTALL_FEDORA=1
-                ;;
-            --test-mode)
-                TEST_MODE=1
                 ;;
             --help|-h)
                 usage
@@ -97,14 +90,17 @@ print_banner() {
 main() {
     parse_args "$@"
 
+    # Resolve /dev/disk/by-* style symlinks so basename-based checks (NVMe name
+    # validation, root-device detection, teardown) see the real kernel device.
+    TARGET_DEVICE=$(readlink -f "$TARGET_DEVICE" 2>/dev/null || echo "$TARGET_DEVICE")
+
     print_banner
     check_root
     validate_device "$TARGET_DEVICE"
 
-    # Non-root path needs nvme-cli on the host; the kexec path gets it from the
-    # initramfs. --install-fedora also takes the kexec path on any disk: it
-    # writes an image, installs a bootloader and switch_roots into the fresh
-    # OS, all of which happen inside the minimal environment.
+    # The kexec path builds its initramfs on the host (nvme-cli is needed unless
+    # Docker is available to build it statically), while the direct path runs
+    # nvme sanitize on the host. Both paths also need nvme-cli installed.
     local is_root=0
     if is_root_device "$TARGET_DEVICE"; then
         is_root=1
@@ -118,6 +114,12 @@ main() {
     if [ "$use_kexec" -eq 1 ]; then
         # Fail fast on unsupported architectures before any destructive action.
         check_arch
+        if ! command -v nvme &>/dev/null && ! command -v docker &>/dev/null; then
+            fatal "nvme-cli is required on the host (or Docker to build it) to build the initramfs. Install nvme-cli."
+        fi
+        for d in bash cpio gzip; do
+            command -v "$d" &>/dev/null || fatal "$d is required to build the initramfs on the host."
+        done
     elif ! command -v nvme &>/dev/null; then
         fatal "nvme-cli is required but not found. Install it with your package manager."
     fi
@@ -160,7 +162,7 @@ main() {
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
     if [ "$use_kexec" -eq 1 ]; then
-        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA" "$TEST_MODE"
+        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
     else
         detach_device "$TARGET_DEVICE"
         do_sanitize "$TARGET_DEVICE" "$METHOD"

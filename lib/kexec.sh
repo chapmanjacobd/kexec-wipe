@@ -1,13 +1,6 @@
 #!/bin/bash
 # kexec-based approach for sanitizing the root device
 
-# Explicit architecture-specific initramfs assets. Update the URLs and
-# checksums together when the initramfs content or release changes.
-INITRAMFS_URL_x86_64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.1/kexec-wipe-initramfs-x86_64.cpio.gz"
-INITRAMFS_URL_aarch64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.1/kexec-wipe-initramfs-aarch64.cpio.gz"
-INITRAMFS_SHA256_x86_64="f022a0edf8d32f5429ca81a050b34d1c2f88f880ccccfd017693d6c915d9d818"
-INITRAMFS_SHA256_aarch64="9270f4f4ae77177c5824c760abc5ef3cf8171119927332df30687e45d5a1e94a"
-
 # Pinned Fedora Cloud Base raw image for --install-fedora.
 # Bumped by the maintainer per Fedora release.
 INSTALL_FEDORA_RELEASE="44"
@@ -31,27 +24,6 @@ check_arch() {
     platform_arch >/dev/null
 }
 
-initramfs_file() {
-    case "$(platform_arch)" in
-        aarch64) echo "kexec-wipe-initramfs-aarch64.cpio.gz" ;;
-        *) echo "kexec-wipe-initramfs-x86_64.cpio.gz" ;;
-    esac
-}
-
-initramfs_url() {
-    case "$(platform_arch)" in
-        aarch64) echo "$INITRAMFS_URL_aarch64" ;;
-        *) echo "$INITRAMFS_URL_x86_64" ;;
-    esac
-}
-
-initramfs_sha256() {
-    case "$(platform_arch)" in
-        aarch64) echo "$INITRAMFS_SHA256_aarch64" ;;
-        *) echo "$INITRAMFS_SHA256_x86_64" ;;
-    esac
-}
-
 fedora_raw_url() {
     local arch
     arch=$(platform_arch)
@@ -72,43 +44,36 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
     fi
 }
 
-download_url() {
-    local url="$1"
-    local dest="$2"
-
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$dest"
-    elif command -v wget &>/dev/null; then
-        wget -q "$url" -O "$dest"
-    else
-        fatal "Neither curl nor wget is available to download files."
-    fi
-}
-
-download_initramfs() {
+# Build the wipe initramfs on the host at runtime. This (unlike shipping a
+# prebuilt initramfs) guarantees the staged kernel modules (xfs/btrfs/ext4/nvme)
+# match the kernel that will be kexec'd, so modprobe can load the NVMe driver
+# after kexec even on distros that build it as a module (e.g. Fedora).
+#
+# The initramfs builder and the init script are embedded into wipe.sh by
+# build.sh (write_embedded_initramfs_build_sh / write_embedded_initramfs_init).
+build_initramfs_on_host() {
     local dest="$1"
-    local arch
-    arch=$(platform_arch)
-    local url
-    url=$(initramfs_url)
-    local expected
-    expected=$(initramfs_sha256)
 
-    info "Downloading initramfs from ${url}..."
+    for d in bash cpio gzip; do
+        command -v "$d" >/dev/null 2>&1 || fatal "$d is required to build the initramfs on the host."
+    done
 
-    download_url "$url" "$dest" || fatal "Failed to download ${arch} initramfs."
+    local srcdir="${WIPE_TMPDIR}/initramfs-src"
+    mkdir -p "$srcdir"
+    write_embedded_initramfs_build_sh "$srcdir/build.sh"
+    write_embedded_initramfs_init "$srcdir/init"
+    chmod +x "$srcdir/build.sh" "$srcdir/init"
+
+    info "Building initramfs on host (matching kernel $(uname -r))..."
+    if ! bash "$srcdir/build.sh" --output="$dest"; then
+        fatal "Failed to build the initramfs on the host."
+    fi
 
     if [ ! -s "$dest" ]; then
-        fatal "Downloaded initramfs is empty."
+        fatal "Built initramfs is empty."
     fi
 
-    local got
-    got=$(sha256sum "$dest" | awk '{print $1}')
-    if [ "$got" != "$expected" ]; then
-        fatal "Initramfs checksum mismatch for ${arch} (got $got, expected $expected)."
-    fi
-
-    success "Initramfs downloaded and verified for ${arch} ($(bytes_to_human "$(stat -c%s "$dest")"))."
+    success "Initramfs built for $(platform_arch) ($(bytes_to_human "$(stat -c%s "$dest")"))."
 }
 
 # Download and verify the Fedora Cloud Base raw image on the host.
@@ -140,31 +105,38 @@ download_fedora_image() {
     success "Fedora image downloaded and verified ($(bytes_to_human "$(stat -c%s "$dest")"))."
 }
 
-# Embed a file into a copy of the initramfs cpio archive. The kernel-initramfs is
-# itself an unpacked RAM filesystem, so appending a file to it makes that file
-# available to the initramfs/init as if on disk. Prints the augmented initramfs
-# path.
+# Embed files into a copy of the initramfs cpio archive in a single pass. The
+# kernel-initramfs is itself an unpacked RAM filesystem, so adding files makes
+# them available to initramfs/init as if on disk. All files are added after one
+# extraction so a large archive (e.g. an embedded Fedora image) is only
+# decompressed and recompressed once. Prints the augmented initramfs path.
 #
 #   args: INITRAMFS_IN  (path to source cpio.gz)
-#         EMBEDDED_PATH (absolute path the file should appear at in the initramfs)
-#         FILE          (path to the file to embed)
-#         [OUT]         (optional output path; defaults to <dir>/augmented.cpio.gz)
+#         OUT           (path to the augmented cpio.gz)
+#         PAIR...       (each "EMBEDDED_PATH=FILE")
 augment_initramfs() {
-    local src="$1" path="$2" file="$3" out="${4:-}"
+    local src="$1" out="$2"
+    shift 2
     local work
 
     if [ -z "$src" ] || [ ! -f "$src" ]; then
         fatal "augment_initramfs: source initramfs '$src' not found."
     fi
-
-    [ -n "$out" ] || out="${src%.gz}.augmented.cpio.gz"
+    [ -n "$out" ] || fatal "augment_initramfs: no output path."
 
     work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
     gzip -dc "$src" | ( cd "$work" && cpio -idm 2>/dev/null )
 
-    local dest="$work/${path#/}"
-    mkdir -p "$(dirname "$dest")"
-    cp "$file" "$dest"
+    local pair path file dest
+    for pair in "$@"; do
+        path="${pair%%=*}"
+        file="${pair#*=}"
+        [ -n "$path" ] || fatal "augment_initramfs: bad pair '$pair'."
+        [ -f "$file" ] || fatal "augment_initramfs: file to embed '$file' not found."
+        dest="$work/${path#/}"
+        mkdir -p "$(dirname "$dest")"
+        cp "$file" "$dest"
+    done
 
     ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
 
@@ -204,14 +176,14 @@ do_kexec_wipe() {
     local dev="$1"
     local method="${2:-auto}"
     local install="${3:-0}"
-    local test_mode="${4:-0}"
 
     check_kexec
 
     make_tmpdir
-    local initramfs_path="${WIPE_TMPDIR}/$(initramfs_file)"
+    local initramfs_path
+    initramfs_path="${WIPE_TMPDIR}/kexec-wipe-initramfs.cpio.gz"
 
-    download_initramfs "$initramfs_path"
+    build_initramfs_on_host "$initramfs_path"
 
     # With --install-fedora, the Fedora image is downloaded on the host and
     # embedded into the initramfs. The image path is handed to the initramfs
@@ -240,11 +212,17 @@ do_kexec_wipe() {
         echo "$provision_user" > "${WIPE_TMPDIR}/user"
         info "  User:       $provision_user"
 
+        # Copy the provisioned account's own authorized_keys. When provisioning a
+        # regular user, use that user's keys (not root's, which is what $HOME
+        # resolves to under sudo). When provisioning root, use root's keys.
         local auth_keys=""
-        if [ -f "${HOME:-/root}/.ssh/authorized_keys" ]; then
-            auth_keys="${HOME:-/root}/.ssh/authorized_keys"
-        elif [ -f "/root/.ssh/authorized_keys" ]; then
-            auth_keys="/root/.ssh/authorized_keys"
+        if [ "$provision_user" = "root" ]; then
+            [ -f "/root/.ssh/authorized_keys" ] && auth_keys="/root/.ssh/authorized_keys"
+        else
+            local user_home
+            user_home=$(getent passwd "$provision_user" 2>/dev/null | cut -d: -f6)
+            [ -n "$user_home" ] || user_home="/home/$provision_user"
+            [ -f "$user_home/.ssh/authorized_keys" ] && auth_keys="$user_home/.ssh/authorized_keys"
         fi
         if [ -n "$auth_keys" ] && [ -s "$auth_keys" ]; then
             cp "$auth_keys" "${WIPE_TMPDIR}/authorized_keys"
@@ -256,10 +234,11 @@ do_kexec_wipe() {
 
         info "Embedding Fedora image into initramfs..."
         local augmented
-        augmented=$(augment_initramfs "$initramfs_path" "/opt/fedora.raw.xz" "$fedora")
-        augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-hostname" "${WIPE_TMPDIR}/hostname")
-        augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-user" "${WIPE_TMPDIR}/user")
-        augmented=$(augment_initramfs "$augmented" "/opt/kexec-wipe-authorized_keys" "${WIPE_TMPDIR}/authorized_keys")
+        augmented=$(augment_initramfs "$initramfs_path" "${initramfs_path%.gz}.augmented.cpio.gz" \
+            "/opt/fedora.raw.xz=$fedora" \
+            "/opt/kexec-wipe-hostname=${WIPE_TMPDIR}/hostname" \
+            "/opt/kexec-wipe-user=${WIPE_TMPDIR}/user" \
+            "/opt/kexec-wipe-authorized_keys=${WIPE_TMPDIR}/authorized_keys")
         initramfs_path="$augmented"
         info "  Augmented initramfs: $initramfs_path"
     fi
@@ -278,10 +257,11 @@ do_kexec_wipe() {
         info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after sanitize"
     fi
 
-    # Test-only: don't abort the initramfs if the device does not implement the
-    # NVMe Sanitize command (e.g. QEMU's emulated NVMe). Never set on real
-    # hardware; see initramfs/init.
-    if [ "$test_mode" -eq 1 ]; then
+    # Internal test hook (used by the QEMU CI tests, not a user-facing flag):
+    # don't abort the initramfs if the device does not implement the NVMe
+    # Sanitize command (e.g. QEMU's emulated NVMe). Never set on real hardware;
+    # see initramfs/init.
+    if [ "${KEXEC_WIPE_TEST_MODE:-0}" = "1" ]; then
         cmdline="${cmdline} kexec_wipe_test=1"
         warn "  TEST MODE: sanitize failure will be ignored (device cannot be sanitized)."
     fi
@@ -295,12 +275,11 @@ do_kexec_wipe() {
     info "  Target:    $dev"
 
     if [[ "$kernel" == *.efi ]]; then
-        # UKI: load its .linux section with our wipe initramfs as the initrd.
-        # We deliberately use ONLY our initramfs (not the UKI's embedded one) so
-        # our /init runs the wipe. Do not try to concatenate the UKI's embedded
-        # initrd with ours: both are compressed cpio streams and the kernel
-        # unpacks only the first gzip member, so the appended initramfs (and its
-        # /init) would be silently dropped.
+        # UKI: kexec-tools (>= 2.0.25) detects the PE's .linux section and loads
+        # it. Our --initrd is passed as an *additional* initrd segment after the
+        # UKI's embedded one; the kernel unpacks all initrds in order, so our
+        # wipe /init (unpacked last) is the one that runs. This requires
+        # kexec-tools 2.0.25+ (verified by the QEMU UKI test in CI).
         info "  Boot image: UKI (.efi, embedded initrd)"
         kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
             || fatal "Failed to load UKI kernel into memory via kexec."
