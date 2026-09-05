@@ -268,27 +268,24 @@ do_kexec_wipe() {
 
     # A .efi kernel is a Unified Kernel Image (UKI): linux + initrd are embedded
     # in one PE binary. A classic kernel (vmlinuz/bzImage/...) has no embedded
-    # initrd, so we hand it our wipe initramfs as the initrd.
+    # initrd, so we hand it our wipe initramfs as the initrd. In both cases the
+    # command is identical: kexec-tools unpacks a UKI's .linux section and loads
+    # it as a plain kernel (arm64 support since 2.0.30, x86_64 since 2.0.31),
+    # and when --initrd is given it replaces the UKI's embedded initrd so our
+    # wipe /init is the one that runs. Verified by the aarch64 QEMU UKI test in
+    # CI (ubuntu-26.04-arm).
     info "Loading kernel into memory..."
     info "  Kernel:    $kernel"
     info "  Initramfs: $initramfs_path"
     info "  Target:    $dev"
 
     if [[ "$kernel" == *.efi ]]; then
-        # UKI: kexec-tools unpacks the PE's .linux section and loads it as a
-        # plain kernel (arm64 support since 2.0.30, x86_64 since 2.0.31). When
-        # --initrd is given it is used as the kernel's initramfs, replacing the
-        # UKI's embedded one, so our wipe /init is the one that runs. Verified
-        # by the aarch64 QEMU UKI test in CI (ubuntu-26.04-arm).
         info "  Boot image: UKI (.efi, embedded initrd)"
-        kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
-            || fatal "Failed to load UKI kernel into memory via kexec."
     else
-        # Classic kernel: load with the wipe initramfs as the initrd.
         info "  Boot image: classic kernel (wipe initramfs as initrd)"
-        kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
-            || fatal "Failed to load kernel into memory via kexec."
     fi
+    kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
+        || fatal "Failed to load $kernel into memory via kexec."
 
     success "Kernel loaded. System will now kexec into minimal environment."
     warn "THE SYSTEM WILL REBOOT MOMENTARILY. Any unsaved work will be lost."

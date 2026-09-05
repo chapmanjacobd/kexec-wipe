@@ -116,10 +116,21 @@ build_uki() {
     printf 'console=ttyAMA0\n' > "$w/cmdline"
     cp /etc/os-release "$w/os-release" 2>/dev/null || printf 'ID=test\n' > "$w/os-release"
 
+    # kexec-tools' arm64 UKI loader only recognizes a raw arm64 Image in the
+    # .linux section (it probes elf/Image/uImage/PE-zboot, but not gzip). Ubuntu's
+    # /boot/vmlinuz is a gzip-compressed Image.gz, which no probe matches and
+    # which fails at kexec -l time with "Can not recognize the kernel format in
+    # .linux section". Decompress it first if needed.
+    local linux_src="$KERNEL"
+    if [ "$(od -An -tx1 -N2 "$KERNEL" | tr -d ' \n')" = "1f8b" ]; then
+        gzip -dc "$KERNEL" > "$w/Image" || { echo "ERROR: failed to decompress kernel" >&2; exit 1; }
+        linux_src="$w/Image"
+    fi
+
     objcopy \
         --add-section .osrel="$w/os-release" --change-section-vma .osrel=0x20000 \
         --add-section .cmdline="$w/cmdline" --change-section-vma .cmdline=0x30000 \
-        --add-section .linux="$KERNEL" --change-section-vma .linux=0x2000000 \
+        --add-section .linux="$linux_src" --change-section-vma .linux=0x2000000 \
         --add-section .initrd="$w/embedded.cpio.gz" --change-section-vma .initrd=0x3000000 \
         "$STUB" "$OUT_DIR/uki.efi"
 

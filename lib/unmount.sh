@@ -15,10 +15,12 @@ unmount_device() {
     local mounts
     mounts=$(lsblk -lno MOUNTPOINTS "/dev/$devname" 2>/dev/null | grep -E '^/' || true)
 
-    # Unmount deepest paths first (longest mount point first)
+    # Unmount deepest paths first (longest mount point first). Read each mount
+    # point line-by-line (not word-split) so paths containing spaces survive,
+    # and sort by descending length to unmount children before their parents.
     if [ -n "$mounts" ]; then
         local tgt
-        for tgt in $(printf '%s\n' "$mounts" | awk '{ print length, $0 }' | sort -rn | awk '{ $1=""; print }'); do
+        printf '%s\n' "$mounts" | awk '{ print length($0), $0 }' | sort -rn | sed 's/^[0-9][0-9]* //' | while IFS= read -r tgt; do
             [ -z "$tgt" ] && continue
             info "  Unmounting $tgt"
             umount -f "$tgt" 2>/dev/null || umount -l "$tgt" 2>/dev/null || true
@@ -101,9 +103,12 @@ remove_raid() {
     fi
 }
 
-# Refuse to proceed if the device still has active consumers (mounts or swap)
-# after teardown. Sanitizing a device that is still mounted risks corruption or
-# a rejected sanitize; the whole point of this tool is to avoid that.
+# Refuse to proceed if the device still has active consumers (mounts, swap, or
+# kernel holders) after teardown. Sanitizing a device that is still in use
+# risks corruption or a rejected sanitize; the whole point of this tool is to
+# avoid that. Holders (dm-crypt/LUKS, LVM, MD, loop, partition mappings) are
+# checked via /sys/block so the check works even when the management tools
+# (vgchange/mdadm/cryptsetup) are not installed.
 assert_device_detached() {
     local dev="$1"
     local devname
@@ -124,6 +129,25 @@ $remaining"
         if grep -qE "^/dev/${devname}(p[0-9]+)?[[:space:]]" /proc/swaps 2>/dev/null; then
             fatal "Device $dev is still used as swap; refusing to sanitize."
         fi
+    fi
+
+    # Any kernel holders (e.g. dm-crypt, an active VG, an assembled MD array, or
+    # a partition that is itself still in use) mean the device is not detached.
+    # Check the whole disk and each of its partitions. A sysfs "holders" entry
+    # that references this device is enough to refuse.
+    local holders=""
+    local node
+    for node in "/dev/$devname" /dev/"$devname"p[0-9]*; do
+        [ -b "$node" ] || continue
+        local h
+        h=$(ls "/sys/block/$(basename "$node")/holders" 2>/dev/null || true)
+        if [ -n "$h" ]; then
+            holders="$holders${holders:+ }$node: $h"
+        fi
+    done
+    if [ -n "$holders" ]; then
+        fatal "Device $dev still has active holders; refusing to sanitize:
+$holders"
     fi
 }
 

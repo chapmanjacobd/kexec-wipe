@@ -53,8 +53,10 @@ parse_cmdline() {
     # against QEMU's emulated NVMe, which does not implement the NVMe Sanitize
     # command. Not for production use.
     KEXEC_WIPE_TEST=0
-    # Optional overrides for the Fedora install source (used by tests). When
-    # empty, the pinned release/checksum above is used.
+    # Path to the Fedora image pre-embedded into the initramfs by the host-side
+    # script (wipe.sh embeds it at /opt/fedora.raw.xz and passes the path here).
+    # There is no download or checksum step in this initramfs: those happen on
+    # the host before kexec. Overridable via cmdline (used by tests).
     KEXEC_WIPE_FEDORA_IMAGE=""
     KEXEC_WIPE_HOSTNAME=""
     KEXEC_WIPE_USER=""

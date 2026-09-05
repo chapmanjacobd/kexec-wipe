@@ -62,13 +62,15 @@ HEADER
         echo "# --- end lib/${lib} ---"
     done
 
-    echo ""
-    cat "$MAIN_BODY"
-
     # Embed the initramfs source (the init script and its builder) so wipe.sh
     # can build the initramfs on the target host at runtime, guaranteeing the
     # staged kernel modules match the kernel that will be kexec'd. Emitted as
     # quoted heredocs so nothing in the embedded content is expanded.
+    #
+    # NOTE: These must be emitted BEFORE main_body.sh. lib/main_body.sh ends
+    # with `main "$@"`, and the embedded writer functions are called from the
+    # kexec path (build_initramfs_on_host in lib/kexec.sh). Emitting them first
+    # guarantees they are defined before main() runs.
     for name in init build.sh; do
         echo ""
         echo "# --- begin embedded: initramfs/${name} ---"
@@ -79,6 +81,9 @@ HEADER
         echo "}"
         echo "# --- end embedded: initramfs/${name} ---"
     done
+
+    echo ""
+    cat "$MAIN_BODY"
 
 } > "${OUTPUT}.tmp"
 

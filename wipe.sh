@@ -138,20 +138,17 @@ is_root_device() {
     # the "[...]" suffix so the path is the plain block device.
     if ! command -v findmnt >/dev/null 2>&1; then
         warn "Cannot determine the root device (findmnt missing); assuming '$dev' is the root device."
-        sleep 10
         return 0
     fi
     local src
     src=$(findmnt -n -o SOURCE / 2>/dev/null) || {
         warn "Cannot determine the root device (findmnt failed); assuming '$dev' is the root device."
-        sleep 10
         return 0
     }
     src="${src%%\[*\]}"
 
     if ! command -v lsblk >/dev/null 2>&1; then
         warn "Cannot determine the root device (lsblk missing); assuming '$dev' is the root device."
-        sleep 10
         return 0
     fi
 
@@ -198,10 +195,12 @@ unmount_device() {
     local mounts
     mounts=$(lsblk -lno MOUNTPOINTS "/dev/$devname" 2>/dev/null | grep -E '^/' || true)
 
-    # Unmount deepest paths first (longest mount point first)
+    # Unmount deepest paths first (longest mount point first). Read each mount
+    # point line-by-line (not word-split) so paths containing spaces survive,
+    # and sort by descending length to unmount children before their parents.
     if [ -n "$mounts" ]; then
         local tgt
-        for tgt in $(printf '%s\n' "$mounts" | awk '{ print length, $0 }' | sort -rn | awk '{ $1=""; print }'); do
+        printf '%s\n' "$mounts" | awk '{ print length($0), $0 }' | sort -rn | sed 's/^[0-9][0-9]* //' | while IFS= read -r tgt; do
             [ -z "$tgt" ] && continue
             info "  Unmounting $tgt"
             umount -f "$tgt" 2>/dev/null || umount -l "$tgt" 2>/dev/null || true
@@ -284,9 +283,12 @@ remove_raid() {
     fi
 }
 
-# Refuse to proceed if the device still has active consumers (mounts or swap)
-# after teardown. Sanitizing a device that is still mounted risks corruption or
-# a rejected sanitize; the whole point of this tool is to avoid that.
+# Refuse to proceed if the device still has active consumers (mounts, swap, or
+# kernel holders) after teardown. Sanitizing a device that is still in use
+# risks corruption or a rejected sanitize; the whole point of this tool is to
+# avoid that. Holders (dm-crypt/LUKS, LVM, MD, loop, partition mappings) are
+# checked via /sys/block so the check works even when the management tools
+# (vgchange/mdadm/cryptsetup) are not installed.
 assert_device_detached() {
     local dev="$1"
     local devname
@@ -307,6 +309,25 @@ $remaining"
         if grep -qE "^/dev/${devname}(p[0-9]+)?[[:space:]]" /proc/swaps 2>/dev/null; then
             fatal "Device $dev is still used as swap; refusing to sanitize."
         fi
+    fi
+
+    # Any kernel holders (e.g. dm-crypt, an active VG, an assembled MD array, or
+    # a partition that is itself still in use) mean the device is not detached.
+    # Check the whole disk and each of its partitions. A sysfs "holders" entry
+    # that references this device is enough to refuse.
+    local holders=""
+    local node
+    for node in "/dev/$devname" /dev/"$devname"p[0-9]*; do
+        [ -b "$node" ] || continue
+        local h
+        h=$(ls "/sys/block/$(basename "$node")/holders" 2>/dev/null || true)
+        if [ -n "$h" ]; then
+            holders="$holders${holders:+ }$node: $h"
+        fi
+    done
+    if [ -n "$holders" ]; then
+        fatal "Device $dev still has active holders; refusing to sanitize:
+$holders"
     fi
 }
 
@@ -743,27 +764,24 @@ do_kexec_wipe() {
 
     # A .efi kernel is a Unified Kernel Image (UKI): linux + initrd are embedded
     # in one PE binary. A classic kernel (vmlinuz/bzImage/...) has no embedded
-    # initrd, so we hand it our wipe initramfs as the initrd.
+    # initrd, so we hand it our wipe initramfs as the initrd. In both cases the
+    # command is identical: kexec-tools unpacks a UKI's .linux section and loads
+    # it as a plain kernel (arm64 support since 2.0.30, x86_64 since 2.0.31),
+    # and when --initrd is given it replaces the UKI's embedded initrd so our
+    # wipe /init is the one that runs. Verified by the aarch64 QEMU UKI test in
+    # CI (ubuntu-26.04-arm).
     info "Loading kernel into memory..."
     info "  Kernel:    $kernel"
     info "  Initramfs: $initramfs_path"
     info "  Target:    $dev"
 
     if [[ "$kernel" == *.efi ]]; then
-        # UKI: kexec-tools unpacks the PE's .linux section and loads it as a
-        # plain kernel (arm64 support since 2.0.30, x86_64 since 2.0.31). When
-        # --initrd is given it is used as the kernel's initramfs, replacing the
-        # UKI's embedded one, so our wipe /init is the one that runs. Verified
-        # by the aarch64 QEMU UKI test in CI (ubuntu-26.04-arm).
         info "  Boot image: UKI (.efi, embedded initrd)"
-        kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
-            || fatal "Failed to load UKI kernel into memory via kexec."
     else
-        # Classic kernel: load with the wipe initramfs as the initrd.
         info "  Boot image: classic kernel (wipe initramfs as initrd)"
-        kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
-            || fatal "Failed to load kernel into memory via kexec."
     fi
+    kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
+        || fatal "Failed to load $kernel into memory via kexec."
 
     success "Kernel loaded. System will now kexec into minimal environment."
     warn "THE SYSTEM WILL REBOOT MOMENTARILY. Any unsaved work will be lost."
@@ -775,179 +793,6 @@ do_kexec_wipe() {
     kexec -e || fatal "kexec -e failed. System may need manual reboot."
 }
 # --- end lib/kexec.sh ---
-
-#!/bin/bash
-
-usage() {
-    cat <<EOF
-kexec-wipe - Sanitize NVMe devices
-
-Usage:
-  curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
-  sudo bash wipe.sh /dev/nvme0n1
-  sudo ./wipe.sh /dev/nvme0n1 [OPTIONS]
-
-Arguments:
-  /dev/nvmeXnY          Target NVMe device to sanitize
-
-Options:
-  --method=METHOD       Sanitize method (default: auto)
-                        auto       - Try crypto-erase, then block-erase
-                        crypto     - Crypto-erase only (fastest for self-encrypting devices)
-                        block      - Block-erase only
-                        overwrite  - Overwrite (slowest, most thorough)
-  --dry-run             Show what would be done without making changes
-  --install-fedora      After sanitizing the device via kexec, write a Fedora
-                        Cloud Base image and install a bootloader so it can boot.
-                        Works on the root device or any other device.
-  --help                Show this help message
-
-Examples:
-  sudo bash wipe.sh /dev/nvme0n1
-  sudo bash wipe.sh /dev/nvme0n1 --method=block
-  sudo bash wipe.sh /dev/nvme0n1 --install-fedora
-  sudo bash wipe.sh /dev/nvme0n1 --dry-run
-
-How it works:
-  Non-root device: unmounts partitions, runs nvme sanitize directly.
-  Root device: kexec's into a minimal in-memory environment to sanitize
-  without any mounted filesystems, then reboots.
-EOF
-}
-
-parse_args() {
-    TARGET_DEVICE=""
-    METHOD="auto"
-    DRY_RUN=0
-    INSTALL_FEDORA=0
-
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --method=*)
-                METHOD="${1#--method=}"
-                case "$METHOD" in
-                    auto|crypto|block|overwrite) ;;
-                    *) fatal "Invalid method: $METHOD (use: auto, crypto, block, overwrite)" ;;
-                esac
-                ;;
-            --dry-run)
-                DRY_RUN=1
-                ;;
-            --install-fedora)
-                INSTALL_FEDORA=1
-                ;;
-            --help|-h)
-                usage
-                exit 0
-                ;;
-            /*)
-                TARGET_DEVICE="$1"
-                ;;
-            *)
-                fatal "Unknown argument: $1"
-                ;;
-        esac
-        shift
-    done
-
-    if [ -z "$TARGET_DEVICE" ]; then
-        error "No target device specified."
-        echo ""
-        usage
-        exit 1
-    fi
-}
-
-print_banner() {
-    echo ""
-    echo -e "${BOLD}kexec-wipe v${WIPE_VERSION}${RESET}"
-    echo -e "${BOLD}Secure NVMe Device Sanitization${RESET}"
-    echo ""
-}
-
-main() {
-    parse_args "$@"
-
-    # Resolve /dev/disk/by-* style symlinks so basename-based checks (NVMe name
-    # validation, root-device detection, teardown) see the real kernel device.
-    TARGET_DEVICE=$(readlink -f "$TARGET_DEVICE" 2>/dev/null || echo "$TARGET_DEVICE")
-
-    print_banner
-    check_root
-    validate_device "$TARGET_DEVICE"
-
-    # The kexec path builds its initramfs on the host (nvme-cli is needed unless
-    # Docker is available to build it statically), while the direct path runs
-    # nvme sanitize on the host. Both paths also need nvme-cli installed.
-    local is_root=0
-    if is_root_device "$TARGET_DEVICE"; then
-        is_root=1
-    fi
-
-    local use_kexec=0
-    if [ "$is_root" -eq 1 ] || [ "$INSTALL_FEDORA" -eq 1 ]; then
-        use_kexec=1
-    fi
-
-    if [ "$use_kexec" -eq 1 ]; then
-        # Fail fast on unsupported architectures before any destructive action.
-        check_arch
-        if ! command -v nvme &>/dev/null && ! command -v docker &>/dev/null; then
-            fatal "nvme-cli is required on the host (or Docker to build it) to build the initramfs. Install nvme-cli."
-        fi
-        for d in bash cpio gzip; do
-            command -v "$d" &>/dev/null || fatal "$d is required to build the initramfs on the host."
-        done
-    elif ! command -v nvme &>/dev/null; then
-        fatal "nvme-cli is required but not found. Install it with your package manager."
-    fi
-
-    if [ "$is_root" -eq 1 ]; then
-        warn "TARGET DEVICE IS THE ROOT DEVICE!"
-        warn "This will kexec into a minimal environment to sanitize."
-        warn "THE SYSTEM WILL REBOOT as part of this process."
-    elif [ "$INSTALL_FEDORA" -eq 1 ]; then
-        warn "TARGET IS NOT THE ROOT DEVICE, but --install-fedora sanitizes and replaces"
-        warn "its contents, installs a bootloader, and boots into the fresh install."
-        warn "THE SYSTEM WILL REBOOT as part of this process."
-    fi
-
-    echo -e "${BOLD}Device Information:${RESET}"
-    get_device_info "$TARGET_DEVICE"
-    echo ""
-
-    local method_display="$METHOD"
-    [ "$method_display" = "auto" ] && method_display="auto (crypto-erase -> block-erase)"
-    echo -e "${BOLD}Sanitize method:${RESET} $method_display"
-    if [ "$INSTALL_FEDORA" -eq 1 ]; then
-        echo -e "${BOLD}Install:${RESET} Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (${INSTALL_FEDORA_CURRENT})"
-    fi
-    echo ""
-
-    if [ "$DRY_RUN" -eq 1 ]; then
-        info "DRY RUN - no changes will be made."
-        if [ "$use_kexec" -eq 1 ]; then
-            info "Would kexec into minimal environment and sanitize $TARGET_DEVICE."
-            if [ "$INSTALL_FEDORA" -eq 1 ]; then
-                info "Would then install Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} on $TARGET_DEVICE."
-            fi
-        else
-            info "Would unmount all partitions on $TARGET_DEVICE and sanitize."
-        fi
-        exit 0
-    fi
-
-    confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
-
-    if [ "$use_kexec" -eq 1 ]; then
-        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
-    else
-        detach_device "$TARGET_DEVICE"
-        do_sanitize "$TARGET_DEVICE" "$METHOD"
-    fi
-}
-
-main "$@"
 
 # --- begin embedded: initramfs/init ---
 write_embedded_initramfs_init() {
@@ -1007,8 +852,10 @@ parse_cmdline() {
     # against QEMU's emulated NVMe, which does not implement the NVMe Sanitize
     # command. Not for production use.
     KEXEC_WIPE_TEST=0
-    # Optional overrides for the Fedora install source (used by tests). When
-    # empty, the pinned release/checksum above is used.
+    # Path to the Fedora image pre-embedded into the initramfs by the host-side
+    # script (wipe.sh embeds it at /opt/fedora.raw.xz and passes the path here).
+    # There is no download or checksum step in this initramfs: those happen on
+    # the host before kexec. Overridable via cmdline (used by tests).
     KEXEC_WIPE_FEDORA_IMAGE=""
     KEXEC_WIPE_HOSTNAME=""
     KEXEC_WIPE_USER=""
@@ -2235,3 +2082,176 @@ main "$@"
 KW_EMBED_build_sh_EOF
 }
 # --- end embedded: initramfs/build.sh ---
+
+#!/bin/bash
+
+usage() {
+    cat <<EOF
+kexec-wipe - Sanitize NVMe devices
+
+Usage:
+  curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
+  sudo bash wipe.sh /dev/nvme0n1
+  sudo ./wipe.sh /dev/nvme0n1 [OPTIONS]
+
+Arguments:
+  /dev/nvmeXnY          Target NVMe device to sanitize
+
+Options:
+  --method=METHOD       Sanitize method (default: auto)
+                        auto       - Try crypto-erase, then block-erase
+                        crypto     - Crypto-erase only (fastest for self-encrypting devices)
+                        block      - Block-erase only
+                        overwrite  - Overwrite (slowest, most thorough)
+  --dry-run             Show what would be done without making changes
+  --install-fedora      After sanitizing the device via kexec, write a Fedora
+                        Cloud Base image and install a bootloader so it can boot.
+                        Works on the root device or any other device.
+  --help                Show this help message
+
+Examples:
+  sudo bash wipe.sh /dev/nvme0n1
+  sudo bash wipe.sh /dev/nvme0n1 --method=block
+  sudo bash wipe.sh /dev/nvme0n1 --install-fedora
+  sudo bash wipe.sh /dev/nvme0n1 --dry-run
+
+How it works:
+  Non-root device: unmounts partitions, runs nvme sanitize directly.
+  Root device: kexec's into a minimal in-memory environment to sanitize
+  without any mounted filesystems, then reboots.
+EOF
+}
+
+parse_args() {
+    TARGET_DEVICE=""
+    METHOD="auto"
+    DRY_RUN=0
+    INSTALL_FEDORA=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --method=*)
+                METHOD="${1#--method=}"
+                case "$METHOD" in
+                    auto|crypto|block|overwrite) ;;
+                    *) fatal "Invalid method: $METHOD (use: auto, crypto, block, overwrite)" ;;
+                esac
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                ;;
+            --install-fedora)
+                INSTALL_FEDORA=1
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            /*)
+                TARGET_DEVICE="$1"
+                ;;
+            *)
+                fatal "Unknown argument: $1"
+                ;;
+        esac
+        shift
+    done
+
+    if [ -z "$TARGET_DEVICE" ]; then
+        error "No target device specified."
+        echo ""
+        usage
+        exit 1
+    fi
+}
+
+print_banner() {
+    echo ""
+    echo -e "${BOLD}kexec-wipe v${WIPE_VERSION}${RESET}"
+    echo -e "${BOLD}Secure NVMe Device Sanitization${RESET}"
+    echo ""
+}
+
+main() {
+    parse_args "$@"
+
+    # Resolve /dev/disk/by-* style symlinks so basename-based checks (NVMe name
+    # validation, root-device detection, teardown) see the real kernel device.
+    TARGET_DEVICE=$(readlink -f "$TARGET_DEVICE" 2>/dev/null || echo "$TARGET_DEVICE")
+
+    print_banner
+    check_root
+    validate_device "$TARGET_DEVICE"
+
+    # The kexec path builds its initramfs on the host (nvme-cli is needed unless
+    # Docker is available to build it statically), while the direct path runs
+    # nvme sanitize on the host. Both paths also need nvme-cli installed.
+    local is_root=0
+    if is_root_device "$TARGET_DEVICE"; then
+        is_root=1
+    fi
+
+    local use_kexec=0
+    if [ "$is_root" -eq 1 ] || [ "$INSTALL_FEDORA" -eq 1 ]; then
+        use_kexec=1
+    fi
+
+    if [ "$use_kexec" -eq 1 ]; then
+        # Fail fast on unsupported architectures before any destructive action.
+        check_arch
+        if ! command -v nvme &>/dev/null && ! command -v docker &>/dev/null; then
+            fatal "nvme-cli is required on the host (or Docker to build it) to build the initramfs. Install nvme-cli."
+        fi
+        for d in bash cpio gzip; do
+            command -v "$d" &>/dev/null || fatal "$d is required to build the initramfs on the host."
+        done
+    elif ! command -v nvme &>/dev/null; then
+        fatal "nvme-cli is required but not found. Install it with your package manager."
+    fi
+
+    if [ "$is_root" -eq 1 ]; then
+        warn "TARGET DEVICE IS THE ROOT DEVICE!"
+        warn "This will kexec into a minimal environment to sanitize."
+        warn "THE SYSTEM WILL REBOOT as part of this process."
+    elif [ "$INSTALL_FEDORA" -eq 1 ]; then
+        warn "TARGET IS NOT THE ROOT DEVICE, but --install-fedora sanitizes and replaces"
+        warn "its contents, installs a bootloader, and boots into the fresh install."
+        warn "THE SYSTEM WILL REBOOT as part of this process."
+    fi
+
+    echo -e "${BOLD}Device Information:${RESET}"
+    get_device_info "$TARGET_DEVICE"
+    echo ""
+
+    local method_display="$METHOD"
+    [ "$method_display" = "auto" ] && method_display="auto (crypto-erase -> block-erase)"
+    echo -e "${BOLD}Sanitize method:${RESET} $method_display"
+    if [ "$INSTALL_FEDORA" -eq 1 ]; then
+        echo -e "${BOLD}Install:${RESET} Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (${INSTALL_FEDORA_CURRENT})"
+    fi
+    echo ""
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "DRY RUN - no changes will be made."
+        if [ "$use_kexec" -eq 1 ]; then
+            info "Would kexec into minimal environment and sanitize $TARGET_DEVICE."
+            if [ "$INSTALL_FEDORA" -eq 1 ]; then
+                info "Would then install Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} on $TARGET_DEVICE."
+            fi
+        else
+            info "Would unmount all partitions on $TARGET_DEVICE and sanitize."
+        fi
+        exit 0
+    fi
+
+    confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
+
+    if [ "$use_kexec" -eq 1 ]; then
+        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
+    else
+        detach_device "$TARGET_DEVICE"
+        do_sanitize "$TARGET_DEVICE" "$METHOD"
+    fi
+}
+
+main "$@"
