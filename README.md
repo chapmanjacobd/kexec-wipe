@@ -83,14 +83,14 @@ The image URL, release, and checksum are pinned in `lib/kexec.sh`.
 
 ## Architecture support
 
-x86_64 and aarch64 are supported. The initramfs is built on the host at run time from the running kernel, so its modules (nvme, xfs, btrfs, ext4) always match the kernel being kexec'd. On aarch64, Fedora uses Unified Kernel Images (UKI); kexec-wipe loads a UKI directly with `kexec -l --initrd` (verified by a QEMU test in CI).
+x86_64 and aarch64 are supported. The initramfs is built on the host at run time from the running kernel, so its modules (nvme, xfs, btrfs, ext4) always match the kernel being kexec'd. On aarch64, Fedora uses Unified Kernel Images (UKI); kexec-wipe loads a UKI directly with `kexec -l --initrd` (verified by a QEMU test in CI on an arm64 runner). This requires kexec-tools >= 2.0.30 (arm64; the UKI support is newer on x86_64).
 
 ## Requirements
 
 - Linux with NVMe support (x86_64 or aarch64)
 - Root privileges
 - `nvme-cli` (or Docker to build a static nvme-cli when using the kexec path)
-- `kexec-tools` (for the root device only)
+- `kexec-tools` (for the root device only; >= 2.0.30 when booting a UKI on aarch64)
 - `cpio` and `gzip` (to build the initramfs on the host, for the root device)
 - `bash` (the script is a bash script)
 - `awk` (to format byte sizes)

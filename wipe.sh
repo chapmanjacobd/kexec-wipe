@@ -791,11 +791,11 @@ do_kexec_wipe() {
     info "  Target:    $dev"
 
     if [[ "$kernel" == *.efi ]]; then
-        # UKI: kexec-tools (>= 2.0.25) detects the PE's .linux section and loads
-        # it. Our --initrd is passed as an *additional* initrd segment after the
-        # UKI's embedded one; the kernel unpacks all initrds in order, so our
-        # wipe /init (unpacked last) is the one that runs. This requires
-        # kexec-tools 2.0.25+ (verified by the QEMU UKI test in CI).
+        # UKI: kexec-tools unpacks the PE's .linux section and loads it as a
+        # plain kernel (arm64 support since 2.0.30, x86_64 since 2.0.31). When
+        # --initrd is given it is used as the kernel's initramfs, replacing the
+        # UKI's embedded one, so our wipe /init is the one that runs. Verified
+        # by the aarch64 QEMU UKI test in CI (ubuntu-26.04-arm).
         info "  Boot image: UKI (.efi, embedded initrd)"
         kexec -l "$kernel" --initrd="$initramfs_path" --command-line="$cmdline" \
             || fatal "Failed to load UKI kernel into memory via kexec."

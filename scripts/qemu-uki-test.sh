@@ -1,17 +1,24 @@
 #!/bin/bash
 #
-# QEMU test for the UKI kexec path: proves that
+# QEMU test for the UKI kexec path on aarch64: proves that
 #     kexec -l <uki.efi> --initrd=<ours>
 # boots <ours> /init rather than the UKI's embedded initrd. This validates the
-# .efi branch of lib/kexec.sh (used on aarch64, which boots Unified Kernel
-# Images) without needing real hardware.
+# .efi branch of lib/kexec.sh, which is how kexec-wipe loads Unified Kernel
+# Images (UKI) on aarch64.
 #
 # It builds a UKI from the host kernel plus a deliberately different "embedded"
 # initramfs, boots a stage-1 initramfs that kexec's into that UKI with a second
 # ("ours") initramfs, then checks the serial log for the markers.
 #
-# Requires: qemu-system-x86_64, busybox, kexec-tools, binutils (objcopy), cpio,
-# gzip, and a systemd UKI stub (linuxx64.efi.stub, e.g. from systemd-boot).
+# This must run on an aarch64 host: it embeds the host kernel in the UKI and
+# relies on the host kexec-tools being able to unpack a UKI (arm64 support
+# landed in kexec-tools 2.0.30). The CI runs it on ubuntu-26.04-arm, whose
+# distro kexec-tools is new enough. It is intentionally not run on x86_64
+# (Ubuntu LTS x86_64 runners still ship kexec-tools without UKI support).
+#
+# Requires: an aarch64 host, qemu-system-aarch64, busybox, kexec-tools,
+# binutils (objcopy), cpio, gzip, and a systemd UKI stub
+# (linuxaa64.efi.stub, e.g. from systemd-boot).
 #
 # Usage:
 #   scripts/qemu-uki-test.sh [--kernel=/boot/vmlinuz-...] [--outdir=/tmp/...]
@@ -20,6 +27,7 @@ set -euo pipefail
 
 KERNEL=""
 OUT_DIR="/tmp/kexec-wipe-uki-test"
+STUB=""
 
 usage() {
     echo "Usage: $0 [--kernel=FILE] [--outdir=DIR]" >&2
@@ -44,16 +52,34 @@ parse_args() {
 
 require_tools() {
     local missing=()
-    for t in qemu-system-x86_64 cpio gzip objcopy busybox kexec ldd; do
+    for t in qemu-system-aarch64 cpio gzip objcopy busybox kexec ldd; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     [ ${#missing[@]} -eq 0 ] || { echo "ERROR: missing tools: ${missing[*]}" >&2; exit 1; }
 }
 
+# kexec-tools gained arm64 UKI (PE .linux section) support in 2.0.30. Older
+# versions fail with "Cannot determine the file type" at kexec -l time.
+check_kexec_version() {
+    local v maj minor patch num
+    v=$(kexec --version 2>&1 | sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
+    [ -n "$v" ] || { echo "ERROR: could not parse kexec --version" >&2; exit 1; }
+    maj=${v%%.*}
+    minor=${v#*.}; minor=${minor%%.*}
+    patch=${v##*.}
+    num=$(( maj * 100000 + minor * 1000 + patch ))
+    if [ "$num" -ge 200030 ]; then
+        echo "Using kexec-tools ${v} (>= 2.0.30, has arm64 UKI support)"
+    else
+        echo "ERROR: kexec-tools ${v} cannot load a UKI on arm64 (need >= 2.0.30)" >&2
+        exit 1
+    fi
+}
+
 find_stub() {
     local c
-    c=$(find /usr/lib /lib -name 'linuxx64.efi.stub' 2>/dev/null | head -1)
-    [ -n "$c" ] || { echo "ERROR: systemd UKI stub (linuxx64.efi.stub) not found; install systemd-boot" >&2; exit 1; }
+    c=$(find /usr/lib /lib -name 'linuxaa64.efi.stub' 2>/dev/null | head -1)
+    [ -n "$c" ] || { echo "ERROR: systemd UKI stub (linuxaa64.efi.stub) not found; install systemd-boot" >&2; exit 1; }
     STUB="$c"
 }
 
@@ -87,7 +113,7 @@ build_uki() {
     # The embedded initrd must NOT win; if it runs, the test fails.
     make_marker_initramfs "KEXEC-WIPE-UKI-EMBEDDED-INITRD-RAN" "$w/embedded.cpio.gz"
 
-    printf 'console=ttyS0\n' > "$w/cmdline"
+    printf 'console=ttyAMA0\n' > "$w/cmdline"
     cp /etc/os-release "$w/os-release" 2>/dev/null || printf 'ID=test\n' > "$w/os-release"
 
     objcopy \
@@ -145,7 +171,7 @@ export LD_LIBRARY_PATH=/lib
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 echo "KEXEC-WIPE-UKI-STAGE1-START"
-kexec -l /uki.efi --initrd=/ours.cpio.gz --command-line="console=ttyS0" \
+kexec -l /uki.efi --initrd=/ours.cpio.gz --command-line="console=ttyAMA0" \
     || { echo "KEXEC-WIPE-UKI-KEXEC-LOAD-FAILED"; poweroff -f; }
 echo "KEXEC-WIPE-UKI-KEXEC-LOADED"
 kexec -e
@@ -160,11 +186,12 @@ EOF
 
 run_qemu() {
     rm -f "$OUT_DIR/serial.log"
-    timeout 240 qemu-system-x86_64 \
+    timeout 300 qemu-system-aarch64 \
+        -machine virt -cpu max -m 1024 \
         -kernel "$KERNEL" \
         -initrd "$OUT_DIR/stage1.cpio.gz" \
-        -append "console=ttyS0" \
-        -nographic -no-reboot -m 512 \
+        -append "console=ttyAMA0" \
+        -nographic -no-reboot \
         > "$OUT_DIR/serial.log" 2>&1 || true
 }
 
@@ -186,6 +213,10 @@ check() {
         echo "FAIL: kexec -l rejected the UKI (or --initrd)" >&2
         ok=0
     fi
+    if grep -q "Cannot determine the file type" "$log"; then
+        echo "FAIL: kexec-tools could not recognize the UKI; needs >= 2.0.30 (arm64)" >&2
+        ok=0
+    fi
     if grep -q "KEXEC-WIPE-UKI-KEXEC-FAILED" "$log"; then
         echo "FAIL: kexec -e failed" >&2
         ok=0
@@ -195,8 +226,10 @@ check() {
 }
 
 main() {
+    [ "$(uname -m)" = "aarch64" ] || { echo "ERROR: the UKI kexec test must run on an aarch64 host" >&2; exit 1; }
     parse_args "$@"
     require_tools
+    check_kexec_version
     find_stub
     mkdir -p "$OUT_DIR"
     make_marker_initramfs "KEXEC-WIPE-UKI-BOOT-OK" "$OUT_DIR/ours.cpio.gz"
