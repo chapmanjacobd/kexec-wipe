@@ -156,9 +156,36 @@ install_disk_tools() {
     done
 }
 
-# Stage kernel filesystem modules (xfs/btrfs/ext4) so the chroot bootloader step
-# can mount the written Fedora image. Modules are kernel-version-specific, so
-# the build host's matching modules are copied as a reasonable default.
+# Copy a module file and its transitive dependencies (resolved via the source
+# modules.dep) into the build tree. `mod` is a path relative to /lib/modules/$kver
+# (e.g. kernel/drivers/nvme/host/nvme.ko.xz). Returns after copying each
+# dependency once.
+copy_module_with_deps() {
+    local mod="$1" src="$2" dst="$3"
+    local depfile="$src/modules.dep"
+
+    [ -f "$depfile" ] || return 0
+    local line
+    line=$(grep -E "^${mod}:" "$depfile" 2>/dev/null || true)
+    [ -z "$line" ] && return 0
+
+    local deps=${line#*:}
+    local d
+    for d in $deps; do
+        [ -f "$src/$d" ] || continue
+        if [ ! -e "$dst/$d" ]; then
+            mkdir -p "$(dirname "$dst/$d")"
+            cp -a "$src/$d" "$dst/$d"
+            copy_module_with_deps "$d" "$src" "$dst"
+        fi
+    done
+}
+
+# Stage kernel filesystem modules (xfs/btrfs/ext4) and the NVMe driver modules
+# so the chroot bootloader step can mount the written Fedora image and so the
+# target NVMe is visible after kexec even when the running kernel has NVMe
+# support as modules (e.g. Fedora). Modules are kernel-version-specific, so the
+# build host's matching modules are copied as a reasonable default.
 stage_fs_modules() {
     local kver
     kver=$(uname -r)
@@ -170,7 +197,7 @@ stage_fs_modules() {
         return 0
     fi
 
-    echo "Staging filesystem kernel modules ($kver)..."
+    echo "Staging kernel modules ($kver)..."
     mkdir -p "$dst/kernel/fs"
     for fs in xfs btrfs ext4; do
         if [ -d "$src/kernel/fs/$fs" ]; then
@@ -178,6 +205,21 @@ stage_fs_modules() {
             cp -a "$src/kernel/fs/$fs" "$dst/kernel/fs/"
         fi
     done
+    # NVMe driver (nvme-core, nvme, nvme-auth, nvme-keyring, ...). Without
+    # these the target device may not appear after kexec on distros that build
+    # NVMe support as modules.
+    if [ -d "$src/kernel/drivers/nvme" ]; then
+        echo "  - nvme (drivers)"
+        mkdir -p "$dst/kernel/drivers"
+        cp -a "$src/kernel/drivers/nvme" "$dst/kernel/drivers/"
+        # Resolve and copy any dependencies of the NVMe driver modules (e.g.
+        # kernel/crypto/hkdf on kernels where nvme-auth is modular), otherwise
+        # busybox modprobe cannot load nvme after kexec.
+        local mod
+        for mod in $(cd "$dst" && find kernel/drivers/nvme -name '*.ko*' 2>/dev/null); do
+            copy_module_with_deps "$mod" "$src" "$dst"
+        done
+    fi
     # Minimal metadata so modprobe can resolve the staged modules.
     mkdir -p "$dst"
     for f in modules.dep modules.dep.bin modules.builtin modules.builtin.bin modules.alias modules.alias.bin modules.symbols; do

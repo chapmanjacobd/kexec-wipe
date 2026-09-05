@@ -83,7 +83,9 @@ parse_cmdline() {
     fi
 
     # Read the hostname from the embedded file (written by the host-side script).
-    [ -f /opt/kexec-wipe-hostname ] && KEXEC_WIPE_HOSTNAME=$(cat /opt/kexec-wipe-hostname)
+    if [ -f /opt/kexec-wipe-hostname ]; then
+        KEXEC_WIPE_HOSTNAME=$(cat /opt/kexec-wipe-hostname)
+    fi
 }
 
 mount_pseudo_fs() {
@@ -363,7 +365,9 @@ write_fedora_image() {
     if ! ls "${dev}p"* >/dev/null 2>&1; then
         log "Partition nodes missing; creating them manually via fdisk/mknod..."
         local devmajor=""
-        [ -f "/sys/block/$devname/dev" ] && devmajor=$(cut -d: -f1 "/sys/block/$devname/dev")
+        if [ -f "/sys/block/$devname/dev" ]; then
+            devmajor=$(cut -d: -f1 "/sys/block/$devname/dev")
+        fi
         if [ -n "$devmajor" ]; then
             local part
             for part in $(fdisk -l "$dev" 2>/dev/null | awk -v d="$dev" '$1 ~ d"p[0-9]+" {print $1}'); do
@@ -440,7 +444,9 @@ install_bootloader() {
     mount -t devtmpfs dev "$mnt/dev" 2>/dev/null || true
 
     local uefi=0
-    [ -d /sys/firmware/efi ] && uefi=1
+    if [ -d /sys/firmware/efi ]; then
+        uefi=1
+    fi
 
     if [ -x "$mnt/sbin/grub2-install" ] || [ -x "$mnt/usr/sbin/grub2-install" ]; then
         local grub_target

@@ -52,9 +52,12 @@ is_root_device() {
     local devname
     devname=$(basename "$dev")
 
-    # Get the device name of the root filesystem (strip partition suffix)
+    # Get the device name of the root filesystem (strip partition suffix).
+    # findmnt reports btrfs subvolume roots as "/dev/nvme0n1p3[/root]"; strip
+    # the "[...]" suffix so the path is the plain block device.
     local root_dev
     root_dev=$(findmnt -n -o SOURCE / 2>/dev/null) || return 1
+    root_dev="${root_dev%%\[*\]}"
     root_dev=$(basename "$root_dev")
     # Use lsblk to find the parent (disk) device. This correctly handles
     # NVMe (nvme0n1p2 -> nvme0n1), mmcblk (mmcblk0p1 -> mmcblk0), and

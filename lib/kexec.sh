@@ -146,6 +146,10 @@ augment_initramfs() {
     local src="$1" path="$2" file="$3" out="${4:-}"
     local work
 
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        fatal "augment_initramfs: source initramfs '$src' not found."
+    fi
+
     [ -n "$out" ] || out="${src%.gz}.augmented.cpio.gz"
 
     work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
@@ -158,6 +162,7 @@ augment_initramfs() {
     ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
 
     rm -rf "$work"
+    echo "$out"
 }
 
 # Federation finds a kernel image (optionally with its initrd) suitable for kexec.
@@ -220,6 +225,7 @@ do_kexec_wipe() {
     local dev="$1"
     local method="${2:-auto}"
     local install="${3:-0}"
+    local test_mode="${4:-0}"
 
     check_kexec
 
@@ -276,6 +282,14 @@ do_kexec_wipe() {
         cmdline="${cmdline} kexec_wipe_install=1"
         cmdline="${cmdline} kexec_wipe_fedora_image=/opt/fedora.raw.xz"
         info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after wipe"
+    fi
+
+    # Test-only: don't abort the initramfs if the device does not implement the
+    # NVMe Sanitize command (e.g. QEMU's emulated NVMe). Never set on real
+    # hardware; see initramfs/init.
+    if [ "$test_mode" -eq 1 ]; then
+        cmdline="${cmdline} kexec_wipe_test=1"
+        warn "  TEST MODE: sanitize failure will be ignored (device cannot be sanitized)."
     fi
 
     # For a classic kernel, pass the separate initrd. For a UKI (.efi), the

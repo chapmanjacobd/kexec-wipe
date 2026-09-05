@@ -21,6 +21,9 @@ Options:
   --install-fedora      After sanitizing the root disk via kexec, write a
                         Fedora Cloud Base image and install a bootloader so it
                         can boot. Requires the root-disk (kexec) path.
+  --test-mode           TESTING ONLY: continue even if the sanitize command is
+                        not supported by the device (e.g. QEMU's emulated
+                        NVMe). Never use on real hardware.
   --help                Show this help message
 
 Examples:
@@ -41,6 +44,7 @@ parse_args() {
     METHOD="auto"
     DRY_RUN=0
     INSTALL_FEDORA=0
+    TEST_MODE=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -56,6 +60,9 @@ parse_args() {
                 ;;
             --install-fedora)
                 INSTALL_FEDORA=1
+                ;;
+            --test-mode)
+                TEST_MODE=1
                 ;;
             --help|-h)
                 usage
@@ -140,7 +147,7 @@ main() {
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
     if [ "$is_root" -eq 1 ]; then
-        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
+        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA" "$TEST_MODE"
     else
         detach_device "$TARGET_DEVICE"
         do_sanitize "$TARGET_DEVICE" "$METHOD"

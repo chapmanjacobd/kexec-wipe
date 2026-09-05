@@ -129,9 +129,12 @@ is_root_device() {
     local devname
     devname=$(basename "$dev")
 
-    # Get the device name of the root filesystem (strip partition suffix)
+    # Get the device name of the root filesystem (strip partition suffix).
+    # findmnt reports btrfs subvolume roots as "/dev/nvme0n1p3[/root]"; strip
+    # the "[...]" suffix so the path is the plain block device.
     local root_dev
     root_dev=$(findmnt -n -o SOURCE / 2>/dev/null) || return 1
+    root_dev="${root_dev%%\[*\]}"
     root_dev=$(basename "$root_dev")
     # Use lsblk to find the parent (disk) device. This correctly handles
     # NVMe (nvme0n1p2 -> nvme0n1), mmcblk (mmcblk0p1 -> mmcblk0), and
@@ -541,6 +544,10 @@ augment_initramfs() {
     local src="$1" path="$2" file="$3" out="${4:-}"
     local work
 
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        fatal "augment_initramfs: source initramfs '$src' not found."
+    fi
+
     [ -n "$out" ] || out="${src%.gz}.augmented.cpio.gz"
 
     work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
@@ -553,6 +560,7 @@ augment_initramfs() {
     ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
 
     rm -rf "$work"
+    echo "$out"
 }
 
 # Federation finds a kernel image (optionally with its initrd) suitable for kexec.
@@ -615,6 +623,7 @@ do_kexec_wipe() {
     local dev="$1"
     local method="${2:-auto}"
     local install="${3:-0}"
+    local test_mode="${4:-0}"
 
     check_kexec
 
@@ -671,6 +680,14 @@ do_kexec_wipe() {
         cmdline="${cmdline} kexec_wipe_install=1"
         cmdline="${cmdline} kexec_wipe_fedora_image=/opt/fedora.raw.xz"
         info "  Install:    Fedora Cloud Base ${INSTALL_FEDORA_RELEASE} (pre-downloaded) after wipe"
+    fi
+
+    # Test-only: don't abort the initramfs if the device does not implement the
+    # NVMe Sanitize command (e.g. QEMU's emulated NVMe). Never set on real
+    # hardware; see initramfs/init.
+    if [ "$test_mode" -eq 1 ]; then
+        cmdline="${cmdline} kexec_wipe_test=1"
+        warn "  TEST MODE: sanitize failure will be ignored (device cannot be sanitized)."
     fi
 
     # For a classic kernel, pass the separate initrd. For a UKI (.efi), the
@@ -763,6 +780,9 @@ Options:
   --install-fedora      After sanitizing the root disk via kexec, write a
                         Fedora Cloud Base image and install a bootloader so it
                         can boot. Requires the root-disk (kexec) path.
+  --test-mode           TESTING ONLY: continue even if the sanitize command is
+                        not supported by the device (e.g. QEMU's emulated
+                        NVMe). Never use on real hardware.
   --help                Show this help message
 
 Examples:
@@ -783,6 +803,7 @@ parse_args() {
     METHOD="auto"
     DRY_RUN=0
     INSTALL_FEDORA=0
+    TEST_MODE=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -798,6 +819,9 @@ parse_args() {
                 ;;
             --install-fedora)
                 INSTALL_FEDORA=1
+                ;;
+            --test-mode)
+                TEST_MODE=1
                 ;;
             --help|-h)
                 usage
@@ -882,7 +906,7 @@ main() {
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
     if [ "$is_root" -eq 1 ]; then
-        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
+        do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA" "$TEST_MODE"
     else
         detach_device "$TARGET_DEVICE"
         do_sanitize "$TARGET_DEVICE" "$METHOD"
