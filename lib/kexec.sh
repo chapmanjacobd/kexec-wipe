@@ -3,10 +3,10 @@
 
 # Explicit architecture-specific initramfs assets. Update the URLs and
 # checksums together when the initramfs content or release changes.
-INITRAMFS_URL_x86_64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.0/kexec-wipe-initramfs-x86_64.cpio.gz"
-INITRAMFS_URL_aarch64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.0/kexec-wipe-initramfs-aarch64.cpio.gz"
-INITRAMFS_SHA256_x86_64="982930de883489de89c111749b2957f07724bbf8069877602435016c5def0833"
-INITRAMFS_SHA256_aarch64="5d72c86a82370c21fa4fe28514b7bebb8323ba7571dc575dff53142043b06143"
+INITRAMFS_URL_x86_64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.1/kexec-wipe-initramfs-x86_64.cpio.gz"
+INITRAMFS_URL_aarch64="https://github.com/chapmanjacobd/kexec-wipe/releases/download/v0.2.1/kexec-wipe-initramfs-aarch64.cpio.gz"
+INITRAMFS_SHA256_x86_64="f022a0edf8d32f5429ca81a050b34d1c2f88f880ccccfd017693d6c915d9d818"
+INITRAMFS_SHA256_aarch64="9270f4f4ae77177c5824c760abc5ef3cf8171119927332df30687e45d5a1e94a"
 
 # Pinned Fedora Cloud Base raw image for --install-fedora.
 # Bumped by the maintainer per Fedora release.
