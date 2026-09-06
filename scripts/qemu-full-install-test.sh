@@ -297,7 +297,8 @@ boot_vm() {
         # The ARM CI runner has no KVM. Use multi-threaded TCG and a large
         # translation-block cache so the four guest vCPUs do not serialize and
         # hot guest code is not repeatedly translated during the install.
-        accel="tcg,thread=multi,tb-size=1073741824"
+        # QEMU interprets an unqualified tb-size value in MiB.
+        accel="tcg,thread=multi,tb-size=1024"
         cpu="max"
     fi
     case "$ARCH" in
