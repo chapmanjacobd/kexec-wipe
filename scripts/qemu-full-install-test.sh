@@ -136,7 +136,7 @@ require_tools() {
     local qemu
     qemu=$(qemu_bin)
     local missing=()
-    for t in "$qemu" qemu-img curl sha256sum ssh cpio gzip xz socat genisoimage mkisofs xorriso; do
+    for t in "$qemu" qemu-img curl sha256sum ssh cpio gzip xz socat; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     # Need at least one iso tool; the check above is satisfied by any one of them.

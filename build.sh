@@ -25,10 +25,9 @@ done
 LIBS=(common.sh sanity.sh unmount.sh sanitize.sh kexec.sh)
 MAIN_BODY="${SCRIPT_DIR}/lib/main_body.sh"
 
-# Use the nearest git tag as the version; strip a leading "v" because
-# print_banner renders it as "v$WIPE_VERSION".
-WIPE_VERSION="$(git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null || echo dev)"
-WIPE_VERSION="${WIPE_VERSION#v}"
+# The version is a static reference kept in ./VERSION (no "v" prefix), and is
+# bumped by release.sh. print_banner renders it as "v$WIPE_VERSION".
+WIPE_VERSION="$(cat "${SCRIPT_DIR}/VERSION")"
 
 # Verify all source files exist
 for lib in "${LIBS[@]}"; do
