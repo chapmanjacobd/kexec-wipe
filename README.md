@@ -106,10 +106,13 @@ CI exercises this mode end to end: the aarch64 job boots a Fedora Cloud aarch64 
 - Root privileges
 - `nvme-cli` (or Docker to build a static nvme-cli when using the kexec path)
 - `kexec-tools` (for the root device only; >= 2.0.30 when booting a UKI on aarch64)
-- `cpio` and `gzip` (to build the initramfs on the host, for the root device)
+- `cpio`, `gzip`, and `find` (to build the initramfs on the host, for the root device)
+- `xz` (the initramfs builder decompresses the staged `.ko.xz` kernel modules with it)
+- `curl` (to fetch a static busybox for the initramfs), or Docker, or a `busybox` already installed on the host, plus network access
 - `bash` (the script is a bash script)
 - `awk` (to format byte sizes)
-- For `--install-fedora`: network access on the host to download the Fedora image
+- `stat` (to report the initramfs and image sizes)
+- For `--install-fedora`: network access on the host to download the Fedora image, plus `curl` or `wget` and `sha256sum`
 
 ## Development
 

@@ -146,21 +146,6 @@ copy_bin_with_libs() {
     return 0
 }
 
-# Copy disk tools (partprobe, blockdev) needed by the Fedora install path.
-# xz is not needed here: busybox provides xz/unlzma/lzcat applets.
-install_disk_tools() {
-    mkdir -p "$BUILD_DIR/bin"
-
-    for b in partprobe blockdev; do
-        if [ -e "$BUILD_DIR/bin/$b" ]; then
-            continue
-        fi
-        if command -v "$b" >/dev/null 2>&1; then
-            copy_bin_with_libs "$(command -v "$b")" "$BUILD_DIR/bin/$b" || true
-        fi
-    done
-}
-
 # Copy a module file and its transitive dependencies (resolved via the source
 # modules.dep) into the build tree. `mod` is a path relative to /lib/modules/$kver
 # (e.g. kernel/drivers/nvme/host/nvme.ko.xz). Returns after copying each
@@ -343,11 +328,13 @@ build_initramfs() {
     # Install busybox (arch-aware)
     install_busybox
 
-    # Create busybox symlinks
+    # Create busybox symlinks. partprobe and blockdev are busybox applets and
+    # cover the Fedora install path (partition rescans) without needing host
+    # util-linux copies in the initramfs.
     cd "$BUILD_DIR/bin"
     for cmd in ash sh bash mount umount mountpoint mkdir cat cp echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
-               lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
+               blkid fdisk partprobe blockdev sync dd chroot sha256sum chmod tr uname rm rmdir \
                xz unlzma lzcat modprobe awk switch_root timeout \
                cut sort basename dirname expr printf seq stat touch; do
         ln -sf busybox "$cmd"
@@ -358,10 +345,8 @@ build_initramfs() {
     mkdir -p "$BUILD_DIR/sbin"
     ln -sf ../bin/busybox "$BUILD_DIR/sbin/modprobe"
 
-    # Install Fedora install support tools (xz/partprobe/blockdev)
-    install_disk_tools
-
-    # Stage filesystem kernel modules for the chroot bootloader step.
+    # Install Fedora install support (partprobe/blockdev busybox applets were
+    # symlinked above; host xz/unlzma come via busybox too).
     stage_fs_modules
 
     # Build nvme-cli

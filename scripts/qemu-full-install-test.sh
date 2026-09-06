@@ -183,9 +183,11 @@ make_iso() {
 }
 
 # ---------------------------------------------------------------------------
-# Pinned asset URLs/checksums (kept in sync with lib/kexec.sh)
-# ---------------------------------------------------------------------------
-source "${REPO_DIR}/lib/kexec.sh" 2>/dev/null || true
+# Pinned asset URLs/checksums are sourced from lib/kexec.sh (the same pins
+# wipe.sh embeds). Fail loudly rather than silently building empty URLs if the
+# source ever changes shape.
+source "${REPO_DIR}/lib/kexec.sh" || { echo "ERROR: cannot source ${REPO_DIR}/lib/kexec.sh for the Fedora pins" >&2; exit 1; }
+[ -n "${INSTALL_FEDORA_RELEASE:-}" ] || { echo "ERROR: lib/kexec.sh did not define INSTALL_FEDORA_RELEASE" >&2; exit 1; }
 
 FEDORA_URL=""
 FEDORA_SHA256=""
@@ -274,7 +276,6 @@ EOF
 QEMU_PID=""
 QEMU_MON=""
 SERIAL_LOG=""
-BOOT_SEED=0
 
 boot_vm() {
     local with_seed="$1"

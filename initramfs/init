@@ -20,15 +20,9 @@ warn() {
     echo "[kexec-wipe] WARNING: $*" >&2
 }
 
+# Print a fatal message and force-reboot, giving the operator a grace period to
+# read the message before the system is rebooted.
 fatal() {
-    echo "[kexec-wipe] FATAL: $*" >&2
-    sleep 5
-    reboot -f
-}
-
-# "Fatal" failure that still gives the operator a grace period to read the
-# message before the system is force-rebooted.
-fatal_reboot() {
     echo "[kexec-wipe] FATAL: $*" >&2
     echo "[kexec-wipe] The system will reboot in 30 seconds..."
     i=30
@@ -192,7 +186,7 @@ do_sanitize() {
             log "TEST MODE: sanitize failed but continuing (emulated device cannot sanitize)."
             return 2
         fi
-        fatal_reboot "All sanitize methods failed."
+        fatal "All sanitize methods failed."
     fi
 }
 
@@ -264,7 +258,7 @@ wait_for_completion() {
 #   - runs do_sanitize (which handles method selection and test-mode skipping)
 #   - waits for completion for a real sanitize
 #   - returns 4 on test-mode-skip (sanitize not performed), 0 on success.
-# On any genuine failure it never returns (calls fatal_reboot internally).
+# On any genuine failure it never returns (calls fatal internally).
 sanitize_and_wait() {
     # do_sanitize returns 2 (test-mode-skip), which is non-zero: guard it so
     # `set -e` does not kill the shell before we can inspect $rc.
@@ -279,7 +273,7 @@ sanitize_and_wait() {
         log "Device $KEXEC_WIPE_DEV has been sanitized."
         return 0
     fi
-    fatal_reboot "Sanitize failed or did not complete."
+    fatal "Sanitize failed or did not complete."
 }
 
 # --- Partition / filesystem helpers ------------------------------------
@@ -361,38 +355,34 @@ write_fedora_image() {
         echo 1 > "/sys/block/$devname/device/rescan" 2>/dev/null || true
     fi
 
-    # Wait for partition nodes to appear (up to 10s).
+    # Wait for partition nodes to appear (up to 10s), retrying the re-read each
+    # iteration because the first attempt can race the uevent generation.
     log "Waiting for partition nodes to appear..."
     local waited=0
     while [ "$waited" -lt 10 ]; do
-        # Check if any partition of $dev exists.
         if ls "${dev}p"* >/dev/null 2>&1; then
             log "Partition table re-read complete."
             break
         fi
         sleep 1
         waited=$((waited + 1))
-        # Retry the re-read on each iteration; sometimes the first attempt races.
         blockdev --rereadpt "$dev" 2>/dev/null || true
     done
 
-    # Fallback: if partition nodes remain absent (e.g. emulated NVMe
-    # devices where sysfs rescan is not supported), try partprobe to ask the
-    # kernel to re-read and create the partition nodes.
+    # Fallbacks for when the nodes still have not materialized (e.g. emulated
+    # NVMe devices where sysfs rescan is not supported): ask partprobe first,
+    # then create the nodes manually. The kernel has usually already re-read
+    # the partition table via BLKRRPART and registered the partitions in sysfs;
+    # only the devtmpfs node materialization failed, so read each partition's
+    # real major:minor from /sys/block/<dev>/<part>/dev and mknod it. This is
+    # correct for any namespace/controller layout, unlike guessing that the
+    # partition index equals the minor number.
     if ! ls "${dev}p"* >/dev/null 2>&1; then
         log "Partition nodes missing; trying partprobe..."
         partprobe "$dev" 2>/dev/null || true
         sleep 1
     fi
 
-    # Fallback: if partition nodes remain absent (e.g. emulated NVMe
-    # devices where sysfs rescan is not supported), create the partition device
-    # nodes manually. The kernel has usually already re-read the partition
-    # table via BLKRRPART and registered the partitions in sysfs; only the
-    # devtmpfs node materialization failed. Read each partition's real
-    # major:minor from sysfs (/sys/block/<dev>/<part>/dev) and mknod it. This is
-    # correct for any namespace/controller layout, unlike guessing that the
-    # partition index equals the minor number.
     if ! ls "${dev}p"* >/dev/null 2>&1; then
         log "Partition nodes missing; creating them manually from sysfs..."
         local part
@@ -866,7 +856,7 @@ main() {
 
     # sanitize_and_wait logs the outcome and only ever returns 0 (sanitized) or
     # 4 (test-mode-skip: sanitize not performed); on a genuine failure it never
-    # returns (fatal_reboot). The `|| true` guards the 4 against set -e.
+    # returns (fatal). The `|| true` guards the 4 against set -e.
     sanitize_and_wait || true
 
     install_fedora

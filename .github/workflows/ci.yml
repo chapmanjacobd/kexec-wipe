@@ -41,15 +41,26 @@ jobs:
           bash -n scripts/qemu-full-install-test.sh
           echo "All syntax checks passed."
 
+      - name: Verify duplicated SSTAT parsing stays in sync
+        run: |
+          # sanitize_log_state is duplicated in lib/sanitize.sh (host bash) and
+          # initramfs/init (busybox ash) by design because the two runtimes
+          # cannot share code. Fail if the parsing blocks drift apart.
+          diff -u <(sed -n '/SSTAT status is in bits/,/esac/p' lib/sanitize.sh) \
+                  <(sed -n '/SSTAT status is in bits/,/esac/p' initramfs/init | sed 's/ash arithmetic/bash arithmetic/')
+
       - name: Test argument parsing
         run: |
           set -e
           bash wipe.sh --help
           cat wipe.sh | bash -s -- --help
-          ! bash wipe.sh 2>/dev/null
-          ! bash wipe.sh /dev/fake --method=invalid 2>/dev/null
-          ! bash wipe.sh /dev/sda 2>/dev/null
-          ! bash wipe.sh /dev/sda --install-fedora 2>/dev/null
+          # Run the failure cases as root (sudo) so check_root passes and the
+          # device-validation and method-validation branches are actually
+          # exercised instead of exiting on the root check first.
+          ! sudo bash wipe.sh 2>/dev/null
+          ! sudo bash wipe.sh /dev/fake --method=invalid 2>/dev/null
+          ! sudo bash wipe.sh /dev/sda 2>/dev/null
+          ! sudo bash wipe.sh /dev/sda --install-fedora 2>/dev/null
 
       - name: Install nvme-cli
         run: sudo apt-get update -qq && sudo apt-get install -y -qq nvme-cli

@@ -44,6 +44,41 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
     fi
 }
 
+# Pre-flight the host tools the kexec path needs beyond the ones the caller
+# checks (root, nvme-cli/docker, kexec-tools, arch). The initramfs builder runs
+# on this host and needs:
+#   - bash, cpio, gzip, find : build and pack the initramfs
+#   - xz                     : decompress the staged .ko.xz kernel modules
+#   - stat                   : report initramfs/image sizes
+#   - curl (or Docker or a host busybox) : obtain the static busybox for the
+#     initramfs; x86_64 fetches a prebuilt one with curl, otherwise it is
+#     built with Docker or copied from the host
+# With --install-fedora the host also downloads and verifies the Fedora image:
+#   - curl or wget, sha256sum
+check_host_tools() {
+    local install="${1:-0}"
+    local missing=()
+
+    for d in cpio gzip find xz stat; do
+        command -v "$d" >/dev/null 2>&1 || missing+=("$d")
+    done
+
+    if ! command -v curl >/dev/null 2>&1 \
+       && ! command -v docker >/dev/null 2>&1 \
+       && ! command -v busybox >/dev/null 2>&1; then
+        missing+=("curl (to fetch a static busybox)")
+    fi
+
+    if [ "$install" -eq 1 ]; then
+        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+            missing+=("curl-or-wget")
+        fi
+        command -v sha256sum >/dev/null 2>&1 || missing+=("sha256sum")
+    fi
+
+    [ ${#missing[@]} -eq 0 ] || fatal "Missing host tools for the kexec path: ${missing[*]}"
+}
+
 # Build the wipe initramfs on the host at runtime. This (unlike shipping a
 # prebuilt initramfs) guarantees the staged kernel modules (xfs/btrfs/ext4/nvme)
 # match the kernel that will be kexec'd, so modprobe can load the NVMe driver
@@ -54,10 +89,7 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
 build_initramfs_on_host() {
     local dest="$1"
 
-    for d in bash cpio gzip; do
-        command -v "$d" >/dev/null 2>&1 || fatal "$d is required to build the initramfs on the host."
-    done
-
+    # Host tools are pre-flighted by check_host_tools in the kexec path.
     local srcdir="${WIPE_TMPDIR}/initramfs-src"
     mkdir -p "$srcdir"
     write_embedded_initramfs_build_sh "$srcdir/build.sh"
@@ -117,31 +149,38 @@ download_fedora_image() {
 augment_initramfs() {
     local src="$1" out="$2"
     shift 2
-    local work
 
-    if [ -z "$src" ] || [ ! -f "$src" ]; then
-        fatal "augment_initramfs: source initramfs '$src' not found."
-    fi
-    [ -n "$out" ] || fatal "augment_initramfs: no output path."
+    # Run the augmentation in a subshell so its EXIT trap cleans the scratch
+    # dir even when a fatal error fires mid-way. The parent's global cleanup()
+    # only removes WIPE_TMPDIR, which would otherwise leak this dir (holding a
+    # copy of the Fedora image) on failure.
+    (
+        local work
 
-    work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
-    gzip -dc "$src" | ( cd "$work" && cpio -idm 2>/dev/null )
+        if [ -z "$src" ] || [ ! -f "$src" ]; then
+            fatal "augment_initramfs: source initramfs '$src' not found."
+        fi
+        [ -n "$out" ] || fatal "augment_initramfs: no output path."
 
-    local pair path file dest
-    for pair in "$@"; do
-        path="${pair%%=*}"
-        file="${pair#*=}"
-        [ -n "$path" ] || fatal "augment_initramfs: bad pair '$pair'."
-        [ -f "$file" ] || fatal "augment_initramfs: file to embed '$file' not found."
-        dest="$work/${path#/}"
-        mkdir -p "$(dirname "$dest")"
-        cp "$file" "$dest"
-    done
+        work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
+        trap 'rm -rf "$work"' EXIT
 
-    ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
+        gzip -dc "$src" | ( cd "$work" && cpio -idm 2>/dev/null )
 
-    rm -rf "$work"
-    echo "$out"
+        local pair path file dest
+        for pair in "$@"; do
+            path="${pair%%=*}"
+            file="${pair#*=}"
+            [ -n "$path" ] || fatal "augment_initramfs: bad pair '$pair'."
+            [ -f "$file" ] || fatal "augment_initramfs: file to embed '$file' not found."
+            dest="$work/${path#/}"
+            mkdir -p "$(dirname "$dest")"
+            cp "$file" "$dest"
+        done
+
+        ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
+        echo "$out"
+    )
 }
 
 # Find a kernel image (optionally with its initrd) suitable for kexec. On

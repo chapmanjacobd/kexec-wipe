@@ -117,9 +117,7 @@ main() {
         if ! command -v nvme &>/dev/null && ! command -v docker &>/dev/null; then
             fatal "nvme-cli is required on the host (or Docker to build it) to build the initramfs. Install nvme-cli."
         fi
-        for d in bash cpio gzip; do
-            command -v "$d" &>/dev/null || fatal "$d is required to build the initramfs on the host."
-        done
+        check_host_tools "$INSTALL_FEDORA"
     elif ! command -v nvme &>/dev/null; then
         fatal "nvme-cli is required but not found. Install it with your package manager."
     fi
@@ -162,6 +160,12 @@ main() {
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
     if [ "$use_kexec" -eq 1 ]; then
+        if [ "$is_root" -eq 0 ]; then
+            # kexec reboots into the initramfs, but tear the device down first
+            # anyway so the sanitize never runs underneath live mounts/swap/LVM,
+            # matching the guarantee the direct path enforces.
+            detach_device "$TARGET_DEVICE"
+        fi
         do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
     else
         detach_device "$TARGET_DEVICE"

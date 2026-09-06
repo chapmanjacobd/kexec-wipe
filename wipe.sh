@@ -567,6 +567,41 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
     fi
 }
 
+# Pre-flight the host tools the kexec path needs beyond the ones the caller
+# checks (root, nvme-cli/docker, kexec-tools, arch). The initramfs builder runs
+# on this host and needs:
+#   - bash, cpio, gzip, find : build and pack the initramfs
+#   - xz                     : decompress the staged .ko.xz kernel modules
+#   - stat                   : report initramfs/image sizes
+#   - curl (or Docker or a host busybox) : obtain the static busybox for the
+#     initramfs; x86_64 fetches a prebuilt one with curl, otherwise it is
+#     built with Docker or copied from the host
+# With --install-fedora the host also downloads and verifies the Fedora image:
+#   - curl or wget, sha256sum
+check_host_tools() {
+    local install="${1:-0}"
+    local missing=()
+
+    for d in cpio gzip find xz stat; do
+        command -v "$d" >/dev/null 2>&1 || missing+=("$d")
+    done
+
+    if ! command -v curl >/dev/null 2>&1 \
+       && ! command -v docker >/dev/null 2>&1 \
+       && ! command -v busybox >/dev/null 2>&1; then
+        missing+=("curl (to fetch a static busybox)")
+    fi
+
+    if [ "$install" -eq 1 ]; then
+        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+            missing+=("curl-or-wget")
+        fi
+        command -v sha256sum >/dev/null 2>&1 || missing+=("sha256sum")
+    fi
+
+    [ ${#missing[@]} -eq 0 ] || fatal "Missing host tools for the kexec path: ${missing[*]}"
+}
+
 # Build the wipe initramfs on the host at runtime. This (unlike shipping a
 # prebuilt initramfs) guarantees the staged kernel modules (xfs/btrfs/ext4/nvme)
 # match the kernel that will be kexec'd, so modprobe can load the NVMe driver
@@ -577,10 +612,7 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
 build_initramfs_on_host() {
     local dest="$1"
 
-    for d in bash cpio gzip; do
-        command -v "$d" >/dev/null 2>&1 || fatal "$d is required to build the initramfs on the host."
-    done
-
+    # Host tools are pre-flighted by check_host_tools in the kexec path.
     local srcdir="${WIPE_TMPDIR}/initramfs-src"
     mkdir -p "$srcdir"
     write_embedded_initramfs_build_sh "$srcdir/build.sh"
@@ -640,31 +672,38 @@ download_fedora_image() {
 augment_initramfs() {
     local src="$1" out="$2"
     shift 2
-    local work
 
-    if [ -z "$src" ] || [ ! -f "$src" ]; then
-        fatal "augment_initramfs: source initramfs '$src' not found."
-    fi
-    [ -n "$out" ] || fatal "augment_initramfs: no output path."
+    # Run the augmentation in a subshell so its EXIT trap cleans the scratch
+    # dir even when a fatal error fires mid-way. The parent's global cleanup()
+    # only removes WIPE_TMPDIR, which would otherwise leak this dir (holding a
+    # copy of the Fedora image) on failure.
+    (
+        local work
 
-    work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
-    gzip -dc "$src" | ( cd "$work" && cpio -idm 2>/dev/null )
+        if [ -z "$src" ] || [ ! -f "$src" ]; then
+            fatal "augment_initramfs: source initramfs '$src' not found."
+        fi
+        [ -n "$out" ] || fatal "augment_initramfs: no output path."
 
-    local pair path file dest
-    for pair in "$@"; do
-        path="${pair%%=*}"
-        file="${pair#*=}"
-        [ -n "$path" ] || fatal "augment_initramfs: bad pair '$pair'."
-        [ -f "$file" ] || fatal "augment_initramfs: file to embed '$file' not found."
-        dest="$work/${path#/}"
-        mkdir -p "$(dirname "$dest")"
-        cp "$file" "$dest"
-    done
+        work=$(mktemp -d /tmp/kexec-wipe-augment.XXXXXX)
+        trap 'rm -rf "$work"' EXIT
 
-    ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
+        gzip -dc "$src" | ( cd "$work" && cpio -idm 2>/dev/null )
 
-    rm -rf "$work"
-    echo "$out"
+        local pair path file dest
+        for pair in "$@"; do
+            path="${pair%%=*}"
+            file="${pair#*=}"
+            [ -n "$path" ] || fatal "augment_initramfs: bad pair '$pair'."
+            [ -f "$file" ] || fatal "augment_initramfs: file to embed '$file' not found."
+            dest="$work/${path#/}"
+            mkdir -p "$(dirname "$dest")"
+            cp "$file" "$dest"
+        done
+
+        ( cd "$work" && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > "$out" )
+        echo "$out"
+    )
 }
 
 # Find a kernel image (optionally with its initrd) suitable for kexec. On
@@ -851,15 +890,9 @@ warn() {
     echo "[kexec-wipe] WARNING: $*" >&2
 }
 
+# Print a fatal message and force-reboot, giving the operator a grace period to
+# read the message before the system is rebooted.
 fatal() {
-    echo "[kexec-wipe] FATAL: $*" >&2
-    sleep 5
-    reboot -f
-}
-
-# "Fatal" failure that still gives the operator a grace period to read the
-# message before the system is force-rebooted.
-fatal_reboot() {
     echo "[kexec-wipe] FATAL: $*" >&2
     echo "[kexec-wipe] The system will reboot in 30 seconds..."
     i=30
@@ -1023,7 +1056,7 @@ do_sanitize() {
             log "TEST MODE: sanitize failed but continuing (emulated device cannot sanitize)."
             return 2
         fi
-        fatal_reboot "All sanitize methods failed."
+        fatal "All sanitize methods failed."
     fi
 }
 
@@ -1095,7 +1128,7 @@ wait_for_completion() {
 #   - runs do_sanitize (which handles method selection and test-mode skipping)
 #   - waits for completion for a real sanitize
 #   - returns 4 on test-mode-skip (sanitize not performed), 0 on success.
-# On any genuine failure it never returns (calls fatal_reboot internally).
+# On any genuine failure it never returns (calls fatal internally).
 sanitize_and_wait() {
     # do_sanitize returns 2 (test-mode-skip), which is non-zero: guard it so
     # `set -e` does not kill the shell before we can inspect $rc.
@@ -1110,7 +1143,7 @@ sanitize_and_wait() {
         log "Device $KEXEC_WIPE_DEV has been sanitized."
         return 0
     fi
-    fatal_reboot "Sanitize failed or did not complete."
+    fatal "Sanitize failed or did not complete."
 }
 
 # --- Partition / filesystem helpers ------------------------------------
@@ -1192,38 +1225,34 @@ write_fedora_image() {
         echo 1 > "/sys/block/$devname/device/rescan" 2>/dev/null || true
     fi
 
-    # Wait for partition nodes to appear (up to 10s).
+    # Wait for partition nodes to appear (up to 10s), retrying the re-read each
+    # iteration because the first attempt can race the uevent generation.
     log "Waiting for partition nodes to appear..."
     local waited=0
     while [ "$waited" -lt 10 ]; do
-        # Check if any partition of $dev exists.
         if ls "${dev}p"* >/dev/null 2>&1; then
             log "Partition table re-read complete."
             break
         fi
         sleep 1
         waited=$((waited + 1))
-        # Retry the re-read on each iteration; sometimes the first attempt races.
         blockdev --rereadpt "$dev" 2>/dev/null || true
     done
 
-    # Fallback: if partition nodes remain absent (e.g. emulated NVMe
-    # devices where sysfs rescan is not supported), try partprobe to ask the
-    # kernel to re-read and create the partition nodes.
+    # Fallbacks for when the nodes still have not materialized (e.g. emulated
+    # NVMe devices where sysfs rescan is not supported): ask partprobe first,
+    # then create the nodes manually. The kernel has usually already re-read
+    # the partition table via BLKRRPART and registered the partitions in sysfs;
+    # only the devtmpfs node materialization failed, so read each partition's
+    # real major:minor from /sys/block/<dev>/<part>/dev and mknod it. This is
+    # correct for any namespace/controller layout, unlike guessing that the
+    # partition index equals the minor number.
     if ! ls "${dev}p"* >/dev/null 2>&1; then
         log "Partition nodes missing; trying partprobe..."
         partprobe "$dev" 2>/dev/null || true
         sleep 1
     fi
 
-    # Fallback: if partition nodes remain absent (e.g. emulated NVMe
-    # devices where sysfs rescan is not supported), create the partition device
-    # nodes manually. The kernel has usually already re-read the partition
-    # table via BLKRRPART and registered the partitions in sysfs; only the
-    # devtmpfs node materialization failed. Read each partition's real
-    # major:minor from sysfs (/sys/block/<dev>/<part>/dev) and mknod it. This is
-    # correct for any namespace/controller layout, unlike guessing that the
-    # partition index equals the minor number.
     if ! ls "${dev}p"* >/dev/null 2>&1; then
         log "Partition nodes missing; creating them manually from sysfs..."
         local part
@@ -1697,7 +1726,7 @@ main() {
 
     # sanitize_and_wait logs the outcome and only ever returns 0 (sanitized) or
     # 4 (test-mode-skip: sanitize not performed); on a genuine failure it never
-    # returns (fatal_reboot). The `|| true` guards the 4 against set -e.
+    # returns (fatal). The `|| true` guards the 4 against set -e.
     sanitize_and_wait || true
 
     install_fedora
@@ -1875,21 +1904,6 @@ copy_bin_with_libs() {
         fi
     fi
     return 0
-}
-
-# Copy disk tools (partprobe, blockdev) needed by the Fedora install path.
-# xz is not needed here: busybox provides xz/unlzma/lzcat applets.
-install_disk_tools() {
-    mkdir -p "$BUILD_DIR/bin"
-
-    for b in partprobe blockdev; do
-        if [ -e "$BUILD_DIR/bin/$b" ]; then
-            continue
-        fi
-        if command -v "$b" >/dev/null 2>&1; then
-            copy_bin_with_libs "$(command -v "$b")" "$BUILD_DIR/bin/$b" || true
-        fi
-    done
 }
 
 # Copy a module file and its transitive dependencies (resolved via the source
@@ -2074,11 +2088,13 @@ build_initramfs() {
     # Install busybox (arch-aware)
     install_busybox
 
-    # Create busybox symlinks
+    # Create busybox symlinks. partprobe and blockdev are busybox applets and
+    # cover the Fedora install path (partition rescans) without needing host
+    # util-linux copies in the initramfs.
     cd "$BUILD_DIR/bin"
     for cmd in ash sh bash mount umount mountpoint mkdir cat cp echo ls grep sed mknod sleep \
                reboot poweroff halt dmesg hexdump head tail wc find df free \
-               lsblk blkid fdisk parted sync dd chroot sha256sum chmod tr uname rm rmdir \
+               blkid fdisk partprobe blockdev sync dd chroot sha256sum chmod tr uname rm rmdir \
                xz unlzma lzcat modprobe awk switch_root timeout \
                cut sort basename dirname expr printf seq stat touch; do
         ln -sf busybox "$cmd"
@@ -2089,10 +2105,8 @@ build_initramfs() {
     mkdir -p "$BUILD_DIR/sbin"
     ln -sf ../bin/busybox "$BUILD_DIR/sbin/modprobe"
 
-    # Install Fedora install support tools (xz/partprobe/blockdev)
-    install_disk_tools
-
-    # Stage filesystem kernel modules for the chroot bootloader step.
+    # Install Fedora install support (partprobe/blockdev busybox applets were
+    # symlinked above; host xz/unlzma come via busybox too).
     stage_fs_modules
 
     # Build nvme-cli
@@ -2272,9 +2286,7 @@ main() {
         if ! command -v nvme &>/dev/null && ! command -v docker &>/dev/null; then
             fatal "nvme-cli is required on the host (or Docker to build it) to build the initramfs. Install nvme-cli."
         fi
-        for d in bash cpio gzip; do
-            command -v "$d" &>/dev/null || fatal "$d is required to build the initramfs on the host."
-        done
+        check_host_tools "$INSTALL_FEDORA"
     elif ! command -v nvme &>/dev/null; then
         fatal "nvme-cli is required but not found. Install it with your package manager."
     fi
@@ -2317,6 +2329,12 @@ main() {
     confirm "You are about to PERMANENTLY SANITIZE $TARGET_DEVICE. All data will be destroyed."
 
     if [ "$use_kexec" -eq 1 ]; then
+        if [ "$is_root" -eq 0 ]; then
+            # kexec reboots into the initramfs, but tear the device down first
+            # anyway so the sanitize never runs underneath live mounts/swap/LVM,
+            # matching the guarantee the direct path enforces.
+            detach_device "$TARGET_DEVICE"
+        fi
         do_kexec_wipe "$TARGET_DEVICE" "$METHOD" "$INSTALL_FEDORA"
     else
         detach_device "$TARGET_DEVICE"
