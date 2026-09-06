@@ -39,6 +39,11 @@
 #   --mem=MB         Guest RAM (default: 8192)
 #   --disk-size=S    Virtual NVMe size (default: 12G; the qcow2 is sparse)
 #   --skip-boot-check  Skip the clean-reboot + ssh verification phase
+#   --skip-install   Skip --install-fedora: run only the sanitize/kexec path
+#                    (build the wipe initramfs, kexec into it, reboot). Used by
+#                    the ARM64 CI job, which boots a real Fedora UKI guest under
+#                    TCG to exercise the UKI kexec path without paying for the
+#                    (much slower) full install+grub+boot-verify there.
 #   --keep           Do not remove the workdir on exit
 #
 set -euo pipefail
@@ -51,10 +56,17 @@ PORT=2222
 MEM=8192
 DISK_SIZE=12G
 SKIP_BOOT_CHECK=0
+SKIP_INSTALL=0
 KEEP=0
 ARCH=""
 GUEST_USER="fedora"
 PROVISION_USER="fedora"
+
+# Polling loops below are sized for KVM. The GitHub ARM64 CI runner has no
+# /dev/kvm, so boot_vm falls back to TCG (software emulation), which is many
+# times slower and flakier; WAIT_MULT scales every wait budget when that
+# happens. x86_64 CI uses KVM and keeps WAIT_MULT=1.
+WAIT_MULT=1
 
 # ---------------------------------------------------------------------------
 # Host tooling / environment
@@ -300,6 +312,10 @@ boot_vm() {
         # QEMU interprets an unqualified tb-size value in MiB.
         accel="tcg,thread=multi,tb-size=1024"
         cpu="max"
+        # Scale every wait budget: software-emulated guests boot and run many
+        # times slower than under KVM, and ARM runner performance varies a lot
+        # run to run.
+        WAIT_MULT=4
     fi
     case "$ARCH" in
         aarch64) machine="virt" ;;
@@ -365,20 +381,40 @@ user_ssh() {
 
 wait_guest_ssh() {
     echo "==> Waiting for guest ssh (root)"
+    local max_tries=$(( 90 * WAIT_MULT ))
     local tries=0
     until root_ssh 'echo UP' 2>/dev/null; do
         tries=$((tries + 1))
-        [ "$tries" -gt 90 ] && { echo "ERROR: guest ssh did not come up" >&2; exit 1; }
+        if [ "$tries" -gt "$max_tries" ]; then
+            {
+                echo "ERROR: guest ssh did not come up"
+                echo "--- serial log tail (guest boot progress) ---"
+                tail -40 "$SERIAL_LOG" 2>/dev/null
+                echo "--- qemu stderr ---"
+                cat "$WORKDIR/qemu-stderr.log" 2>/dev/null
+            } >&2
+            exit 1
+        fi
         sleep 5
     done
 }
 
 wait_phase1() {
     echo "==> Waiting for Phase-1 setup (kexec-tools/nvme-cli)"
+    local max_tries=$(( 60 * WAIT_MULT ))
     local tries=0
     until root_ssh 'grep -q PHASE1-SETUP-DONE /var/log/cloud-init-output.log' 2>/dev/null; do
         tries=$((tries + 1))
-        [ "$tries" -gt 60 ] && { echo "ERROR: Phase-1 setup timed out" >&2; exit 1; }
+        if [ "$tries" -gt "$max_tries" ]; then
+            {
+                echo "ERROR: Phase-1 setup timed out"
+                echo "--- serial log tail ---"
+                tail -40 "$SERIAL_LOG" 2>/dev/null
+                echo "--- guest cloud-init log tail ---"
+                root_ssh 'tail -40 /var/log/cloud-init-output.log' 2>/dev/null
+            } >&2
+            exit 1
+        fi
         sleep 5
     done
     echo "==> Phase-1 setup done"
@@ -400,20 +436,57 @@ prepare_guest() {
 }
 
 run_wipe() {
-    echo "==> Running wipe.sh /dev/nvme0n1 --install-fedora (test mode)"
+    local wipe_arg=""
+    if [ "$SKIP_INSTALL" -eq 0 ]; then
+        echo "==> Running wipe.sh /dev/nvme0n1 --install-fedora (test mode)"
+        wipe_arg="--install-fedora"
+    else
+        echo "==> Running wipe.sh /dev/nvme0n1 (test mode, sanitize/kexec only)"
+    fi
     # Run as root, with SUDO_USER set so the provisioned user is $PROVISION_USER.
     # KEXEC_WIPE_TEST_MODE=1 lets the kexec'd initramfs continue when QEMU's
     # emulated NVMe does not implement the Sanitize command.
-    root_ssh "echo YES | KEXEC_WIPE_TEST_MODE=1 SUDO_USER=$PROVISION_USER nohup bash -c 'bash /root/wipe.sh /dev/nvme0n1 --install-fedora > /root/wipe-run.log 2>&1' &" \
+    # Detach on the guest (setsid + closed stdio) so this ssh returns
+    # immediately: check_serial owns progress tracking via the serial log, and
+    # the interactive 'read YES' confirmation is fed through the pipe. Without
+    # the detach, a hung guest would pin this ssh (and thus CI) with no output.
+    root_ssh "setsid bash -c 'echo YES | KEXEC_WIPE_TEST_MODE=1 SUDO_USER=$PROVISION_USER bash /root/wipe.sh /dev/nvme0n1 $wipe_arg > /root/wipe-run.log 2>&1' </dev/null >/dev/null 2>&1 &" \
         >/dev/null 2>&1 || true
 }
 
 check_serial() {
-    echo "==> Waiting for pipeline to complete (up to ~10 min)"
+    local max_tries=$(( 120 * WAIT_MULT ))
     local tries=0
+
+    # Minimal path (--skip-install): the kexec'd wipe initramfs sanitizes (the
+    # emulated NVMe cannot, so test mode logs the skip), then reboots, which
+    # -no-reboot turns into a QEMU process exit. That exit is the signal that
+    # the whole UKI-kexec/sanitize pipeline ran through.
+    if [ "$SKIP_INSTALL" -eq 1 ]; then
+        echo "==> Waiting for the wipe initramfs to run (up to ~$(( max_tries * 5 / 60 )) min)"
+        until grep -q "Sanitize was not performed (test/emulated device)" "$SERIAL_LOG" 2>/dev/null; do
+            tries=$((tries + 1))
+            [ "$tries" -gt "$max_tries" ] && { echo "ERROR: wipe did not reach the sanitize step" >&2; tail -40 "$SERIAL_LOG"; exit 1; }
+            sleep 5
+        done
+        echo "OK: sanitize ran (test-mode skip on emulated NVMe)"
+
+        echo "==> Waiting for the guest to reboot out of the wipe initramfs"
+        tries=0
+        until ! kill -0 "$QEMU_PID" 2>/dev/null; do
+            tries=$((tries + 1))
+            [ "$tries" -gt "$max_tries" ] && { echo "ERROR: guest did not reboot after the wipe" >&2; tail -40 "$SERIAL_LOG"; exit 1; }
+            sleep 5
+        done
+        echo "PASS: kexec into the wipe initramfs completed and rebooted (QEMU exited)"
+        return 0
+    fi
+
+    echo "==> Waiting for pipeline to complete (up to ~$(( max_tries * 5 / 60 )) min)"
+    tries=0
     until grep -q "Switching root into Fedora" "$SERIAL_LOG" 2>/dev/null; do
         tries=$((tries + 1))
-        [ "$tries" -gt 120 ] && { echo "ERROR: pipeline did not reach switch_root" >&2; tail -30 "$SERIAL_LOG"; exit 1; }
+        [ "$tries" -gt "$max_tries" ] && { echo "ERROR: pipeline did not reach switch_root" >&2; tail -30 "$SERIAL_LOG"; exit 1; }
         sleep 5
     done
 
@@ -446,7 +519,7 @@ check_serial() {
             | awk -F: -v s="$switch_line" '$1 > s' | grep -q . \
           || ! kill -0 "$QEMU_PID" 2>/dev/null; do
         tries=$((tries + 1))
-        [ "$tries" -gt 90 ] && { echo "ERROR: fresh Fedora did not boot" >&2; exit 1; }
+        [ "$tries" -gt "$(( 90 * WAIT_MULT ))" ] && { echo "ERROR: fresh Fedora did not boot" >&2; exit 1; }
         sleep 5
     done
     echo "PASS: install pipeline complete, fresh Fedora started booting"
@@ -461,8 +534,9 @@ verify_boot() {
     # The first boot may run the SELinux autorelabel (scheduled by the tool),
     # which relabels the filesystem and reboots, exiting QEMU (-no-reboot).
     # Detect that and relaunch once.
+    local max_tries=$(( 90 * WAIT_MULT ))
     local tries=0
-    while [ "$tries" -lt 90 ]; do
+    while [ "$tries" -lt "$max_tries" ]; do
         if ! kill -0 "$QEMU_PID" 2>/dev/null; then
             echo "==> VM exited (autorelabel reboot); relaunching"
             sleep 3
@@ -493,7 +567,7 @@ cleanup() {
 }
 
 usage() {
-    sed -n '2,43p' "$0"
+    sed -n '2,47p' "$0"
     exit 1
 }
 
@@ -506,6 +580,7 @@ main() {
             --mem=*) MEM="${1#--mem=}" ;;
             --disk-size=*) DISK_SIZE="${1#--disk-size=}" ;;
             --skip-boot-check) SKIP_BOOT_CHECK=1 ;;
+            --skip-install) SKIP_INSTALL=1 ;;
             --keep) KEEP=1 ;;
             --help|-h) usage ;;
             *) echo "Unknown argument: $1" >&2; usage ;;
@@ -536,6 +611,10 @@ main() {
     prepare_guest
     run_wipe
     check_serial
+    if [ "$SKIP_INSTALL" -eq 1 ]; then
+        echo "ALL PASS: sanitize/kexec pipeline verified in QEMU (${ARCH})"
+        exit 0
+    fi
     if [ "$SKIP_BOOT_CHECK" -eq 0 ]; then
         verify_boot
     fi

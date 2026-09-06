@@ -98,7 +98,7 @@ kexec-wipe supports x86_64 and aarch64. It builds the initramfs from the running
 
 Fedora uses Unified Kernel Images (UKI) on aarch64. A UKI combines the kernel and its initrd in one EFI binary. kexec-wipe loads the UKI with `kexec -l --initrd` and replaces the embedded initrd with the wipe initramfs. This requires kexec-tools >= 2.0.30 on aarch64 (UKI load support in kexec-tools is newer on x86_64).
 
-CI exercises this mode end to end: the aarch64 job boots a Fedora Cloud aarch64 guest in QEMU, runs `--install-fedora`, and the guest loads its own UKI.
+CI exercises this mode end to end: the aarch64 job boots a Fedora Cloud aarch64 guest in QEMU and runs wipe.sh against its own root device, so the guest kexec's its own UKI (the full `--install-fedora` write+grub+boot flow runs on the x86_64 job, which has KVM; the arm64 runners have no `/dev/kvm` and run under TCG emulation).
 
 ## Requirements
 
@@ -137,7 +137,7 @@ lib/main_body.sh   - argument parsing, usage, main flow
 ### Release
 
 1. Run `./build.sh`. It embeds the current initramfs source into wipe.sh.
-2. Push a version tag. CI assembles wipe.sh, runs the static checks and the QEMU integration tests, installs real Fedora in QEMU on x86_64 and aarch64 (the aarch64 run exercises the UKI boot mode), and uploads wipe.sh to the release.
+2. Push a version tag. CI assembles wipe.sh, runs the static checks and the QEMU integration tests, installs real Fedora in QEMU on x86_64 (KVM), runs the sanitize/kexec pipeline on a real Fedora aarch64 guest (UKI boot mode under TCG), and uploads wipe.sh to the release.
 
 ## Safety
 

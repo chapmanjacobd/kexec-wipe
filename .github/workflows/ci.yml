@@ -122,11 +122,19 @@ jobs:
           - arch: x86_64
             runner: ubuntu-latest
             apt: qemu-system-x86 qemu-utils ovmf genisoimage socat
+            extra: ""
           - arch: aarch64
             # aarch64 runners boot a real Fedora aarch64 guest, which uses
             # Unified Kernel Images, so the UKI kexec path is exercised for real.
+            # There is no /dev/kvm, so the guest runs under TCG (software
+            # emulation), which makes --install-fedora's full write+grub+boot
+            # too slow to be reliable. --skip-install instead runs the real
+            # wipe.sh sanitize/kexec pipeline (UKI kexec into the wipe
+            # initramfs) and verifies it reboots; the full install is covered
+            # by the x86_64 job on KVM.
             runner: ubuntu-26.04-arm
             apt: qemu-system-arm qemu-utils ovmf genisoimage socat
+            extra: "--skip-install"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
@@ -152,8 +160,10 @@ jobs:
           fi
 
       - name: Real Fedora install test (${{ matrix.arch }})
-        timeout-minutes: 90
-        run: scripts/qemu-full-install-test.sh --arch=${{ matrix.arch }} --mem=4096
+        # ARM64 runs under TCG, so allow a long runtime for boot + phase-1
+        # + the kexec pipeline. The full install test (x86_64/KVM) is fast.
+        timeout-minutes: 120
+        run: scripts/qemu-full-install-test.sh --arch=${{ matrix.arch }} --mem=4096 ${{ matrix.extra }}
 
   release:
     name: Create release
