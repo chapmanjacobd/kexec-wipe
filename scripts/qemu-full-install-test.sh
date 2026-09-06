@@ -168,11 +168,18 @@ make_iso() {
     shift
     local tool
     tool=$(iso_tool) || { echo "ERROR: no ISO tool available" >&2; exit 1; }
+    local stderr
+    stderr=$(mktemp)
     if [ "$tool" = "xorriso" ]; then
-        xorriso -as mkisofs -output "$output" -volid cidata -joliet -rock "$@" >/dev/null 2>&1
+        timeout 30 xorriso -as mkisofs -output "$output" -volid cidata -joliet -rock "$@" 2>"$stderr" || {
+            echo "ERROR: iso tool failed (exit $?). stderr:" >&2; cat "$stderr" >&2; rm -f "$stderr"; exit 1
+        }
     else
-        "$tool" -output "$output" -volid cidata -joliet -rock "$@" >/dev/null 2>&1
+        timeout 30 "$tool" -output "$output" -volid cidata -joliet -rock "$@" 2>"$stderr" || {
+            echo "ERROR: $tool failed (exit $?). stderr:" >&2; cat "$stderr" >&2; rm -f "$stderr"; exit 1
+        }
     fi
+    rm -f "$stderr"
 }
 
 # ---------------------------------------------------------------------------
