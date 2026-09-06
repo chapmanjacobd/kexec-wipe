@@ -62,10 +62,10 @@ ARCH=""
 GUEST_USER="fedora"
 PROVISION_USER="fedora"
 
-# Polling loops below are sized for KVM. The GitHub ARM64 CI runner has no
-# /dev/kvm, so boot_vm falls back to TCG (software emulation), which is many
-# times slower and flakier; WAIT_MULT scales every wait budget when that
-# happens. x86_64 CI uses KVM and keeps WAIT_MULT=1.
+# Polling loops below are sized for KVM. An aarch64 guest cannot use x86 KVM,
+# so boot_vm falls back to TCG (software emulation), which is slower and
+# flakier; WAIT_MULT scales every wait budget when that happens. The x86_64
+# guest uses KVM when it is available.
 WAIT_MULT=1
 
 # ---------------------------------------------------------------------------
@@ -334,11 +334,11 @@ boot_vm() {
     # device node is openable, and fall back to TCG with a concrete CPU if not.
     accel="kvm"
     cpu="host"
-    if [ ! -r /dev/kvm ]; then
+    if [ "$ARCH" = "aarch64" ] || [ ! -r /dev/kvm ]; then
         echo "==>  /dev/kvm not usable; falling back to TCG (software emulation)"
-        # The ARM CI runner has no KVM. Use multi-threaded TCG and a large
-        # translation-block cache so the four guest vCPUs do not serialize and
-        # hot guest code is not repeatedly translated during the install.
+        # Use multi-threaded TCG and a large translation-block cache so the
+        # four guest vCPUs do not serialize and hot guest code is not repeatedly
+        # translated during the install.
         # QEMU interprets an unqualified tb-size value in MiB.
         accel="tcg,thread=multi,tb-size=1024"
         cpu="max"

@@ -124,15 +124,10 @@ jobs:
             apt: qemu-system-x86 qemu-utils ovmf genisoimage socat
             extra: ""
           - arch: aarch64
-            # aarch64 runners boot a real Fedora aarch64 guest, which uses
-            # Unified Kernel Images, so the UKI kexec path is exercised for real.
-            # There is no /dev/kvm, so the guest runs under TCG (software
-            # emulation), which makes --install-fedora's full write+grub+boot
-            # too slow to be reliable. --skip-install instead runs the real
-            # wipe.sh sanitize/kexec pipeline (UKI kexec into the wipe
-            # initramfs) and verifies it reboots; the full install is covered
-            # by the x86_64 job on KVM.
-            runner: ubuntu-26.04-arm
+            # Run the real Fedora aarch64 guest on the faster x86_64 runner.
+            # This still exercises the ARM Unified Kernel Image kexec path,
+            # while avoiding the much slower native ARM runner without KVM.
+            runner: ubuntu-latest
             apt: qemu-system-arm qemu-utils ovmf genisoimage socat
             extra: "--skip-install"
     runs-on: ${{ matrix.runner }}
