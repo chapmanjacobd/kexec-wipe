@@ -282,13 +282,12 @@ boot_vm() {
     local qemu machine netdev accel cpu
     qemu=$(qemu_bin)
     # GitHub-hosted runners may not expose a usable /dev/kvm: ARM64 runners
-    # have none, and x86_64 runners ship it root:kvm 660 (the CI workflow chmod's
-    # it). When the runner user can't open it, fall back to TCG so the test can
-    # still at least boot. Use KVM whenever it is actually usable.
+    # have none, and x86_64 runners ship it root:kvm 660 until the CI workflow
+    # chmod's it. Never spawn QEMU to probe (that can block); just check the
+    # device node is openable, and fall back to TCG with a concrete CPU if not.
     accel="kvm"
     cpu="host"
-    if [ ! -r /dev/kvm ] || ! "$qemu" -accel kvm -machine none -nodefaults -display none \
-           </dev/null >/dev/null 2>&1; then
+    if [ ! -r /dev/kvm ]; then
         echo "==>  /dev/kvm not usable; falling back to TCG (software emulation)"
         accel="tcg"
         if [ "$ARCH" = "aarch64" ]; then
@@ -298,13 +297,14 @@ boot_vm() {
         fi
     fi
     case "$ARCH" in
-        aarch64) machine="-machine virt,accel=$accel" ;;
-        *)       machine="-machine q35,accel=$accel" ;;
+        aarch64) machine="virt" ;;
+        *)       machine="q35" ;;
     esac
     netdev=$(net_device)
 
     local args=(
-        "$machine"
+        -machine "$machine"
+        -accel "$accel"
         -cpu "$cpu" -smp 4 -m "$MEM"
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
         -drive "if=pflash,format=raw,file=$pflash_vars"
@@ -321,8 +321,18 @@ boot_vm() {
     fi
 
     echo "==> Booting QEMU (seed=$with_seed, arch=$ARCH)"
-    setsid nohup "$qemu" "${args[@]}" >/dev/null 2>&1 &
+    local qemu_stderr="$WORKDIR/qemu-stderr.log"
+    : > "$qemu_stderr"
+    setsid nohup "$qemu" "${args[@]}" >/dev/null 2>"$qemu_stderr" &
     QEMU_PID=$!
+    # QEMU may fail instantly (e.g. bad args, KVM unavailable); surface the
+    # error instead of letting wait_guest_ssh spin silently for 450s.
+    sleep 3
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        echo "ERROR: QEMU exited immediately. stderr:" >&2
+        cat "$qemu_stderr" >&2
+        exit 1
+    fi
 }
 
 stop_vm() {
