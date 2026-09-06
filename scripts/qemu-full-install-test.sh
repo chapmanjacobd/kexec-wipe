@@ -40,10 +40,9 @@
 #   --disk-size=S    Virtual NVMe size (default: 12G; the qcow2 is sparse)
 #   --skip-boot-check  Skip the clean-reboot + ssh verification phase
 #   --skip-install   Skip --install-fedora: run only the sanitize/kexec path
-#                    (build the wipe initramfs, kexec into it, reboot). Used by
-#                    the ARM64 CI job, which boots a real Fedora UKI guest under
-#                    TCG to exercise the UKI kexec path without paying for the
-#                    (much slower) full install+grub+boot-verify there.
+#                    (build the wipe initramfs, kexec into it, reboot). The
+#                    minimal path starts wipe.sh from cloud-init and monitors
+#                    the serial console instead of setting up guest SSH.
 #   --keep           Do not remove the workdir on exit
 #
 set -euo pipefail
@@ -57,6 +56,7 @@ MEM=8192
 DISK_SIZE=12G
 SKIP_BOOT_CHECK=0
 SKIP_INSTALL=0
+DIRECT_WIPE=0
 KEEP=0
 ARCH=""
 GUEST_USER="fedora"
@@ -150,7 +150,9 @@ require_tools() {
     local qemu
     qemu=$(qemu_bin)
     local missing=()
-    for t in "$qemu" qemu-img curl sha256sum ssh cpio gzip xz socat; do
+    local tools=("$qemu" qemu-img curl sha256sum base64 cpio gzip xz socat)
+    [ "$DIRECT_WIPE" -eq 0 ] && tools+=(ssh)
+    for t in "${tools[@]}"; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     # Need at least one iso tool; the check above is satisfied by any one of them.
@@ -239,7 +241,9 @@ make_disk() {
     # install and verification boots.
     rm -f "$WORKDIR/OVMF_VARS.fd"
     qemu-img convert -f raw -O qcow2 "$WORKDIR/fedora.raw" "$WORKDIR/nvme.qcow2"
-    qemu-img resize "$WORKDIR/nvme.qcow2" "$DISK_SIZE"
+    if [ "$SKIP_INSTALL" -eq 0 ]; then
+        qemu-img resize "$WORKDIR/nvme.qcow2" "$DISK_SIZE"
+    fi
     rm -f "$WORKDIR/fedora.raw"
 }
 
@@ -256,6 +260,32 @@ make_seed() {
     local seeddir="$WORKDIR/seed"
     rm -rf "$seeddir"
     mkdir -p "$seeddir"
+
+    if [ "$DIRECT_WIPE" -eq 1 ]; then
+        # The minimal job only verifies UKI kexec. Put the already-built script
+        # in the seed and let cloud-init launch it, avoiding guest SSH entirely.
+        local wipe_b64
+        wipe_b64=$(sed -e "s|cmdline=\"root=/dev/ram rw quiet panic=10\"|cmdline=\"root=/dev/ram rw quiet panic=10 console=${console},115200n8\"|" \
+            "$REPO_DIR/wipe.sh" | base64 -w0)
+        dw_pkgs="kexec-tools nvme-cli xz cpio gzip busybox"
+        cat > "$seeddir/user-data" <<EOF
+#cloud-config
+write_files:
+  - path: /root/wipe.sh
+    permissions: '0755'
+    encoding: b64
+    content: |
+      $wipe_b64
+runcmd:
+  - dnf -y install $dw_pkgs
+  - echo PHASE1-SETUP-DONE
+  - echo YES | KEXEC_WIPE_TEST_MODE=1 bash /root/wipe.sh /dev/nvme0n1 > /root/wipe-run.log 2>&1
+EOF
+        printf 'instance-id: kexec-wipe-minimal-test\nlocal-hostname: qemu-host\n' > "$seeddir/meta-data"
+        make_iso "$WORKDIR/seed.iso" "$seeddir/user-data" "$seeddir/meta-data"
+        return 0
+    fi
+
     cat > "$seeddir/user-data" <<EOF
 #cloud-config
 hostname: qemu-host
@@ -421,9 +451,6 @@ wait_phase1() {
 }
 
 prepare_guest() {
-    echo "==> Building wipe.sh"
-    ( cd "$REPO_DIR" && ./build.sh >/dev/null )
-
     echo "==> Installing wipe.sh in guest"
     # wipe.sh now builds its initramfs on the host (guest) at runtime, so no
     # prebuilt initramfs needs to be shipped or pointed at. Only the kexec
@@ -594,9 +621,14 @@ main() {
         *) echo "ERROR: unsupported arch '$ARCH' (use x86_64 or aarch64)" >&2; exit 1 ;;
     esac
 
+    if [ "$SKIP_INSTALL" -eq 1 ]; then
+        DIRECT_WIPE=1
+    fi
     require_tools
     find_ovmf
-    find_ssh_key
+    if [ "$DIRECT_WIPE" -eq 0 ]; then
+        find_ssh_key
+    fi
     fedora_pins
     mkdir -p "$WORKDIR"
 
@@ -604,12 +636,18 @@ main() {
 
     download_fedora
     make_disk
+    if [ "$DIRECT_WIPE" -eq 1 ]; then
+        echo "==> Building wipe.sh"
+        ( cd "$REPO_DIR" && ./build.sh >/dev/null )
+    fi
     make_seed
     boot_vm 1
-    wait_guest_ssh
-    wait_phase1
-    prepare_guest
-    run_wipe
+    if [ "$DIRECT_WIPE" -eq 0 ]; then
+        wait_guest_ssh
+        wait_phase1
+        prepare_guest
+        run_wipe
+    fi
     check_serial
     if [ "$SKIP_INSTALL" -eq 1 ]; then
         echo "ALL PASS: sanitize/kexec pipeline verified in QEMU (${ARCH})"
