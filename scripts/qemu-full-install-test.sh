@@ -220,6 +220,10 @@ make_disk() {
     echo "==> Decompressing raw image (5 GB)"
     xz -dc "$WORKDIR/fedora.raw.xz" > "$WORKDIR/fedora.raw"
     rm -f "$WORKDIR/nvme.qcow2"
+    # The firmware variable store is mutated when GRUB registers its boot
+    # entry. Start each test with a fresh store, then preserve it across the
+    # install and verification boots.
+    rm -f "$WORKDIR/OVMF_VARS.fd"
     qemu-img convert -f raw -O qcow2 "$WORKDIR/fedora.raw" "$WORKDIR/nvme.qcow2"
     qemu-img resize "$WORKDIR/nvme.qcow2" "$DISK_SIZE"
     rm -f "$WORKDIR/fedora.raw"
@@ -275,7 +279,7 @@ BOOT_SEED=0
 boot_vm() {
     local with_seed="$1"
     local pflash_vars="$WORKDIR/OVMF_VARS.fd"
-    cp "$OVMF_VARS" "$pflash_vars"
+    [ -f "$pflash_vars" ] || cp "$OVMF_VARS" "$pflash_vars"
     SERIAL_LOG="$WORKDIR/serial-$(date +%s).log"
     QEMU_MON="$WORKDIR/mon-$(date +%s).sock"
 
