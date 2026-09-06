@@ -98,17 +98,19 @@ OVMF_VARS=""
 
 find_ovmf() {
     if [ "$ARCH" = "aarch64" ]; then
-        for c in /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/edk2/aarch64/AAVMF_CODE.fd; do
+        for c in /usr/share/AAVMF/AAVMF_CODE_4M.fd /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/edk2/aarch64/AAVMF_CODE.fd; do
             [ -f "$c" ] && { OVMF_CODE="$c"; break; }
         done
-        for v in /usr/share/AAVMF/AAVMF_VARS.fd /usr/share/edk2/aarch64/AAVMF_VARS.fd; do
+        for v in /usr/share/AAVMF/AAVMF_VARS_4M.fd /usr/share/AAVMF/AAVMF_VARS.fd /usr/share/edk2/aarch64/AAVMF_VARS.fd; do
             [ -f "$v" ] && { OVMF_VARS="$v"; break; }
         done
     else
-        for c in /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd; do
+        for c in /usr/share/edk2/ovmf/OVMF_CODE_4M.fd /usr/share/edk2/ovmf/OVMF_CODE.fd \
+                 /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd; do
             [ -f "$c" ] && { OVMF_CODE="$c"; break; }
         done
-        for v in /usr/share/edk2/ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd; do
+        for v in /usr/share/edk2/ovmf/OVMF_VARS_4M.fd /usr/share/edk2/ovmf/OVMF_VARS.fd \
+                 /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do
             [ -f "$v" ] && { OVMF_VARS="$v"; break; }
         done
     fi
