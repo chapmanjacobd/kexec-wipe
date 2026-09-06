@@ -135,12 +135,17 @@ $remaining"
     # a partition that is itself still in use) mean the device is not detached.
     # Check the whole disk and each of its partitions. A sysfs "holders" entry
     # that references this device is enough to refuse.
+    #
+    # Read holders from /sys/class/block, not /sys/block: /sys/block only lists
+    # whole disks, so "/sys/block/<part>/holders" does not exist for partitions
+    # (their kobjects live under /sys/block/<disk>/<part>). /sys/class/block
+    # covers every device including partitions and is the canonical location.
     local holders=""
     local node
     for node in "/dev/$devname" /dev/"$devname"p[0-9]*; do
         [ -b "$node" ] || continue
         local h
-        h=$(ls "/sys/block/$(basename "$node")/holders" 2>/dev/null || true)
+        h=$(ls "/sys/class/block/$(basename "$node")/holders" 2>/dev/null || true)
         if [ -n "$h" ]; then
             holders="$holders${holders:+ }$node: $h"
         fi

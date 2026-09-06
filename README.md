@@ -78,7 +78,7 @@ The image URL, release, and checksum are pinned in `lib/kexec.sh`.
 
 ## Architecture support
 
-x86_64 and aarch64 are supported. The initramfs is built on the host at run time from the running kernel, so its modules (nvme, xfs, btrfs, ext4) always match the kernel being kexec'd. On aarch64, Fedora uses Unified Kernel Images (UKI); kexec-wipe loads a UKI directly with `kexec -l --initrd` (verified by a QEMU test in CI on an arm64 runner). This requires kexec-tools >= 2.0.30 (arm64; the UKI support is newer on x86_64).
+x86_64 and aarch64 are supported. The initramfs is built on the host at run time from the running kernel, so its modules (nvme, xfs, btrfs, ext4) always match the kernel being kexec'd. On aarch64, Fedora uses Unified Kernel Images (UKI); kexec-wipe loads a UKI directly with `kexec -l --initrd`. This path is exercised end-to-end in CI: the aarch64 job boots a real Fedora Cloud aarch64 guest in QEMU and runs `--install-fedora`, which kexec's the guest's own UKI. This requires kexec-tools >= 2.0.30 (arm64; the UKI support is newer on x86_64).
 
 ## Requirements
 
@@ -114,7 +114,7 @@ lib/main_body.sh   - Argument parsing, usage, main flow
 ### Release
 
 1. Run `./build.sh` (embeds the current initramfs source into wipe.sh).
-2. Push a version tag. CI assembles wipe.sh, runs the static checks, the QEMU integration tests (including the UKI kexec test), and uploads wipe.sh to the release.
+2. Push a version tag. CI assembles wipe.sh, runs the static checks and the QEMU integration tests, installs real Fedora in QEMU on both x86_64 and aarch64 (the aarch64 run exercises the UKI kexec path), and uploads wipe.sh to the release.
 
 ## Safety
 

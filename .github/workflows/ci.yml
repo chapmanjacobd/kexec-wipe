@@ -38,6 +38,7 @@ jobs:
           sh -n initramfs/init
           bash -n initramfs/build.sh
           bash -n build.sh
+          bash -n scripts/qemu-full-install-test.sh
           echo "All syntax checks passed."
 
       - name: Test argument parsing
@@ -75,7 +76,7 @@ jobs:
           echo "Initramfs verification passed."
 
   integration:
-    name: Integration
+    name: Integration (x86_64 initramfs)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -128,141 +129,46 @@ jobs:
           grep -q "kexec-wipe initramfs" /tmp/serial.log
           echo "QEMU smoke test passed."
 
-      - name: QEMU Fedora install test
-        run: |
-          set -euo pipefail
-
-          # --- Prepare a test initramfs that can bring up an emulated NVMe.
-          # The runner kernel exposes the nvme driver as modules, so stage them
-          # (plus modprobe metadata) into a copy of our built initramfs.
-          # No network is needed inside the initramfs anymore: wipe.sh (and this
-          # test) pre-downloads the Fedora image on the host and embeds it.
-          rm -rf /tmp/install-initramfs
-          mkdir -p /tmp/install-initramfs
-          cd /tmp/install-initramfs
-          zcat /tmp/initramfs-docker.cpio.gz | cpio -idm 2>/dev/null
-
-          KVER=$(uname -r)
-          SRC_MODS="/lib/modules/$KVER"
-          DST_MODS="/tmp/install-initramfs/lib/modules/$KVER"
-          mkdir -p "$DST_MODS/kernel/drivers/nvme"
-          if [ -d "$SRC_MODS/kernel/drivers/nvme" ]; then
-            cp -a "$SRC_MODS/kernel/drivers/nvme"/* "$DST_MODS/kernel/drivers/nvme/"
-          fi
-          # Overwrite with the full host module metadata so modprobe resolves.
-          for f in modules.dep modules.dep.bin modules.builtin modules.builtin.bin modules.alias modules.alias.bin modules.symbols; do
-            [ -f "$SRC_MODS/$f" ] && cp "$SRC_MODS/$f" "$DST_MODS/$f" 2>/dev/null || true
-          done
-          cd /
-          ( cd /tmp/install-initramfs && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > /tmp/install-initramfs.cpio.gz )
-
-          # --- Build a small bootable synthetic "Fedora" raw image.
-          # A single ext4 partition seeded with a busybox init that prints a
-          # marker and powers off, so the test validates the whole post-sanitize
-          # install path (pre-embedded image, write, switch_root).
-          rm -f /tmp/fedora.raw /tmp/fedora.raw.xz
-          dd if=/dev/zero of=/tmp/fedora.raw bs=1M count=96 status=none
-          printf 'o\nn\np\n1\n\n+80M\nw\n' | fdisk /tmp/fedora.raw >/dev/null 2>&1
-          LOOP=$(sudo losetup -fP --show /tmp/fedora.raw)
-          sudo partprobe "$LOOP" 2>/dev/null || true
-          sleep 1
-          sudo mkfs.ext4 -q "${LOOP}p1"
-
-          rm -rf /tmp/fedora-root
-          mkdir -p /tmp/fedora-root
-          sudo mount "${LOOP}p1" /tmp/fedora-root
-          sudo mkdir -p /tmp/fedora-root/bin /tmp/fedora-root/sbin \
-            /tmp/fedora-root/dev /tmp/fedora-root/proc /tmp/fedora-root/sys
-          sudo cp /tmp/install-initramfs/bin/busybox /tmp/fedora-root/bin/busybox
-          sudo ln -sf busybox /tmp/fedora-root/bin/sh
-          sudo mkdir -p /tmp/fedora-root/boot/grub2
-          sudo touch /tmp/fedora-root/boot/grub2/grub.cfg
-          printf '%s\n' '#!/bin/sh' \
-            'echo "KEXEC-WIPE-TEST-INSTALL-BOOT-OK"' \
-            '/bin/busybox sync' \
-            '/bin/busybox sleep 1' \
-            '/bin/busybox poweroff -f' > /tmp/fedora-init
-          sudo cp /tmp/fedora-init /tmp/fedora-root/sbin/init
-          sudo chmod +x /tmp/fedora-root/sbin/init
-          sudo umount /tmp/fedora-root
-          sudo losetup -d "$LOOP"
-
-          xz -c /tmp/fedora.raw > /tmp/fedora.raw.xz
-
-          # --- Embed the Fedora image into the initramfs (mirrors lib/kexec.sh
-          # augment_initramfs: hand the image to the initramfs via cmdline).
-          rm -rf /tmp/augment
-          mkdir -p /tmp/augment
-          gzip -dc /tmp/install-initramfs.cpio.gz | ( cd /tmp/augment && cpio -idm 2>/dev/null )
-          mkdir -p /tmp/augment/opt
-          cp /tmp/fedora.raw.xz /tmp/augment/opt/fedora.raw.xz
-          echo "test-host" > /tmp/augment/opt/kexec-wipe-hostname
-          : > /tmp/augment/opt/kexec-wipe-authorized_keys
-          ( cd /tmp/augment && find . -print0 | cpio --null -ov --format=newc 2>/dev/null | gzip -9 > /tmp/install-initramfs.cpio.gz )
-          rm -rf /tmp/augment
-
-          # --- Boot QEMU with an emulated NVMe device. No networking needed.
-          # QEMU's -drive needs the backing file to exist; create a blank one.
-          rm -f /tmp/install-disk.qcow2
-          qemu-img create -f qcow2 /tmp/install-disk.qcow2 128M >/dev/null
-          timeout 240 qemu-system-x86_64 \
-            -kernel /tmp/vmlinuz \
-            -initrd /tmp/install-initramfs.cpio.gz \
-            -append "console=ttyS0 kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto kexec_wipe_install=1 kexec_wipe_test=1 kexec_wipe_fedora_image=/opt/fedora.raw.xz" \
-            -nographic -no-reboot -m 512 \
-            -drive file=/tmp/install-disk.qcow2,if=none,id=nvme0 \
-            -device nvme,serial=deadbeef,drive=nvme0 \
-            > /tmp/install-serial.log 2>&1 || true
-
-          echo "--- Install serial output ---"
-          cat /tmp/install-serial.log
-          echo "--- End install serial output ---"
-
-          # The init must have run the full install pipeline and booted the
-          # freshly written root, which prints the marker before powering off.
-          FAIL=0
-          for marker in "Fedora installation complete" "KEXEC-WIPE-TEST-INSTALL-BOOT-OK" "Sanitize was not performed"; do
-            if grep -q "$marker" /tmp/install-serial.log; then
-              echo "OK: found '$marker'"
-            else
-              echo "FAIL: missing '$marker'" >&2
-              FAIL=1
-            fi
-          done
-          if [ "$FAIL" -ne 0 ]; then
-            echo "::error::QEMU Fedora install test: one or more expected markers missing from serial output"
-            exit 1
-          fi
-          echo "QEMU Fedora install test passed."
-
-  uki:
-    name: UKI kexec test (aarch64)
-    # The UKI kexec path is only exercised on aarch64 (kexec-tools arm64 UKI
-    # support is in >= 2.0.30; the x86_64 support is newer still and Ubuntu LTS
-    # runners do not ship it). ubuntu-26.04-arm ships kexec-tools 2.0.32.
-    runs-on: ubuntu-26.04-arm
+  # Real Fedora end-to-end install tests (scripts/qemu-full-install-test.sh):
+  # boot an actual Fedora Cloud guest, run the real wipe.sh inside it, install
+  # real Fedora onto a virtual NVMe, reboot, and verify ssh works.
+  install-fedora:
+    name: Install Fedora in QEMU (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            apt: qemu-system-x86 qemu-utils ovmf genisoimage socat
+          - arch: aarch64
+            # aarch64 runners boot a real Fedora aarch64 guest, which uses
+            # Unified Kernel Images, so the UKI kexec path is exercised for real.
+            runner: ubuntu-26.04-arm
+            apt: qemu-system-arm qemu-utils ovmf genisoimage socat
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install QEMU and tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-arm busybox-static \
-            systemd-boot kexec-tools cpio gzip binutils
+      - name: Install packages
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.apt }}
 
-      - name: QEMU UKI kexec test
+      - name: Generate ssh key for the test
         run: |
-          set -euo pipefail
-          KERNEL=$(ls /boot/vmlinuz-* | head -1)
-          echo "Using kernel: $KERNEL"
-          sudo cp "$KERNEL" /tmp/vmlinuz
-          sudo chmod 644 /tmp/vmlinuz
-          scripts/qemu-uki-test.sh --kernel=/tmp/vmlinuz
+          set -e
+          mkdir -p "$HOME/.ssh"
+          if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+            ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+          fi
+
+      - name: Real Fedora install test (${{ matrix.arch }})
+        timeout-minutes: 90
+        run: scripts/qemu-full-install-test.sh --arch=${{ matrix.arch }} --mem=4096
 
   release:
     name: Create release
     runs-on: ubuntu-latest
-    needs: [test, integration, uki]
+    needs: [test, integration, install-fedora]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v6

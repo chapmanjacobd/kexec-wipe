@@ -77,15 +77,37 @@ is_root_device() {
     # Walk up to the whole-disk device backing the root mount. A single lsblk
     # PKNAME hop is not enough when the root sits on a dm/partition (e.g. LVM
     # on nvme0n1p2), so walk until lsblk reports no further parent.
+    #
+    # lsblk reports no PKNAME for stacked devices like MD RAID (md0: the array
+    # "owns" its members as slaves, not as a parent), so when PKNAME is empty
+    # follow the device's sysfs "slaves" instead to get back to a real disk.
     local parent=""
     local node="$src"
     local hops=8
     while [ "$hops" -gt 0 ]; do
-        local p
+        local p slave
         p=$(lsblk -n -o PKNAME "$node" 2>/dev/null | head -1) || true
-        [ -n "$p" ] || break
-        parent="$p"
-        node="/dev/$p"
+        if [ -n "$p" ]; then
+            parent="$p"
+            node="/dev/$p"
+        else
+            # No PKNAME: either a stacked device (MD/dm) or a whole disk with no
+            # parent. dm devices already resolve via PKNAME above, so this is
+            # normally an MD array; walk its first slave (typically a partition
+            # of the backing disk). A whole disk has no slaves either, so the
+            # loop then ends.
+            local sdir
+            sdir="/sys/block/$(basename "$node")/slaves"
+            slave=""
+            for s in "$sdir"/*; do
+                [ -e "$s" ] || break
+                slave=$(basename "$s")
+                break
+            done
+            [ -n "$slave" ] || break
+            parent="$slave"
+            node="/dev/$slave"
+        fi
         hops=$((hops - 1))
     done
 

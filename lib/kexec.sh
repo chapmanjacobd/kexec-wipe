@@ -157,6 +157,10 @@ find_kernel() {
         "/boot/bzImage-${kver}"
         "/boot/vmlinux-${kver}"
         "/vmlinuz-${kver}"
+        # Fedora installs UKIs at /boot/efi/EFI/<product>/, while Debian-style
+        # systems that mount the ESP at /boot put them at /boot/EFI/<product>/.
+        "/boot/efi/EFI/fedora/linux-${kver}.efi"
+        "/boot/efi/EFI/fedora/vmlinuz-${kver}"
         "/boot/EFI/fedora/linux-${kver}.efi"
         "/boot/EFI/fedora/vmlinuz-${kver}"
     )
@@ -272,8 +276,9 @@ do_kexec_wipe() {
     # command is identical: kexec-tools unpacks a UKI's .linux section and loads
     # it as a plain kernel (arm64 support since 2.0.30, x86_64 since 2.0.31),
     # and when --initrd is given it replaces the UKI's embedded initrd so our
-    # wipe /init is the one that runs. Verified by the aarch64 QEMU UKI test in
-    # CI (ubuntu-26.04-arm).
+    # wipe /init is the one that runs. Exercised for real by the aarch64
+    # Fedora install test in CI (ubuntu-26.04-arm), whose Fedora Cloud guest
+    # boots UKIs and kexec's one via find_kernel above.
     info "Loading kernel into memory..."
     info "  Kernel:    $kernel"
     info "  Initramfs: $initramfs_path"

@@ -12,22 +12,32 @@
 #   3. Reboots the VM and verifies the installed Fedora boots cleanly via GRUB
 #      and that you can ssh in as the provisioned user.
 #
+# Run on x86_64 or aarch64 hosts. On aarch64 the guest is a real Fedora
+# aarch64 system, so the UKI kexec path (Fedora arm64 boots Unified Kernel
+# Images) is exercised for real as well.
+#
 # The guest's NVMe is backed only by a qcow2 file. NO host block device is ever
 # attached to QEMU; the host's real NVMe is never touched.
 #
-# Requires: qemu-system-x86_64, qemu-img, an OVMF firmware, genisoimage/mkisofs,
-#           curl, ssh, and an ssh key at ~/.ssh/id_ed25519.pub (or id_rsa.pub).
+# Requires: qemu-system-x86_64 (or qemu-system-aarch64 on arm64), qemu-img, an
+#           OVMF/AAVMF firmware, genisoimage/mkisofs/xorriso, curl, ssh, socat,
+#           and an ssh key at ~/.ssh/id_ed25519.pub (or id_rsa.pub).
 # The guest itself needs internet access (QEMU user networking) to download the
-# Fedora image and busybox. Roughly 10 GB of disk space in the workdir.
+# Fedora image and packages. Roughly 10 GB of disk space in the workdir.
 #
 # Usage:
 #   scripts/qemu-full-install-test.sh
 #   scripts/qemu-full-install-test.sh --workdir=/tmp/foo --port=2223 --skip-boot-check
+#   scripts/qemu-full-install-test.sh --arch=aarch64 --mem=4096   (arm64 host)
 #
 # Options:
+#   --arch=ARCH      x86_64 (default) or aarch64; picks the QEMU binary, machine
+#                    type (q35/virt), firmware (OVMF/AAVMF), and serial console
+#                    (ttyS0/ttyAMA0). Defaults to the host architecture.
 #   --workdir=DIR    Scratch directory (default: /tmp/kexec-wipe-full-test)
 #   --port=N         Host ssh forward port (default: 2222)
 #   --mem=MB         Guest RAM (default: 8192)
+#   --disk-size=S    Virtual NVMe size (default: 12G; the qcow2 is sparse)
 #   --skip-boot-check  Skip the clean-reboot + ssh verification phase
 #   --keep           Do not remove the workdir on exit
 #
@@ -42,7 +52,7 @@ MEM=8192
 DISK_SIZE=12G
 SKIP_BOOT_CHECK=0
 KEEP=0
-ARCH="x86_64"
+ARCH=""
 GUEST_USER="fedora"
 PROVISION_USER="fedora"
 
@@ -50,17 +60,61 @@ PROVISION_USER="fedora"
 # Host tooling / environment
 # ---------------------------------------------------------------------------
 
+# The arch determines which QEMU binary, machine type, firmware, and serial
+# console the guest uses. Default to the host architecture.
+host_arch_matching() {
+    case "$(uname -m)" in
+        aarch64|arm64) echo "aarch64" ;;
+        x86_64|amd64)  echo "x86_64" ;;
+        *) echo "ERROR: unsupported host architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+}
+
+qemu_bin() {
+    case "$ARCH" in
+        aarch64) echo "qemu-system-aarch64" ;;
+        *)       echo "qemu-system-x86_64" ;;
+    esac
+}
+
+# The virtio-net device name differs per machine type: q35 exposes PCIe
+# (virtio-net-pci), while the aarch64 virt machine expects an MMIO device.
+net_device() {
+    case "$ARCH" in
+        aarch64) echo "virtio-net-device" ;;
+        *)       echo "virtio-net-pci" ;;
+    esac
+}
+
+serial_console() {
+    case "$ARCH" in
+        aarch64) echo "ttyAMA0" ;;
+        *)       echo "ttyS0" ;;
+    esac
+}
+
 OVMF_CODE=""
 OVMF_VARS=""
 
 find_ovmf() {
-    for c in /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd; do
-        [ -f "$c" ] && { OVMF_CODE="$c"; break; }
-    done
-    for v in /usr/share/edk2/ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd; do
-        [ -f "$v" ] && { OVMF_VARS="$v"; break; }
-    done
-    [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ] || { echo "ERROR: OVMF firmware not found" >&2; exit 1; }
+    if [ "$ARCH" = "aarch64" ]; then
+        for c in /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/edk2/aarch64/AAVMF_CODE.fd; do
+            [ -f "$c" ] && { OVMF_CODE="$c"; break; }
+        done
+        for v in /usr/share/AAVMF/AAVMF_VARS.fd /usr/share/edk2/aarch64/AAVMF_VARS.fd; do
+            [ -f "$v" ] && { OVMF_VARS="$v"; break; }
+        done
+    else
+        for c in /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/OVMF/OVMF_CODE.fd; do
+            [ -f "$c" ] && { OVMF_CODE="$c"; break; }
+        done
+        for v in /usr/share/edk2/ovmf/OVMF_VARS.fd /usr/share/OVMF/OVMF_VARS.fd; do
+            [ -f "$v" ] && { OVMF_VARS="$v"; break; }
+        done
+    fi
+    local fw
+    [ "$ARCH" = "aarch64" ] && fw="AAVMF" || fw="OVMF"
+    [ -n "$OVMF_CODE" ] && [ -n "$OVMF_VARS" ] || { echo "ERROR: $fw firmware not found" >&2; exit 1; }
 }
 
 SSH_PUBKEY=""
@@ -79,8 +133,10 @@ find_ssh_key() {
 }
 
 require_tools() {
+    local qemu
+    qemu=$(qemu_bin)
     local missing=()
-    for t in qemu-system-x86_64 qemu-img curl sha256sum ssh cpio gzip genisoimage mkisofs xorriso; do
+    for t in "$qemu" qemu-img curl sha256sum ssh cpio gzip xz socat genisoimage mkisofs xorriso; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     # Need at least one iso tool; the check above is satisfied by any one of them.
@@ -162,6 +218,14 @@ make_disk() {
 
 make_seed() {
     echo "==> Building cloud-init seed ISO"
+    local console
+    console=$(serial_console)
+    # Tools the guest needs for wipe.sh's on-host initramfs build
+    # (initramfs/build.sh): nvme-cli, cpio, gzip, xz, and on aarch64 a static
+    # busybox (Fedora's busybox package is statically linked; on x86_64 the
+    # builder downloads an official static busybox directly instead).
+    local dw_pkgs="kexec-tools nvme-cli xz cpio gzip parted"
+    [ "$ARCH" = "aarch64" ] && dw_pkgs="${dw_pkgs} busybox"
     local seeddir="$WORKDIR/seed"
     rm -rf "$seeddir"
     mkdir -p "$seeddir"
@@ -184,9 +248,9 @@ chpasswd:
   expire: false
 ssh_pwauth: true
 runcmd:
-  - systemctl enable serial-getty@ttyS0.service
-  - grubby --update-kernel=ALL --args="console=ttyS0,115200n8" || true
-  - dnf -y install kexec-tools nvme-cli xz cpio gzip parted
+  - systemctl enable serial-getty@${console}.service
+  - grubby --update-kernel=ALL --args="console=${console},115200n8" || true
+  - dnf -y install $dw_pkgs
   - echo "PHASE1-SETUP-DONE"
 EOF
     printf 'instance-id: kexec-wipe-full-test\nlocal-hostname: qemu-host\n' > "$seeddir/meta-data"
@@ -206,15 +270,23 @@ boot_vm() {
     SERIAL_LOG="$WORKDIR/serial-$(date +%s).log"
     QEMU_MON="$WORKDIR/mon-$(date +%s).sock"
 
+    local qemu machine netdev
+    qemu=$(qemu_bin)
+    case "$ARCH" in
+        aarch64) machine="-machine virt,accel=kvm" ;;
+        *)       machine="-machine q35,accel=kvm" ;;
+    esac
+    netdev=$(net_device)
+
     local args=(
-        -machine q35,accel=kvm
+        "$machine"
         -cpu host -smp 4 -m "$MEM"
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
         -drive "if=pflash,format=raw,file=$pflash_vars"
         -drive "file=$WORKDIR/nvme.qcow2,if=none,id=nvme0"
         -device "nvme,serial=deadbeef,drive=nvme0"
         -netdev "user,id=net0,hostfwd=tcp::$PORT-:22"
-        -device virtio-net-pci,netdev=net0
+        -device "${netdev},netdev=net0"
         -serial "file:$SERIAL_LOG"
         -monitor "unix:$QEMU_MON,server,nowait"
         -nographic -no-reboot
@@ -223,8 +295,8 @@ boot_vm() {
         args+=(-drive "file=$WORKDIR/seed.iso,if=virtio,format=raw,readonly=on")
     fi
 
-    echo "==> Booting QEMU (seed=$with_seed)"
-    setsid nohup qemu-system-x86_64 "${args[@]}" >/dev/null 2>&1 &
+    echo "==> Booting QEMU (seed=$with_seed, arch=$ARCH)"
+    setsid nohup "$qemu" "${args[@]}" >/dev/null 2>&1 &
     QEMU_PID=$!
 }
 
@@ -280,7 +352,9 @@ prepare_guest() {
     # wipe.sh now builds its initramfs on the host (guest) at runtime, so no
     # prebuilt initramfs needs to be shipped or pointed at. Only the kexec
     # command line is patched so the wipe logs to the serial console.
-    sed -e 's|cmdline="root=/dev/ram rw quiet panic=10"|cmdline="root=/dev/ram rw quiet panic=10 console=ttyS0,115200n8"|' \
+    local console
+    console=$(serial_console)
+    sed -e "s|cmdline=\"root=/dev/ram rw quiet panic=10\"|cmdline=\"root=/dev/ram rw quiet panic=10 console=${console},115200n8\"|" \
         "$REPO_DIR/wipe.sh" \
         | root_ssh 'cat > /root/wipe.sh && chmod +x /root/wipe.sh && bash -n /root/wipe.sh'
 }
@@ -379,16 +453,18 @@ cleanup() {
 }
 
 usage() {
-    sed -n '2,32p' "$0"
+    sed -n '2,43p' "$0"
     exit 1
 }
 
 main() {
     while [ $# -gt 0 ]; do
         case "$1" in
+            --arch=*) ARCH="${1#--arch=}" ;;
             --workdir=*) WORKDIR="${1#--workdir=}" ;;
             --port=*) PORT="${1#--port=}" ;;
             --mem=*) MEM="${1#--mem=}" ;;
+            --disk-size=*) DISK_SIZE="${1#--disk-size=}" ;;
             --skip-boot-check) SKIP_BOOT_CHECK=1 ;;
             --keep) KEEP=1 ;;
             --help|-h) usage ;;
@@ -396,6 +472,12 @@ main() {
         esac
         shift
     done
+
+    [ -n "$ARCH" ] || ARCH=$(host_arch_matching)
+    case "$ARCH" in
+        x86_64|aarch64) ;;
+        *) echo "ERROR: unsupported arch '$ARCH' (use x86_64 or aarch64)" >&2; exit 1 ;;
+    esac
 
     require_tools
     find_ovmf

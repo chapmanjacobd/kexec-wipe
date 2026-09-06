@@ -284,19 +284,6 @@ sanitize_and_wait() {
 
 # --- Partition / filesystem helpers ------------------------------------
 
-# Wait for a partition device node to appear (e.g. after writing an image and
-# re-reading the partition table). Returns 0 when the device exists.
-wait_for_partition() {
-    local part="$1"
-    local timeout="${2:-10}"
-    local i=0
-    while [ "$i" -lt "$timeout" ] && [ ! -b "$part" ]; do
-        sleep 1
-        i=$((i + 1))
-    done
-    [ -b "$part" ]
-}
-
 # Detect filesystem type on a partition.  Tries busybox blkid with a few
 # retries; returns 1 if detection fails.
 detect_fs_type() {
@@ -335,9 +322,17 @@ write_fedora_image() {
     # fails.
     write_with_dd() {
         local dec="$1"
-        ( $dec | dd of="$dev" bs=4M conv=fsync status=none ) 2>/dev/null \
-        || ( $dec | dd of="$dev" bs=4M conv=fsync ) \
-        || ( $dec | dd of="$dev" bs=4M ) || fatal "Failed to write Fedora image."
+        # A pipeline's exit status is that of the last command (dd), so without
+        # more a truncated/corrupt image would be masked by dd's success.
+        # Enable pipefail inside this subshell so the decompressor's failure is
+        # what triggers the fatal below. busybox ash supports pipefail; guard
+        # the option in case a build lacks it.
+        (
+            set -o pipefail 2>/dev/null || true
+            ( $dec | dd of="$dev" bs=4M conv=fsync status=none ) 2>/dev/null \
+            || ( $dec | dd of="$dev" bs=4M conv=fsync ) \
+            || ( $dec | dd of="$dev" bs=4M )
+        ) || fatal "Failed to write Fedora image."
     }
     if command -v xz >/dev/null 2>&1; then
         write_with_dd "xz -dc $xzfile"

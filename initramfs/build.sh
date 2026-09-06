@@ -46,14 +46,19 @@ install_busybox() {
 
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
         echo "Building busybox static via Docker (arch: $(host_arch))..."
-        docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
+        # Run the container in an `if` so a failed build (missing applet,
+        # builder image, etc.) falls through to host busybox instead of dying
+        # under `set -e`.
+        if docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache busybox-static >/dev/null 2>&1
             cp /bin/busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /bin/busybox /output/bin/busybox 2>/dev/null
             chown -R $HOST_UID:$HOST_GID /output/bin/busybox
-        '
-        chmod +x "$BUILD_DIR/bin/busybox" && return 0
+        '; then
+            chmod +x "$BUILD_DIR/bin/busybox"
+            return 0
+        fi
         echo "Docker busybox build failed; falling back to host busybox."
     fi
 
@@ -181,6 +186,42 @@ copy_module_with_deps() {
     done
 }
 
+# Busybox modprobe cannot decompress module files, so expand any compressed
+# (.ko.xz/.ko.zst) modules that were staged and strip the compression suffix
+# from modules.dep, which busybox uses to resolve module paths. If a
+# decompressor is missing the module is left compressed and untouched in
+# modules.dep (busybox will simply be unable to load it, which is no worse
+# than before).
+decompress_staged_modules() {
+    local dst="$1"
+    local expanded=0
+    local mod plain tmp
+    while IFS= read -r mod; do
+        [ -n "$mod" ] || continue
+        plain="${mod%.xz}"
+        case "$mod" in
+            *.ko.xz)
+                tmp="${mod}.expanded"
+                xz -dc "$mod" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+                plain="${mod%.xz}"
+                ;;
+            *.ko.zst)
+                tmp="${mod}.expanded"
+                zstd -q -dc "$mod" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+                plain="${mod%.zst}"
+                ;;
+            *) continue ;;
+        esac
+        mv -f "$tmp" "$plain"
+        rm -f "$mod"
+        expanded=1
+    done < <(find "$dst/kernel" -type f \( -name '*.ko.xz' -o -name '*.ko.zst' \) 2>/dev/null)
+    if [ "$expanded" -eq 1 ]; then
+        # Not anchored to end-of-line: modules.dep entries end with ':'.
+        sed -E -i 's/\.(xz|zst)//g' "$dst/modules.dep" 2>/dev/null || true
+    fi
+}
+
 # Stage kernel filesystem modules (xfs/btrfs/ext4 and fat/vfat) and the NVMe
 # driver modules so the chroot bootloader step can mount the written Fedora
 # image (including its EFI System Partition) and so the target NVMe is visible
@@ -234,6 +275,8 @@ stage_fs_modules() {
             copy_module_with_deps "$mod" "$src" "$dst"
         done
     fi
+    # busybox modprobe cannot load compressed modules.
+    decompress_staged_modules "$dst"
 }
 
 parse_args() {

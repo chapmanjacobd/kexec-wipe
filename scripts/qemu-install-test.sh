@@ -4,8 +4,9 @@
 # emulated NVMe (test mode), install a fake "Fedora" image over HTTP, and boot
 # into the freshly written root.
 #
-# This mirrors the CI "QEMU Fedora install test" job but runs against a local
-# qemu + host kernel so it can be iterated without pushing to GitHub.
+# This is a LOCAL-only dev tool: a quick, synthetic stand-in for the full
+# install pipeline. CI runs the real thing instead
+# (scripts/qemu-full-install-test.sh, which installs actual Fedora).
 #
 # Usage:
 #   ./initramfs/build.sh --output=/tmp/initramfs.cpio.gz

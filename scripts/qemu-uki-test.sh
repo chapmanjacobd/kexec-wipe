@@ -12,8 +12,10 @@
 #
 # This must run on an aarch64 host: it embeds the host kernel in the UKI and
 # relies on the host kexec-tools being able to unpack a UKI (arm64 support
-# landed in kexec-tools 2.0.30). The CI runs it on ubuntu-26.04-arm, whose
-# distro kexec-tools is new enough. It is intentionally not run on x86_64
+# landed in kexec-tools 2.0.30). This is a LOCAL-only dev tool; CI no longer
+# runs it. CI exercises the real UKI boot path instead via the aarch64 Fedora
+# install test (scripts/qemu-full-install-test.sh), whose Fedora Cloud guest
+# boots Unified Kernel Images on arm64. It is intentionally not used on x86_64
 # (Ubuntu LTS x86_64 runners still ship kexec-tools without UKI support).
 #
 # Requires: an aarch64 host, qemu-system-aarch64, busybox, kexec-tools,

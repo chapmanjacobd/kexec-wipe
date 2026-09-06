@@ -155,15 +155,37 @@ is_root_device() {
     # Walk up to the whole-disk device backing the root mount. A single lsblk
     # PKNAME hop is not enough when the root sits on a dm/partition (e.g. LVM
     # on nvme0n1p2), so walk until lsblk reports no further parent.
+    #
+    # lsblk reports no PKNAME for stacked devices like MD RAID (md0: the array
+    # "owns" its members as slaves, not as a parent), so when PKNAME is empty
+    # follow the device's sysfs "slaves" instead to get back to a real disk.
     local parent=""
     local node="$src"
     local hops=8
     while [ "$hops" -gt 0 ]; do
-        local p
+        local p slave
         p=$(lsblk -n -o PKNAME "$node" 2>/dev/null | head -1) || true
-        [ -n "$p" ] || break
-        parent="$p"
-        node="/dev/$p"
+        if [ -n "$p" ]; then
+            parent="$p"
+            node="/dev/$p"
+        else
+            # No PKNAME: either a stacked device (MD/dm) or a whole disk with no
+            # parent. dm devices already resolve via PKNAME above, so this is
+            # normally an MD array; walk its first slave (typically a partition
+            # of the backing disk). A whole disk has no slaves either, so the
+            # loop then ends.
+            local sdir
+            sdir="/sys/block/$(basename "$node")/slaves"
+            slave=""
+            for s in "$sdir"/*; do
+                [ -e "$s" ] || break
+                slave=$(basename "$s")
+                break
+            done
+            [ -n "$slave" ] || break
+            parent="$slave"
+            node="/dev/$slave"
+        fi
         hops=$((hops - 1))
     done
 
@@ -315,12 +337,17 @@ $remaining"
     # a partition that is itself still in use) mean the device is not detached.
     # Check the whole disk and each of its partitions. A sysfs "holders" entry
     # that references this device is enough to refuse.
+    #
+    # Read holders from /sys/class/block, not /sys/block: /sys/block only lists
+    # whole disks, so "/sys/block/<part>/holders" does not exist for partitions
+    # (their kobjects live under /sys/block/<disk>/<part>). /sys/class/block
+    # covers every device including partitions and is the canonical location.
     local holders=""
     local node
     for node in "/dev/$devname" /dev/"$devname"p[0-9]*; do
         [ -b "$node" ] || continue
         local h
-        h=$(ls "/sys/block/$(basename "$node")/holders" 2>/dev/null || true)
+        h=$(ls "/sys/class/block/$(basename "$node")/holders" 2>/dev/null || true)
         if [ -n "$h" ]; then
             holders="$holders${holders:+ }$node: $h"
         fi
@@ -653,6 +680,10 @@ find_kernel() {
         "/boot/bzImage-${kver}"
         "/boot/vmlinux-${kver}"
         "/vmlinuz-${kver}"
+        # Fedora installs UKIs at /boot/efi/EFI/<product>/, while Debian-style
+        # systems that mount the ESP at /boot put them at /boot/EFI/<product>/.
+        "/boot/efi/EFI/fedora/linux-${kver}.efi"
+        "/boot/efi/EFI/fedora/vmlinuz-${kver}"
         "/boot/EFI/fedora/linux-${kver}.efi"
         "/boot/EFI/fedora/vmlinuz-${kver}"
     )
@@ -768,8 +799,9 @@ do_kexec_wipe() {
     # command is identical: kexec-tools unpacks a UKI's .linux section and loads
     # it as a plain kernel (arm64 support since 2.0.30, x86_64 since 2.0.31),
     # and when --initrd is given it replaces the UKI's embedded initrd so our
-    # wipe /init is the one that runs. Verified by the aarch64 QEMU UKI test in
-    # CI (ubuntu-26.04-arm).
+    # wipe /init is the one that runs. Exercised for real by the aarch64
+    # Fedora install test in CI (ubuntu-26.04-arm), whose Fedora Cloud guest
+    # boots UKIs and kexec's one via find_kernel above.
     info "Loading kernel into memory..."
     info "  Kernel:    $kernel"
     info "  Initramfs: $initramfs_path"
@@ -1083,19 +1115,6 @@ sanitize_and_wait() {
 
 # --- Partition / filesystem helpers ------------------------------------
 
-# Wait for a partition device node to appear (e.g. after writing an image and
-# re-reading the partition table). Returns 0 when the device exists.
-wait_for_partition() {
-    local part="$1"
-    local timeout="${2:-10}"
-    local i=0
-    while [ "$i" -lt "$timeout" ] && [ ! -b "$part" ]; do
-        sleep 1
-        i=$((i + 1))
-    done
-    [ -b "$part" ]
-}
-
 # Detect filesystem type on a partition.  Tries busybox blkid with a few
 # retries; returns 1 if detection fails.
 detect_fs_type() {
@@ -1134,9 +1153,17 @@ write_fedora_image() {
     # fails.
     write_with_dd() {
         local dec="$1"
-        ( $dec | dd of="$dev" bs=4M conv=fsync status=none ) 2>/dev/null \
-        || ( $dec | dd of="$dev" bs=4M conv=fsync ) \
-        || ( $dec | dd of="$dev" bs=4M ) || fatal "Failed to write Fedora image."
+        # A pipeline's exit status is that of the last command (dd), so without
+        # more a truncated/corrupt image would be masked by dd's success.
+        # Enable pipefail inside this subshell so the decompressor's failure is
+        # what triggers the fatal below. busybox ash supports pipefail; guard
+        # the option in case a build lacks it.
+        (
+            set -o pipefail 2>/dev/null || true
+            ( $dec | dd of="$dev" bs=4M conv=fsync status=none ) 2>/dev/null \
+            || ( $dec | dd of="$dev" bs=4M conv=fsync ) \
+            || ( $dec | dd of="$dev" bs=4M )
+        ) || fatal "Failed to write Fedora image."
     }
     if command -v xz >/dev/null 2>&1; then
         write_with_dd "xz -dc $xzfile"
@@ -1750,14 +1777,19 @@ install_busybox() {
 
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
         echo "Building busybox static via Docker (arch: $(host_arch))..."
-        docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
+        # Run the container in an `if` so a failed build (missing applet,
+        # builder image, etc.) falls through to host busybox instead of dying
+        # under `set -e`.
+        if docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
             apk add --no-cache busybox-static >/dev/null 2>&1
             cp /bin/busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /busybox.static /output/bin/busybox 2>/dev/null \
                 || cp /bin/busybox /output/bin/busybox 2>/dev/null
             chown -R $HOST_UID:$HOST_GID /output/bin/busybox
-        '
-        chmod +x "$BUILD_DIR/bin/busybox" && return 0
+        '; then
+            chmod +x "$BUILD_DIR/bin/busybox"
+            return 0
+        fi
         echo "Docker busybox build failed; falling back to host busybox."
     fi
 
@@ -1885,6 +1917,42 @@ copy_module_with_deps() {
     done
 }
 
+# Busybox modprobe cannot decompress module files, so expand any compressed
+# (.ko.xz/.ko.zst) modules that were staged and strip the compression suffix
+# from modules.dep, which busybox uses to resolve module paths. If a
+# decompressor is missing the module is left compressed and untouched in
+# modules.dep (busybox will simply be unable to load it, which is no worse
+# than before).
+decompress_staged_modules() {
+    local dst="$1"
+    local expanded=0
+    local mod plain tmp
+    while IFS= read -r mod; do
+        [ -n "$mod" ] || continue
+        plain="${mod%.xz}"
+        case "$mod" in
+            *.ko.xz)
+                tmp="${mod}.expanded"
+                xz -dc "$mod" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+                plain="${mod%.xz}"
+                ;;
+            *.ko.zst)
+                tmp="${mod}.expanded"
+                zstd -q -dc "$mod" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+                plain="${mod%.zst}"
+                ;;
+            *) continue ;;
+        esac
+        mv -f "$tmp" "$plain"
+        rm -f "$mod"
+        expanded=1
+    done < <(find "$dst/kernel" -type f \( -name '*.ko.xz' -o -name '*.ko.zst' \) 2>/dev/null)
+    if [ "$expanded" -eq 1 ]; then
+        # Not anchored to end-of-line: modules.dep entries end with ':'.
+        sed -E -i 's/\.(xz|zst)//g' "$dst/modules.dep" 2>/dev/null || true
+    fi
+}
+
 # Stage kernel filesystem modules (xfs/btrfs/ext4 and fat/vfat) and the NVMe
 # driver modules so the chroot bootloader step can mount the written Fedora
 # image (including its EFI System Partition) and so the target NVMe is visible
@@ -1938,6 +2006,8 @@ stage_fs_modules() {
             copy_module_with_deps "$mod" "$src" "$dst"
         done
     fi
+    # busybox modprobe cannot load compressed modules.
+    decompress_staged_modules "$dst"
 }
 
 parse_args() {
