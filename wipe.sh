@@ -11,7 +11,7 @@
 #
 set -euo pipefail
 
-WIPE_VERSION="0.2.6"
+WIPE_VERSION="0.2.7"
 
 # --- begin lib/common.sh ---
 #!/bin/bash
