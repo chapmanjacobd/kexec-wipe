@@ -272,17 +272,33 @@ boot_vm() {
     SERIAL_LOG="$WORKDIR/serial-$(date +%s).log"
     QEMU_MON="$WORKDIR/mon-$(date +%s).sock"
 
-    local qemu machine netdev
+    local qemu machine netdev accel cpu
     qemu=$(qemu_bin)
+    # GitHub-hosted runners may not expose a usable /dev/kvm: ARM64 runners
+    # have none, and x86_64 runners ship it root:kvm 660 (the CI workflow chmod's
+    # it). When the runner user can't open it, fall back to TCG so the test can
+    # still at least boot. Use KVM whenever it is actually usable.
+    accel="kvm"
+    cpu="host"
+    if [ ! -r /dev/kvm ] || ! "$qemu" -accel kvm -machine none -nodefaults -display none \
+           </dev/null >/dev/null 2>&1; then
+        echo "==>  /dev/kvm not usable; falling back to TCG (software emulation)"
+        accel="tcg"
+        if [ "$ARCH" = "aarch64" ]; then
+            cpu="cortex-a57"
+        else
+            cpu="max"
+        fi
+    fi
     case "$ARCH" in
-        aarch64) machine="-machine virt,accel=kvm" ;;
-        *)       machine="-machine q35,accel=kvm" ;;
+        aarch64) machine="-machine virt,accel=$accel" ;;
+        *)       machine="-machine q35,accel=$accel" ;;
     esac
     netdev=$(net_device)
 
     local args=(
         "$machine"
-        -cpu host -smp 4 -m "$MEM"
+        -cpu "$cpu" -smp 4 -m "$MEM"
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
         -drive "if=pflash,format=raw,file=$pflash_vars"
         -drive "file=$WORKDIR/nvme.qcow2,if=none,id=nvme0"

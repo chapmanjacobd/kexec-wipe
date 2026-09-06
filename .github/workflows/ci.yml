@@ -102,33 +102,6 @@ jobs:
 
           echo "Initramfs verification passed."
 
-      - name: Install QEMU
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 linux-image-generic \
-            kexec-tools systemd-boot busybox-static
-
-      - name: QEMU smoke test
-        run: |
-          KERNEL=$(ls /boot/vmlinuz-* | head -1)
-          echo "Using kernel: $KERNEL"
-          sudo cp "$KERNEL" /tmp/vmlinuz
-          sudo chmod 644 /tmp/vmlinuz
-
-          timeout 30 qemu-system-x86_64 \
-            -kernel /tmp/vmlinuz \
-            -initrd /tmp/initramfs-docker.cpio.gz \
-            -append "console=ttyS0 kexec_wipe_dev=/dev/nvme0n1 kexec_wipe_method=auto" \
-            -nographic -no-reboot -m 512 \
-            > /tmp/serial.log 2>&1 || true
-
-          echo "--- Serial output ---"
-          cat /tmp/serial.log
-          echo "--- End serial output ---"
-
-          grep -q "kexec-wipe initramfs" /tmp/serial.log
-          echo "QEMU smoke test passed."
-
   # Real Fedora end-to-end install tests (scripts/qemu-full-install-test.sh):
   # boot an actual Fedora Cloud guest, run the real wipe.sh inside it, install
   # real Fedora onto a virtual NVMe, reboot, and verify ssh works.
@@ -159,6 +132,15 @@ jobs:
           mkdir -p "$HOME/.ssh"
           if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
             ssh-keygen -t ed25519 -N '' -f "$HOME/.ssh/id_ed25519"
+          fi
+
+      # x86_64 runners expose /dev/kvm but it is root:kvm 660 by default, so
+      # grant the runner user access. ARM64 runners have no /dev/kvm at all;
+      # then the test script's TCG fallback kicks in.
+      - name: Enable KVM access
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm
           fi
 
       - name: Real Fedora install test (${{ matrix.arch }})
