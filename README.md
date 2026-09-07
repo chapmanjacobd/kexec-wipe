@@ -108,7 +108,7 @@ CI exercises this mode end to end: the aarch64 job boots a Fedora Cloud aarch64 
 - `kexec-tools` (for the root device only; >= 2.0.30 when booting a UKI on aarch64)
 - `cpio`, `gzip`, and `find` (to build the initramfs on the host, for the root device)
 - `xz` (the initramfs builder decompresses the staged `.ko.xz` kernel modules with it)
-- `curl` (to fetch a static busybox for the initramfs), or Docker, or a `busybox` already installed on the host, plus network access
+- `curl` or `wget` (to fetch a static busybox for the initramfs), or Docker, or a `busybox` already installed on the host, plus network access
 - `bash` (the script is a bash script)
 - `awk` (to format byte sizes)
 - `stat` (to report the initramfs and image sizes)

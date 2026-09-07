@@ -573,9 +573,9 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
 #   - bash, cpio, gzip, find : build and pack the initramfs
 #   - xz                     : decompress the staged .ko.xz kernel modules
 #   - stat                   : report initramfs/image sizes
-#   - curl (or Docker or a host busybox) : obtain the static busybox for the
-#     initramfs; x86_64 fetches a prebuilt one with curl, otherwise it is
-#     built with Docker or copied from the host
+#   - curl/wget (or Docker or a host busybox) : obtain the static busybox for
+#     the initramfs; x86_64 fetches a prebuilt one, otherwise it is built with
+#     Docker or copied from the host
 # With --install-fedora the host also downloads and verifies the Fedora image:
 #   - curl or wget, sha256sum
 check_host_tools() {
@@ -587,9 +587,10 @@ check_host_tools() {
     done
 
     if ! command -v curl >/dev/null 2>&1 \
+       && ! command -v wget >/dev/null 2>&1 \
        && ! command -v docker >/dev/null 2>&1 \
        && ! command -v busybox >/dev/null 2>&1; then
-        missing+=("curl (to fetch a static busybox)")
+        missing+=("curl/wget (to fetch a static busybox)")
     fi
 
     if [ "$install" -eq 1 ]; then
@@ -1794,14 +1795,49 @@ host_arch() {
     esac
 }
 
+# Download the x86_64 prebuilt BusyBox with bounded retries and timeouts.
+# Keeping the download in a temporary file prevents a partial response from
+# being used as the initramfs binary.
+download_busybox() {
+    local output="$1"
+    local tmp="${output}.download"
+    rm -f "$tmp"
+
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 \
+            --retry-delay 2 --retry-max-time 90 "$BUSYBOX_URL" -o "$tmp" \
+            && [ -s "$tmp" ]; then
+            mv "$tmp" "$output"
+            return 0
+        fi
+        echo "curl could not download busybox; trying wget or another fallback." >&2
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q --timeout=10 --tries=3 -O "$tmp" "$BUSYBOX_URL" \
+            && [ -s "$tmp" ]; then
+            mv "$tmp" "$output"
+            return 0
+        fi
+        echo "wget could not download busybox; trying another fallback." >&2
+    fi
+
+    rm -f "$tmp"
+    return 1
+}
+
 # Obtain a busybox static binary matching the target architecture. The official
 # prebuilt static binaries only exist for x86_64, so other architectures (e.g.
 # aarch64) build from Alpine via Docker, falling back to host busybox.
 install_busybox() {
     echo "Installing busybox..."
 
-    if [ "$(host_arch)" = "x86_64" ] && command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$BUSYBOX_URL" -o "$BUILD_DIR/bin/busybox" && chmod +x "$BUILD_DIR/bin/busybox" && return 0
+    if [ "$(host_arch)" = "x86_64" ] \
+       && { command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; }; then
+        if download_busybox "$BUILD_DIR/bin/busybox"; then
+            chmod +x "$BUILD_DIR/bin/busybox"
+            return 0
+        fi
     fi
 
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then

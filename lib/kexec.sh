@@ -50,9 +50,9 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
 #   - bash, cpio, gzip, find : build and pack the initramfs
 #   - xz                     : decompress the staged .ko.xz kernel modules
 #   - stat                   : report initramfs/image sizes
-#   - curl (or Docker or a host busybox) : obtain the static busybox for the
-#     initramfs; x86_64 fetches a prebuilt one with curl, otherwise it is
-#     built with Docker or copied from the host
+#   - curl/wget (or Docker or a host busybox) : obtain the static busybox for
+#     the initramfs; x86_64 fetches a prebuilt one, otherwise it is built with
+#     Docker or copied from the host
 # With --install-fedora the host also downloads and verifies the Fedora image:
 #   - curl or wget, sha256sum
 check_host_tools() {
@@ -64,9 +64,10 @@ check_host_tools() {
     done
 
     if ! command -v curl >/dev/null 2>&1 \
+       && ! command -v wget >/dev/null 2>&1 \
        && ! command -v docker >/dev/null 2>&1 \
        && ! command -v busybox >/dev/null 2>&1; then
-        missing+=("curl (to fetch a static busybox)")
+        missing+=("curl/wget (to fetch a static busybox)")
     fi
 
     if [ "$install" -eq 1 ]; then
