@@ -1845,15 +1845,24 @@ install_busybox() {
         # Run the container in an `if` so a failed build (missing applet,
         # builder image, etc.) falls through to host busybox instead of dying
         # under `set -e`.
-        if docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -c '
-            apk add --no-cache busybox-static >/dev/null 2>&1
-            cp /bin/busybox.static /output/bin/busybox 2>/dev/null \
-                || cp /busybox.static /output/bin/busybox 2>/dev/null \
-                || cp /bin/busybox /output/bin/busybox 2>/dev/null
-            chown -R $HOST_UID:$HOST_GID /output/bin/busybox
+        if docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -ec '
+            apk add --no-cache busybox-static >/dev/null
+            mkdir -p /output/bin
+            busybox_path=""
+            for candidate in /bin/busybox.static /busybox.static /bin/busybox; do
+                if [ -x "$candidate" ]; then
+                    busybox_path="$candidate"
+                    break
+                fi
+            done
+            [ -n "$busybox_path" ]
+            cp "$busybox_path" /output/bin/busybox
+            chown "$HOST_UID:$HOST_GID" /output/bin/busybox
         '; then
-            chmod +x "$BUILD_DIR/bin/busybox"
-            return 0
+            if [ -s "$BUILD_DIR/bin/busybox" ]; then
+                chmod +x "$BUILD_DIR/bin/busybox"
+                return 0
+            fi
         fi
         echo "Docker busybox build failed; falling back to host busybox."
     fi
