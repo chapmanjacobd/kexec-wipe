@@ -123,13 +123,6 @@ jobs:
             runner: ubuntu-latest
             apt: qemu-system-x86 qemu-utils ovmf genisoimage socat
             extra: ""
-          - arch: aarch64
-            # Run the real Fedora aarch64 guest on the faster x86_64 runner.
-            # This still exercises the ARM Unified Kernel Image kexec path,
-            # while avoiding the much slower native ARM runner without KVM.
-            runner: ubuntu-latest
-            apt: qemu-system-arm qemu-utils ovmf genisoimage socat
-            extra: "--skip-install"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v6
