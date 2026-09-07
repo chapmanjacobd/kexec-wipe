@@ -2,7 +2,7 @@
 
 kexec-wipe permanently destroys the data on an NVMe device. It uses the NVMe `sanitize` command for the operation. It works on a device that holds the root filesystem of the running system and on a device that does not. The option `--install-fedora` also writes a Fedora image to the device after the sanitize.
 
-## Quick start
+## Quick Wipe
 
 ```bash
 curl -sL -o wipe.sh https://raw.githubusercontent.com/chapmanjacobd/kexec-wipe/main/wipe.sh
