@@ -326,7 +326,7 @@ boot_vm() {
     SERIAL_LOG="$WORKDIR/serial-$(date +%s).log"
     QEMU_MON="$WORKDIR/mon-$(date +%s).sock"
 
-    local qemu machine netdev accel cpu
+    local qemu machine netdev accel cpu smp=4
     qemu=$(qemu_bin)
     # GitHub-hosted runners may not expose a usable /dev/kvm: ARM64 runners
     # have none, and x86_64 runners ship it root:kvm 660 until the CI workflow
@@ -341,7 +341,14 @@ boot_vm() {
         # translated during the install.
         # QEMU interprets an unqualified tb-size value in MiB.
         accel="tcg,thread=multi,tb-size=1024"
-        cpu="max"
+        if [ "$ARCH" = "aarch64" ]; then
+            cpu="cortex-a57"
+            # Older QEMU MTTCG builds can corrupt or deadlock multi-vCPU
+            # Fedora systemd boots under ARM emulation.
+            smp=1
+        else
+            cpu="max"
+        fi
         # Scale every wait budget: software-emulated guests boot and run many
         # times slower than under KVM, and ARM runner performance varies a lot
         # run to run.
@@ -356,7 +363,7 @@ boot_vm() {
     local args=(
         -machine "$machine"
         -accel "$accel"
-        -cpu "$cpu" -smp 4 -m "$MEM"
+        -cpu "$cpu" -smp "$smp" -m "$MEM"
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
         -drive "if=pflash,format=raw,file=$pflash_vars"
         -drive "file=$WORKDIR/nvme.qcow2,if=none,id=nvme0"
