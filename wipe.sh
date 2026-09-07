@@ -589,8 +589,10 @@ check_host_tools() {
     if ! command -v curl >/dev/null 2>&1 \
        && ! command -v wget >/dev/null 2>&1 \
        && ! command -v docker >/dev/null 2>&1 \
-       && ! command -v busybox >/dev/null 2>&1; then
-        missing+=("curl/wget (to fetch a static busybox)")
+       && ! command -v busybox >/dev/null 2>&1 \
+       && ! command -v apt-get >/dev/null 2>&1 \
+       && ! command -v dnf >/dev/null 2>&1; then
+        missing+=("curl/wget/dnf/apt/docker (to fetch a static busybox)")
     fi
 
     if [ "$install" -eq 1 ]; then
@@ -1781,7 +1783,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 OUTPUT=""
-BUSYBOX_URL="https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox"
+ALPINE_CDN="https://dl-cdn.alpinelinux.org/alpine/latest-stable"
 USE_DOCKER=1
 BUILD_DIR=""
 
@@ -1795,51 +1797,169 @@ host_arch() {
     esac
 }
 
-# Download the x86_64 prebuilt BusyBox with bounded retries and timeouts.
-# Keeping the download in a temporary file prevents a partial response from
-# being used as the initramfs binary.
-download_busybox() {
-    local output="$1"
-    local tmp="${output}.download"
-    rm -f "$tmp"
-
+# Fetch a URL to stdout (curl preferred, wget fallback). Returns 0 on success.
+http_get() {
+    local url="$1"
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 \
-            --retry-delay 2 --retry-max-time 90 "$BUSYBOX_URL" -o "$tmp" \
-            && [ -s "$tmp" ]; then
-            mv "$tmp" "$output"
-            return 0
-        fi
-        echo "curl could not download busybox; trying wget or another fallback." >&2
+        curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 \
+            --retry-delay 2 --retry-max-time 90 "$url" 2>/dev/null && return 0
     fi
-
     if command -v wget >/dev/null 2>&1; then
-        if wget -q --timeout=10 --tries=3 -O "$tmp" "$BUSYBOX_URL" \
-            && [ -s "$tmp" ]; then
-            mv "$tmp" "$output"
-            return 0
-        fi
-        echo "wget could not download busybox; trying another fallback." >&2
+        wget -q -O - --timeout=10 --tries=3 "$url" 2>/dev/null && return 0
     fi
-
-    rm -f "$tmp"
     return 1
 }
 
-# Obtain a busybox static binary matching the target architecture. The official
-# prebuilt static binaries only exist for x86_64, so other architectures (e.g.
-# aarch64) build from Alpine via Docker, falling back to host busybox.
+# Map the host architecture to the Alpine CDN architecture name.
+alpine_arch_name() {
+    case "$(host_arch)" in
+        x86_64)  echo "x86_64" ;;
+        aarch64) echo "aarch64" ;;
+        armv7l)  echo "armv7" ;;
+        armv6l|arm) echo "armhf" ;;
+        *)       host_arch ;;
+    esac
+}
+
+# Return 0 if the given file is a statically linked ELF executable. The
+# initramfs has no shared libraries, so a dynamic (or corrupt) busybox is
+# useless to us.
+busybox_is_static() {
+    local bin="$1"
+    # Must be a real ELF binary first (a flaky download can leave garbage).
+    [ -f "$bin" ] || return 1
+    local magic
+    magic=$(od -An -tx1 -N4 "$bin" 2>/dev/null | tr -d ' \n')
+    [ "$magic" = "7f454c46" ] || return 1
+    if command -v file >/dev/null 2>&1; then
+        # "statically linked" (classic non-PIE) or "static-pie linked" (modern
+        # busybox builds) both describe a fully static executable.
+        file -b "$bin" 2>/dev/null | grep -Eqi 'statically linked|static-pie'
+        return $?
+    fi
+    # Fallback: ldd exits non-zero for a static executable (no dynamic deps).
+    if command -v ldd >/dev/null 2>&1; then
+        if ldd "$bin" >/dev/null 2>&1; then
+            return 1
+        fi
+        return 0
+    fi
+    return 0
+}
+
+# Try to obtain a busybox binary via the host package manager. Debian/Ubuntu
+# ship busybox-static (statically linked); Fedora's busybox package is dynamic,
+# so the static check below rejects it and this tier falls through to the
+# Alpine CDN fallback. Needs sudo unless already root.
+install_busybox_via_pkg() {
+    local destdir="$1"
+    local maybe_sudo=""
+    if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 || return 1
+        maybe_sudo="sudo"
+    fi
+    local pkg_root
+    pkg_root=$(mktemp -d)
+
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "Fetching busybox-static via apt-get..."
+        # Refresh the package cache (harmless; also fine if this fails, the
+        # cached lists may already be good enough).
+        $maybe_sudo apt-get update -qq >/dev/null 2>&1 || true
+        if (cd "$pkg_root" && apt-get download -qq busybox-static >/dev/null 2>&1); then
+            local deb bb
+            deb=$(find "$pkg_root" -name 'busybox-static*.deb' -type f | head -1)
+            if [ -n "$deb" ] && command -v dpkg-deb >/dev/null 2>&1 \
+               && dpkg-deb -x "$deb" "$pkg_root/extracted" 2>/dev/null; then
+                bb=$(find "$pkg_root/extracted" -name busybox -type f | head -1)
+                if [ -n "$bb" ] && busybox_is_static "$bb"; then
+                    if cp "$bb" "$destdir" 2>/dev/null; then
+                        rm -rf "$pkg_root"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "Fetching busybox via dnf..."
+        if (cd "$pkg_root" && $maybe_sudo dnf -q download busybox >/dev/null 2>&1); then
+            local rpm bb
+            rpm=$(find "$pkg_root" -name 'busybox*.rpm' -type f | head -1)
+            if [ -n "$rpm" ] && command -v rpm2cpio >/dev/null 2>&1 \
+               && command -v cpio >/dev/null 2>&1; then
+                local rpm_name
+                rpm_name=$(basename "$rpm")
+                if (cd "$pkg_root" && rpm2cpio "$rpm_name" | cpio -idm --quiet >/dev/null 2>&1); then
+                    bb=$(find "$pkg_root" -path '*/bin/busybox' -type f | head -1)
+                    if [ -n "$bb" ] && busybox_is_static "$bb"; then
+                        if cp "$bb" "$destdir" 2>/dev/null; then
+                            rm -rf "$pkg_root"
+                            return 0
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    rm -rf "$pkg_root"
+    return 1
+}
+
+# Download the Alpine busybox-static package directly from the CDN and extract
+# the statically linked binary from it. Alpine's CDN (dl-cdn.alpinelinux.org)
+# is far more reliable than busybox.net and needs no Docker. The package
+# version is resolved from the repository APKINDEX so no version is hardcoded,
+# and it needs no root (no chroot, no container).
+download_busybox_from_alpine() {
+    local output="$1"
+    local arch
+    arch=$(alpine_arch_name)
+    local base="${ALPINE_CDN}/main/${arch}"
+
+    echo "Downloading busybox-static from Alpine CDN (${arch})..."
+
+    # `|| true` absorbs the benign EPIPE: curl keeps writing while tar stops at
+    # the end-of-archive marker (the APK has trailing padding). Real success is
+    # judged by the extracted file below, not the pipeline status.
+    local ver
+    ver=$(http_get "${base}/APKINDEX.tar.gz" | tar -xzO APKINDEX 2>/dev/null \
+          | awk '/^P:busybox-static$/ { f=1; next } f && /^V:/ { sub(/^V:/, ""); print; exit }' \
+          || true)
+    if [ -z "$ver" ]; then
+        echo "Could not resolve busybox-static version from the Alpine APKINDEX." >&2
+        return 1
+    fi
+
+    local extract_dir
+    extract_dir=$(mktemp -d)
+    http_get "${base}/busybox-static-${ver}.apk" | tar -xz -C "$extract_dir" 2>/dev/null || true
+    local bb="$extract_dir/bin/busybox.static"
+    if busybox_is_static "$bb" && cp "$bb" "$output" 2>/dev/null; then
+        rm -rf "$extract_dir"
+        return 0
+    fi
+    echo "busybox.static not found or not a static ELF in the extracted APK." >&2
+    rm -rf "$extract_dir"
+    return 1
+}
+
+# Obtain a busybox static binary matching the target architecture. The primary
+# source is Alpine's busybox-static package (all architectures, verified static,
+# reliable CDN); Docker, the host package manager and a host busybox are
+# fallbacks.
 install_busybox() {
     echo "Installing busybox..."
 
-    if [ "$(host_arch)" = "x86_64" ] \
-       && { command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; }; then
-        if download_busybox "$BUILD_DIR/bin/busybox"; then
+    # Tier 1: Alpine busybox-static APK straight from the CDN (all arches).
+    if { command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; }; then
+        if download_busybox_from_alpine "$BUILD_DIR/bin/busybox"; then
             chmod +x "$BUILD_DIR/bin/busybox"
             return 0
         fi
     fi
 
+    # Tier 2: build from Alpine via Docker.
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
         echo "Building busybox static via Docker (arch: $(host_arch))..."
         # Run the container in an `if` so a failed build (missing applet,
@@ -1864,9 +1984,16 @@ install_busybox() {
                 return 0
             fi
         fi
-        echo "Docker busybox build failed; falling back to host busybox."
+        echo "Docker busybox build failed; trying another fallback."
     fi
 
+    # Tier 3: host package manager (apt-get / dnf).
+    if install_busybox_via_pkg "$BUILD_DIR/bin/busybox"; then
+        chmod +x "$BUILD_DIR/bin/busybox"
+        return 0
+    fi
+
+    # Tier 4: host busybox binary (may or may not be static).
     if command -v busybox >/dev/null 2>&1; then
         cp "$(command -v busybox)" "$BUILD_DIR/bin/busybox"
         chmod +x "$BUILD_DIR/bin/busybox"

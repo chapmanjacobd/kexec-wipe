@@ -66,8 +66,10 @@ check_host_tools() {
     if ! command -v curl >/dev/null 2>&1 \
        && ! command -v wget >/dev/null 2>&1 \
        && ! command -v docker >/dev/null 2>&1 \
-       && ! command -v busybox >/dev/null 2>&1; then
-        missing+=("curl/wget (to fetch a static busybox)")
+       && ! command -v busybox >/dev/null 2>&1 \
+       && ! command -v apt-get >/dev/null 2>&1 \
+       && ! command -v dnf >/dev/null 2>&1; then
+        missing+=("curl/wget/dnf/apt/docker (to fetch a static busybox)")
     fi
 
     if [ "$install" -eq 1 ]; then
