@@ -1648,7 +1648,6 @@ def install_local_payload(stage: Path, device: str) -> None:
                 check=False,
                 timeout=60,
                 die_on_timeout=False,
-                capture_output=True,
             )
             if mounted.returncode != 0:
                 continue
