@@ -20,11 +20,18 @@ kernel (x86) or reboots (arm64/Raspberry Pi).  The first-boot unit installs
 IIAB from the requested PR using vars/local_vars_tiny.yml and then runs the
 PR's changed roles.
 
+With --local-device, the script instead behaves like a Raspberry Pi image
+writer: it writes a local raw image to a USB or microSD device, mounts the
+new filesystems, injects the same cloud-init and first-boot payload, and
+leaves the device ready to boot.  This mode does not use SSH or kexec.
+
 Examples:
   ./iiab_deploy.py 192.168.1.219 4543
   ./iiab_deploy.py xk@box 4543 --yes --hostname box --disk /dev/nvme0n1
   ./iiab_deploy.py 192.168.1.219 https://github.com/iiab/iiab/pull/4543 \\
       --roles 0-init,7-edu-apps,network,zimantic --netburn
+  sudo ./iiab_deploy.py --local-device /dev/disk/by-path/... \\
+      --image ~/Downloads/2026-10-06-raspios-trixie-arm64-lite.img.xz 4543
 
 This tool is intentionally a single file so it can be copied to another
 machine.  The remote shell payloads are embedded near the bottom.
@@ -762,6 +769,41 @@ class ImageInfo:
     compression: str  # xz | gzip | zstd | qcow2 | none
 
 
+def local_image_info(path_text: str) -> tuple[Path, ImageInfo]:
+    path = Path(path_text).expanduser()
+    if not path.is_file():
+        die(f"local image not found: {path}")
+    name = path.name.lower()
+    if name.endswith(".xz"):
+        compression = "xz"
+    elif name.endswith((".gz", ".gzip")):
+        compression = "gzip"
+    elif name.endswith((".zst", ".zstd")):
+        compression = "zstd"
+    elif name.endswith((".qcow2", ".qcow")):
+        die("local-device mode accepts raw images, not qcow2; convert it first")
+    else:
+        compression = "none"
+    sha256 = ""
+    for checksum_path in (
+        Path(str(path) + ".sha256"),
+        path.with_suffix(".sha256"),
+    ):
+        if not checksum_path.is_file():
+            continue
+        fields = checksum_path.read_text(encoding="utf-8").split()
+        if not fields or not re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]):
+            die(f"invalid SHA-256 checksum file: {checksum_path}")
+        sha256 = fields[0]
+        break
+    return path.resolve(), ImageInfo(
+        label=path.name,
+        url=str(path.resolve()),
+        sha256=sha256,
+        compression=compression,
+    )
+
+
 def choose_image(profile: str, arch: str) -> ImageInfo:
     if profile == "rpi":
         if arch in ("aarch64", "arm64", "armv7l"):
@@ -1217,6 +1259,41 @@ def rewrite_network_config(
     return out, notes
 
 
+def normalize_local_network_config(text: str) -> str:
+    """Normalize a local NoCloud config without renaming its interfaces."""
+    yaml = _load_yaml()
+    if yaml is None:
+        return text
+    try:
+        data = yaml.safe_load(text) or {}
+    except Exception as e:
+        die(f"failed to parse network-config as YAML: {e}")
+    if not isinstance(data, dict):
+        die("network-config must be a YAML mapping")
+    if isinstance(data.get("network"), dict):
+        outer = data
+        data = dict(outer["network"])
+        extra = sorted(set(outer) - {"network"})
+        if extra:
+            warn(
+                "network-config: ignoring top-level keys outside network: "
+                + ", ".join(extra)
+            )
+    version = data.get("version")
+    if version is not None and version != 2:
+        die(
+            "network-config must be version 2 "
+            f"(found version {version!r}); convert it before deploying"
+        )
+    data["version"] = 2
+    return yaml.safe_dump(
+        data,
+        sort_keys=False,
+        default_flow_style=False,
+        width=1000,
+    )
+
+
 def choose_disk(
     probe: dict[str, Any], requested: Optional[str]
 ) -> tuple[str, dict[str, Any], bool]:
@@ -1262,6 +1339,406 @@ def choose_disk(
             for d in sorted(disks, key=lambda x: x["NAME"])
         )
     )
+
+
+def _device_mounts(device: str) -> list[tuple[str, str]]:
+    p = run(
+        ["lsblk", "-nrpo", "NAME,MOUNTPOINT", device],
+        check=False,
+        timeout=30,
+        die_on_timeout=False,
+    )
+    mounts: list[tuple[str, str]] = []
+    for line in (p.stdout or "").splitlines():
+        fields = line.split(None, 1)
+        if len(fields) == 2 and fields[1].strip() not in ("", "-"):
+            mounts.append((fields[0], fields[1].strip()))
+    return mounts
+
+
+def _root_disk_paths() -> Optional[set[str]]:
+    source = run(
+        ["findmnt", "-n", "-o", "SOURCE", "/"],
+        check=False,
+        timeout=30,
+        die_on_timeout=False,
+    ).stdout.strip()
+    if not source or not source.startswith("/dev/"):
+        return None
+    p = run(
+        ["lsblk", "-s", "-nrpo", "PATH,TYPE", source],
+        check=False,
+        timeout=30,
+        die_on_timeout=False,
+    )
+    if p.returncode != 0:
+        return None
+    paths: set[str] = set()
+    for line in (p.stdout or "").splitlines():
+        fields = line.rsplit(None, 1)
+        if len(fields) == 2 and fields[1] == "disk":
+            paths.add(os.path.realpath(fields[0]))
+    return paths or None
+
+
+def validate_local_device(requested: str) -> tuple[str, dict[str, Any]]:
+    """Validate and describe a local whole disk before writing it."""
+    if os.geteuid() != 0:
+        die("--local-device mode must run as root (use sudo)")
+    device = os.path.realpath(os.path.expanduser(requested))
+    if not os.path.exists(device):
+        die(f"local device not found: {requested}")
+    kind = run(
+        ["lsblk", "-dnpo", "TYPE", device],
+        check=False,
+        timeout=30,
+        die_on_timeout=False,
+    ).stdout.strip()
+    if kind != "disk":
+        die(f"{requested} is not a whole disk (lsblk type: {kind or 'unknown'})")
+    root_disks = _root_disk_paths()
+    if root_disks is None:
+        die("could not determine the running system's root disk; refusing to write")
+    if device in root_disks:
+        die(f"refusing to overwrite the disk containing this system's root: {device}")
+    mounts = _device_mounts(device)
+    if mounts:
+        die(
+            "local device has mounted partitions; unmount them first:\n"
+            + "\n".join(f"  {part} -> {mount}" for part, mount in mounts)
+        )
+    fields = dict(
+        re.findall(
+            r'(\w+)="([^"]*)"',
+            run(
+                [
+                    "lsblk",
+                    "-dnP",
+                    "-b",
+                    "-o",
+                    "NAME,TYPE,SIZE,MODEL,TRAN",
+                    device,
+                ],
+                check=True,
+                timeout=30,
+            ).stdout,
+        )
+    )
+    fields["NAME"] = Path(device).name
+    fields["PATH"] = device
+    return device, fields
+
+
+def _local_partitions(device: str) -> list[dict[str, str]]:
+    p = run(
+        ["lsblk", "-J", "-o", "PATH,TYPE,FSTYPE", device],
+        check=True,
+        timeout=30,
+    )
+    try:
+        data = json.loads(p.stdout)
+    except json.JSONDecodeError as e:
+        die(f"could not parse lsblk output for {device}: {e}")
+    out: list[dict[str, str]] = []
+
+    def visit(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "part" and item.get("path"):
+                out.append(
+                    {
+                        "path": str(item["path"]),
+                        "fstype": str(item.get("fstype") or ""),
+                    }
+                )
+            visit(item.get("children"))
+
+    visit(data.get("blockdevices"))
+    return out
+
+
+def _local_fstype(path: str, hinted: str) -> str:
+    if hinted:
+        return hinted
+    return run(
+        ["blkid", "-o", "value", "-s", "TYPE", path],
+        check=False,
+        timeout=30,
+        die_on_timeout=False,
+    ).stdout.strip()
+
+
+def _local_decompressor(compression: str) -> str:
+    command = {
+        "xz": "xz",
+        "gzip": "gzip",
+        "zstd": "zstd",
+    }.get(compression, "")
+    if not command or not shutil.which(command):
+        die(f"{command or compression} is required for local image handling")
+    return command
+
+
+def _local_raw_size(image_path: Path, compression: str) -> int:
+    if compression == "none":
+        return image_path.stat().st_size
+    command = _local_decompressor(compression)
+    reader = subprocess.Popen(
+        [command, "-dc", str(image_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if reader.stdout is None:
+        die(f"could not decompress {image_path.name}")
+    size = 0
+    for chunk in iter(lambda: reader.stdout.read(8 * 1024 * 1024), b""):
+        size += len(chunk)
+    reader.stdout.close()
+    rc = reader.wait()
+    if rc != 0:
+        die(f"decompressing {image_path.name} failed (exit {rc})")
+    return size
+
+
+def write_local_image(
+    image_path: Path,
+    device: str,
+    compression: str,
+    expected_sha256: str,
+    disable_verify: bool,
+) -> None:
+    if expected_sha256 and not disable_verify:
+        log(f"verifying {image_path}")
+        verify_sha256(image_path, expected_sha256)
+    elif disable_verify:
+        warn("local image verification disabled")
+    else:
+        warn("no local image checksum supplied; writing without verification")
+
+    raw_size = _local_raw_size(image_path, compression)
+    disk_size_text = run(["blockdev", "--getsize64", device], timeout=30).stdout.strip()
+    try:
+        disk_size = int(disk_size_text)
+    except ValueError:
+        die(f"could not determine the size of {device}")
+    if raw_size <= 0:
+        die(f"local image is empty: {image_path}")
+    log(f"image: {format_bytes(raw_size)} raw; device: {format_bytes(disk_size)}")
+    if raw_size > disk_size:
+        die(
+            f"image ({raw_size} bytes) is larger than the target device "
+            f"({disk_size} bytes)"
+        )
+
+    decompressor: Optional[subprocess.Popen] = None
+    input_file: Any = None
+    source: Any = None
+    writer: Optional[subprocess.Popen] = None
+    try:
+        if compression == "none":
+            input_file = open(image_path, "rb")
+            source = input_file
+        else:
+            command = _local_decompressor(compression)
+            decompressor = subprocess.Popen(
+                [command, "-dc", str(image_path)],
+                stdout=subprocess.PIPE,
+            )
+            if decompressor.stdout is None:
+                die(f"could not decompress {image_path.name}")
+            source = decompressor.stdout
+
+        log(f"writing {image_path.name} to {device}")
+        writer = subprocess.Popen(
+            [
+                "dd",
+                f"of={device}",
+                "bs=4M",
+                "iflag=fullblock",
+                "conv=fsync",
+                "status=progress",
+            ],
+            stdin=source,
+        )
+        if decompressor is not None and decompressor.stdout is not None:
+            decompressor.stdout.close()
+        writer_rc = writer.wait()
+        decompressor_rc = decompressor.wait() if decompressor is not None else 0
+    finally:
+        if input_file is not None:
+            input_file.close()
+        if writer is not None and writer.poll() is None:
+            writer.terminate()
+        if decompressor is not None and decompressor.poll() is None:
+            decompressor.terminate()
+    if writer_rc != 0:
+        die(f"writing {device} failed (dd exit {writer_rc})")
+    if decompressor_rc != 0:
+        die(f"decompressing {image_path.name} failed (exit {decompressor_rc})")
+    run(["sync"], timeout=120)
+    run(
+        ["blockdev", "--rereadpt", device],
+        check=False,
+        timeout=30,
+        die_on_timeout=False,
+    )
+    if shutil.which("udevadm"):
+        run(["udevadm", "settle"], check=False, timeout=30, die_on_timeout=False)
+
+
+def install_local_payload(stage: Path, device: str) -> None:
+    """Mount a freshly-written image and install its first-boot payload."""
+    for part, mountpoint in _device_mounts(device):
+        run(["umount", mountpoint], check=False, timeout=30, die_on_timeout=False)
+    run(
+        ["blockdev", "--rereadpt", device],
+        check=False,
+        timeout=30,
+        die_on_timeout=False,
+    )
+    if shutil.which("udevadm"):
+        run(["udevadm", "settle"], check=False, timeout=30, die_on_timeout=False)
+    for part, mountpoint in _device_mounts(device):
+        run(["umount", mountpoint], check=False, timeout=30, die_on_timeout=False)
+
+    partitions = _local_partitions(device)
+    root_part = ""
+    boot_part = ""
+    for part in partitions:
+        fstype = _local_fstype(part["path"], part["fstype"])
+        if fstype in ("ext4", "ext3", "ext2", "xfs", "btrfs") and not root_part:
+            root_part = part["path"]
+        elif fstype in ("vfat", "fat", "fat16", "fat32", "msdos") and not boot_part:
+            boot_part = part["path"]
+    if not root_part:
+        die(f"could not find a Linux root partition on {device}")
+    if not boot_part:
+        die(f"could not find a FAT boot partition on {device}")
+
+    mount_dir = Path(tempfile.mkdtemp(prefix="iiab-deploy-local."))
+    root_dir = mount_dir / "root"
+    root_dir.mkdir()
+    boot_dir: Optional[Path] = None
+    root_mounted = False
+    boot_mounted = False
+    try:
+        run(["mount", "-o", "rw", root_part, str(root_dir)], timeout=60)
+        root_mounted = True
+        for candidate, markers in (
+            (
+                root_dir / "boot" / "firmware",
+                ("cmdline.txt", "config.txt", "start.elf", "start4.elf"),
+            ),
+            (
+                root_dir / "boot",
+                ("cmdline.txt", "config.txt", "start.elf", "start4.elf"),
+            ),
+            (root_dir / "boot" / "efi", ("EFI",)),
+        ):
+            candidate.mkdir(parents=True, exist_ok=True)
+            mounted = run(
+                ["mount", "-o", "rw", boot_part, str(candidate)],
+                check=False,
+                timeout=60,
+                die_on_timeout=False,
+                capture_output=True,
+            )
+            if mounted.returncode != 0:
+                continue
+            if any((candidate / marker).exists() for marker in markers):
+                boot_dir = candidate
+                boot_mounted = True
+                break
+            run(
+                ["umount", str(candidate)],
+                check=False,
+                timeout=60,
+                die_on_timeout=False,
+            )
+        if boot_dir is None:
+            die(f"could not identify the boot partition layout on {device}")
+        payload = stage / "payload"
+        run(["cp", "-a", f"{payload}/.", f"{root_dir}/"], timeout=120)
+
+        cloud = payload / "var/lib/iiab-deploy/cloudinit"
+        seed = root_dir / "var/lib/cloud/seed/nocloud"
+        seed.mkdir(parents=True, exist_ok=True)
+        for name in ("user-data", "meta-data", "network-config"):
+            source = cloud / name
+            if not source.is_file():
+                continue
+            shutil.copy2(source, seed / name)
+            shutil.copy2(source, boot_dir / name)
+
+        config = root_dir / "var/lib/iiab-deploy/config.env"
+        env: dict[str, str] = {}
+        if config.is_file():
+            for line in config.read_text(encoding="utf-8").splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    env[key] = value.strip("'\"")
+        hostname = env.get("HOSTNAME", "box")
+        (root_dir / "etc/hostname").write_text(hostname + "\n", encoding="utf-8")
+        hosts = root_dir / "etc/hosts"
+        host_text = hosts.read_text(encoding="utf-8") if hosts.is_file() else ""
+        host_lines = [
+            line for line in host_text.splitlines()
+            if not line.lstrip().startswith("127.0.1.1")
+        ]
+        host_lines.append(f"127.0.1.1\t{hostname}")
+        hosts.write_text("\n".join(host_lines) + "\n", encoding="utf-8")
+        machine_id = root_dir / "etc/machine-id"
+        if machine_id.exists():
+            machine_id.write_text("", encoding="utf-8")
+        dbus_machine_id = root_dir / "var/lib/dbus/machine-id"
+        if dbus_machine_id.exists() or dbus_machine_id.is_symlink():
+            dbus_machine_id.unlink()
+
+        for service in (
+            root_dir / "lib/systemd/system/ssh.service",
+            root_dir / "usr/lib/systemd/system/ssh.service",
+        ):
+            if not service.exists():
+                continue
+            wants = root_dir / "etc/systemd/system/multi-user.target.wants"
+            wants.mkdir(parents=True, exist_ok=True)
+            link = wants / "ssh.service"
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to("/" + service.relative_to(root_dir).as_posix())
+            break
+
+        (root_dir / "boot" / "ssh").touch()
+        (boot_dir / "ssh").touch()
+        cmdline = boot_dir / "cmdline.txt"
+        if cmdline.is_file():
+            text = cmdline.read_text(encoding="utf-8").strip()
+            text = text.replace("console=tty1", "console=tty0")
+            if "console=tty0" not in text:
+                text += " console=tty0"
+            if "console=ttyS0" not in text:
+                text += " console=ttyS0,115200"
+            cmdline.write_text(text + "\n", encoding="utf-8")
+        run(["sync"], timeout=120)
+    finally:
+        if boot_mounted:
+            run(
+                ["umount", str(boot_dir)],
+                check=False,
+                timeout=60,
+                die_on_timeout=False,
+            )
+        if root_mounted:
+            run(
+                ["umount", str(root_dir)],
+                check=False,
+                timeout=60,
+                die_on_timeout=False,
+            )
+        shutil.rmtree(mount_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3008,6 +3485,43 @@ def print_plan(
     print("This will overwrite the target disk.  There is no undo.")
     print("=" * 70)
 
+
+def print_local_plan(
+    *,
+    device: str,
+    disk_info: dict[str, Any],
+    image: ImageInfo,
+    pr: PRInfo,
+    hostname: str,
+    profile: str,
+    roles: list[str],
+    roles_override: bool,
+    post_user: str,
+) -> None:
+    print()
+    print("=" * 70)
+    print("IIAB local image plan")
+    print("=" * 70)
+    print(
+        f"Target device:  {device}  {format_bytes(disk_info.get('SIZE', 0))}  "
+        f"{disk_info.get('MODEL', '')}"
+    )
+    print(f"Image:          {image.url}")
+    print(f"Compression:    {image.compression}")
+    print(f"Checksum:       {image.sha256 or '<none supplied>'}")
+    print(f"New hostname:   {hostname}")
+    print(f"Profile:        {profile}")
+    print(f"PR:             {pr.url}  [{pr.state}{', draft' if pr.draft else ''}]")
+    print(f"PR ref:         {pr.merge_ref or pr.head_ref}")
+    print(f"Roles to run:   {' '.join(roles) or '<none>'}"
+          f"{' (override)' if roles_override else ' (auto)'}")
+    print(f"First-boot user: {post_user}")
+    print("First boot:     IIAB installation runs locally after the Pi boots")
+    print("=" * 70)
+    print("This will overwrite the target device.  There is no undo.")
+    print("=" * 70)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -3020,6 +3534,138 @@ def valid_hostname(name: str) -> bool:
         return False
     label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
     return bool(re.fullmatch(rf"{label}(?:\.{label})*", name))
+
+
+def run_local_mode(args: argparse.Namespace) -> int:
+    if args.netburn:
+        die("--netburn cannot be combined with --local-device")
+    if args.ip or args.gateway or args.dns:
+        die("--ip, --gateway, and --dns require an SSH target")
+    if not args.image:
+        die("--image is required with --local-device")
+    device, disk_info = validate_local_device(args.local_device)
+    image_path, image = local_image_info(args.image)
+    profile = "rpi" if args.profile == "auto" else args.profile
+    arch = "aarch64" if profile == "rpi" else "x86_64"
+
+    repo, pr_number = parse_pr_arg(args.pr)
+    log(f"resolving {repo}#{pr_number}")
+    pr = resolve_pr(repo, pr_number)
+    if not (pr.merge_ref or pr.head_ref):
+        die("could not determine a ref to fetch for the PR")
+
+    probe: dict[str, Any] = {
+        "HOSTNAME": "",
+        "OS_PRETTY": "local image",
+        "MODEL": "local media",
+        "ARCH": arch,
+        "ROOT_DISK": device,
+        "MEM_MB": "",
+        "FREE_MB": "",
+        "IP4": "",
+        "IP6": "",
+        "GATEWAY4": "",
+        "GATEWAY6": "",
+        "DNS4": "",
+    }
+    hostname = (args.hostname or "box").strip()
+    if not valid_hostname(hostname):
+        die(f"invalid hostname: {hostname!r}")
+    user_data_path = Path(args.cloudinit_userdata).expanduser()
+    network_path = Path(args.cloudinit_networkconfig).expanduser()
+    if not user_data_path.is_file():
+        die(f"missing {user_data_path}")
+    if not network_path.is_file():
+        die(f"missing {network_path}")
+    user_data = rewrite_user_data(
+        user_data_path.read_text(encoding="utf-8"), hostname
+    )
+    network_config = normalize_local_network_config(
+        network_path.read_text(encoding="utf-8")
+    )
+    post_user = args.post_user or parse_post_user(user_data, profile)
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*$", post_user):
+        die(f"invalid post-boot user name: {post_user!r}")
+    meta_data = (
+        f"instance-id: iiab-deploy-{hostname}-{int(time.time())}\n"
+        f"local-hostname: {hostname}\n"
+    )
+
+    if args.roles is not None:
+        raw_roles = [r for r in re.split(r"[\s,]+", args.roles) if r]
+        roles_override = True
+    else:
+        raw_roles = list(pr.auto_roles)
+        roles_override = False
+    roles: list[str] = []
+    seen: set[str] = set()
+    for role in raw_roles:
+        if not re.match(r"^[A-Za-z0-9_.-]+$", role) or ".." in role:
+            die(f"invalid role name: {role!r}")
+        if role not in seen:
+            seen.add(role)
+            roles.append(role)
+
+    print_local_plan(
+        device=device,
+        disk_info=disk_info,
+        image=image,
+        pr=pr,
+        hostname=hostname,
+        profile=profile,
+        roles=roles,
+        roles_override=roles_override,
+        post_user=post_user,
+    )
+    if not args.yes and not args.dry_run:
+        if not sys.stdin.isatty():
+            die("refusing to overwrite without --yes (stdin is not a TTY)")
+        answer = input(f"Type the target device path ({device}) to confirm: ")
+        if answer.strip() != device:
+            die("confirmation did not match; aborted")
+
+    stage: Optional[Path] = None
+    try:
+        stage = make_stage(
+            args=args,
+            probe=probe,
+            pr=pr,
+            image=image,
+            hostname=hostname,
+            post_user=post_user,
+            disk_dev=device,
+            is_root_disk=False,
+            roles=roles,
+            roles_override=roles_override,
+            user_data=user_data,
+            network_config=network_config,
+            meta_data=meta_data,
+            profile=profile,
+            netburn_url="",
+            netburn_image_size=0,
+        )
+        log(f"stage: {stage}")
+        if args.dry_run:
+            log("dry run: no changes made to the local device")
+            return 0
+        write_local_image(
+            image_path,
+            device,
+            image.compression,
+            image.sha256,
+            args.disable_verify,
+        )
+        install_local_payload(stage, device)
+        log(f"local image ready on {device}")
+        print(
+            "Boot the device when ready.  The IIAB first-boot installer will "
+            "run on the new system and write its log to "
+            f"{LOG_DIR}/firstboot.log."
+        )
+        return 0
+    finally:
+        if stage is not None and not args.keep_payload:
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def check_kexec_safety(probe: dict[str, Any]) -> None:
@@ -3047,6 +3693,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
           %(prog)s xk@box 4543 --yes --hostname box --disk /dev/nvme0n1
           %(prog)s 192.168.1.219 https://github.com/iiab/iiab/pull/4543 \\
               --roles 0-init,7-edu-apps,network,zimantic --netburn
+          sudo %(prog)s --local-device /dev/disk/by-path/... \\
+              --image ~/Downloads/raspios.img.xz 4543 --yes
 
         The target is reimaged with Raspberry Pi OS Lite arm64 when it is a
         Raspberry Pi, otherwise with the Ubuntu 26.04 cloud image.  Both use
@@ -3060,14 +3708,34 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     p = argparse.ArgumentParser(
         description=(
-            "Reimage an SSH-accessible machine and install IIAB from a PR."
+            "Reimage an SSH-accessible machine or local removable media and "
+            "install IIAB from a PR."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=epilog,
     )
-    p.add_argument("address", help="[user@]host[:port] of the target")
     p.add_argument(
-        "pr", help="PR number (4543) or full github.com/.../pull/4543 URL"
+        "address",
+        nargs="?",
+        help="[user@]host[:port] of the target (omit for --local-device)",
+    )
+    p.add_argument(
+        "pr",
+        nargs="?",
+        help="PR number (4543) or full github.com/.../pull/4543 URL",
+    )
+    p.add_argument(
+        "--local-device",
+        help="write a local image to this whole USB/microSD block device",
+    )
+    p.add_argument(
+        "--image",
+        help="local raw image (.img, .xz, .gz, or .zst) for --local-device",
+    )
+    p.add_argument(
+        "--disable-verify",
+        action="store_true",
+        help="skip local image checksum verification (no checksum is supplied by default)",
     )
     p.add_argument(
         "--yes", action="store_true", help="do not ask for hostname confirmation"
@@ -3202,7 +3870,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.local_device:
+        if args.address and args.pr:
+            p.error("--local-device accepts one PR positional and no target address")
+        if args.pr is None and args.address:
+            args.pr, args.address = args.address, None
+        if args.pr is None:
+            p.error("a PR number or URL is required")
+        if not args.image:
+            p.error("--image is required with --local-device")
+    elif not args.address or not args.pr:
+        p.error("address and PR are required unless --local-device is used")
+    return args
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -3211,6 +3891,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     server: Optional[ImageServer] = None
     args = parse_args(argv)
     try:
+        if args.local_device:
+            return run_local_mode(args)
         remote = parse_address(args.address)
         if args.identity:
             remote.identity = args.identity

@@ -80,6 +80,9 @@ A PR can be given as a number, `iiab/iiab#4543`, or a full URL:
   work through the unauthenticated GitHub API.
 - Network access to GitHub and to the image host
 - For `--netburn`: a TCP route from the target back to the control host
+- For `--local-device`: root privileges and local `lsblk`, `blkid`, `mount`,
+  `umount`, `dd`, `cp`, `sync`, and the image decompressor (`xz`, `gzip`, or
+  `zstd`) as applicable
 
 ### Target
 
@@ -170,6 +173,35 @@ before it starts waiting for SSH on the new system. If the target makes no
 transfer progress for 15 minutes, the tool reports the stall and continues
 waiting for SSH, which normally ends in exit code 2. The target is wiped just
 before streaming, so do not stop the tool while bytes are still flowing.
+
+### Local USB/microSD image writing
+
+Use `--local-device` when the USB or microSD device is attached to the machine
+where this script is running. This mode is a local replacement for Raspberry
+Pi Imager: it writes a raw Raspberry Pi image, mounts its root and boot
+partitions, copies the cloud-init NoCloud seed and IIAB first-boot service,
+then exits. It does not use SSH or kexec.
+
+```bash
+sudo ./iiab_deploy.py \
+    --local-device /dev/disk/by-path/pci-0000:00:14.0-usb-0:3:1.0-scsi-0:0:0:0 \
+    --image ~/Downloads/2026-10-06-raspios-trixie-arm64-lite.img.xz \
+    --disable-verify \
+    https://github.com/iiab/iiab/pull/4543 \
+    --cloudinit-userdata ~/.local/bin/cloudinit/user-data \
+    --cloudinit-networkconfig ~/.local/bin/cloudinit/network-config \
+    --skip-rpi-upgrade
+```
+
+The command refuses partitions, mounted target filesystems, and the disk
+containing the running system's root filesystem. It accepts raw `.img` files
+and `.xz`, `.gz`, or `.zst` compressed raw images, and requires `--yes` to
+skip the confirmation prompt. The target must be a whole Raspberry Pi OS
+image with a Linux root partition and a recognizable FAT boot partition. If
+`<image>.sha256` (or the same basename with a `.sha256` suffix) exists, it is
+used for verification; pass `--disable-verify` to skip that check.
+After the device boots, cloud-init creates the configured user and
+`iiab-deploy-firstboot.service` installs IIAB from the requested PR.
 
 ### Roles
 

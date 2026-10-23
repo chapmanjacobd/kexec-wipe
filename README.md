@@ -7,8 +7,8 @@ kexec-wipe permanently destroys the data on an NVMe device. It uses the NVMe `sa
 The repository also contains `iiab_deploy.py`, a separate Python tool that
 reimages an SSH-accessible machine and installs Internet-in-a-Box from an
 `iiab/iiab` pull request. It does not use the NVMe sanitize path. See
-[IIAB_DEPLOY.md](IIAB_DEPLOY.md) for usage, requirements, netburn mode, and
-caveats.
+[IIAB_DEPLOY.md](IIAB_DEPLOY.md) for usage, requirements, netburn mode, local
+USB/microSD image writing, and caveats.
 
 
 ## Quick Wipe
