@@ -56,14 +56,12 @@ import tempfile
 import textwrap
 import threading
 import time
-import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, NoReturn, Optional
+from typing import Any, NoReturn
 
 DEFAULT_REPO = "iiab/iiab"
 DEFAULT_SSH_PORT = 22
@@ -129,12 +127,12 @@ def die(msg: str, code: int = 1) -> NoReturn:
 def run(
     cmd: list[str],
     *,
-    input_text: Optional[str] = None,
-    input_bytes: Optional[bytes] = None,
+    input_text: str | None = None,
+    input_bytes: bytes | None = None,
     check: bool = True,
     capture: bool = True,
-    timeout: Optional[float] = None,
-    env: Optional[dict[str, str]] = None,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
     die_on_timeout: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run a local command, dying with a useful message on failure."""
@@ -229,9 +227,9 @@ def resolve_url(url: str, timeout: float = 60.0) -> str:
 @dataclass
 class Remote:
     host: str
-    user: Optional[str] = None
-    port: Optional[int] = None
-    identity: Optional[str] = None
+    user: str | None = None
+    port: int | None = None
+    identity: str | None = None
     is_root: bool = False
     can_sudo: bool = False
 
@@ -243,12 +241,12 @@ class Remote:
 
 
 def parse_address(s: str) -> Remote:
-    user: Optional[str] = None
+    user: str | None = None
     hostport = s
     if "@" in s:
         user, hostport = s.rsplit("@", 1)
     host = hostport
-    port: Optional[int] = None
+    port: int | None = None
     if hostport.startswith("["):
         m = re.match(r"^\[([^\]]+)\](?::(\d+))?$", hostport)
         if m:
@@ -304,7 +302,7 @@ def ssh_run(
     *,
     sudo: bool = False,
     check: bool = False,
-    timeout: Optional[float] = None,
+    timeout: float | None = None,
     insecure: bool = False,
     tty: bool = False,
 ) -> subprocess.CompletedProcess:
@@ -500,7 +498,7 @@ def is_raspberry_pi(probe: dict[str, Any]) -> bool:
     return "raspberry pi" in model or "bcm2" in model
 
 
-def rpi_arm64_capability(probe: dict[str, Any]) -> Optional[bool]:
+def rpi_arm64_capability(probe: dict[str, Any]) -> bool | None:
     """Return whether the Raspberry Pi hardware can boot arm64, if known."""
     compat = str(probe.get("RPI_COMPAT", "")).lower()
     if any(
@@ -597,7 +595,7 @@ def _github_api_json(url: str) -> Any:
         raise DeployError(f"GitHub API request failed: {url}: {e}") from e
 
 
-def _gh_pr_files(repo: str, number: int) -> Optional[list[str]]:
+def _gh_pr_files(repo: str, number: int) -> list[str] | None:
     """List every changed path, past gh's 100-file limit for ``pr view``."""
     if not _gh_available():
         return None
@@ -963,9 +961,9 @@ def primary_interface(probe: dict[str, Any]) -> str:
 def apply_network_overrides(
     probe: dict[str, Any],
     *,
-    ip: Optional[str] = None,
-    gateway: Optional[str] = None,
-    dns: Optional[str] = None,
+    ip: str | None = None,
+    gateway: str | None = None,
+    dns: str | None = None,
 ) -> dict[str, Any]:
     """Return a probe copy with user-supplied network values.
 
@@ -1295,7 +1293,7 @@ def normalize_local_network_config(text: str) -> str:
 
 
 def choose_disk(
-    probe: dict[str, Any], requested: Optional[str]
+    probe: dict[str, Any], requested: str | None
 ) -> tuple[str, dict[str, Any], bool]:
     """Return (device, lsblk fields, is_root_disk)."""
     disks = [
@@ -1313,8 +1311,7 @@ def choose_disk(
 
     if requested:
         name = requested
-        if name.startswith("/dev/"):
-            name = name[len("/dev/") :]
+        name = name.removeprefix("/dev/")
         name = name.split("/")[-1]
         if name not in by_name:
             die(
@@ -1356,7 +1353,7 @@ def _device_mounts(device: str) -> list[tuple[str, str]]:
     return mounts
 
 
-def _root_disk_paths() -> Optional[set[str]]:
+def _root_disk_paths() -> set[str] | None:
     source = run(
         ["findmnt", "-n", "-o", "SOURCE", "/"],
         check=False,
@@ -1537,10 +1534,10 @@ def write_local_image(
             f"({disk_size} bytes)"
         )
 
-    decompressor: Optional[subprocess.Popen] = None
+    decompressor: subprocess.Popen | None = None
     input_file: Any = None
     source: Any = None
-    writer: Optional[subprocess.Popen] = None
+    writer: subprocess.Popen | None = None
     try:
         if compression == "none":
             input_file = open(image_path, "rb")
@@ -1625,7 +1622,7 @@ def install_local_payload(stage: Path, device: str) -> None:
     mount_dir = Path(tempfile.mkdtemp(prefix="iiab-deploy-local."))
     root_dir = mount_dir / "root"
     root_dir.mkdir()
-    boot_dir: Optional[Path] = None
+    boot_dir: Path | None = None
     root_mounted = False
     boot_mounted = False
     try:
@@ -3046,7 +3043,7 @@ class ImageServer:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
 
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 path = self.path.split("?", 1)[0]
                 if path not in ("/", "/" + outer.filename, "/image.img.gz"):
                     self.send_error(404)
@@ -3118,9 +3115,7 @@ class ImageServer:
                 if now - last_log >= 10:
                     last_log = now
                     log(
-                        "netburn: served {:.0f}/{:.0f} MiB".format(
-                            min(sent / (1024 * 1024), total_mb), total_mb
-                        )
+                        f"netburn: served {min(sent / (1024 * 1024), total_mb):.0f}/{total_mb:.0f} MiB"
                     )
             elif now - last_change > stall_minutes * 60:
                 warn(
@@ -3257,7 +3252,7 @@ def prepare_netburn_image(
 
 def wait_for_ssh(
     candidates: list[Remote], timeout_minutes: int, deploy_id: str
-) -> Optional[Remote]:
+) -> Remote | None:
     deadline = time.time() + timeout_minutes * 60
     check = (
         f"test \"$(cat {shlex.quote(STATE_DIR + '/deploy-id')} 2>/dev/null)\" "
@@ -3289,13 +3284,13 @@ def follow_firstboot(
     timeout_minutes: int,
     show: bool,
     deploy_id: str,
-) -> tuple[Optional[dict[str, Any]], Optional[Remote]]:
+) -> tuple[dict[str, Any] | None, Remote | None]:
     log_path = f"{LOG_DIR}/firstboot.log"
     result_path = f"{STATE_DIR}/result.json"
     deadline = time.time() + timeout_minutes * 60
     offset = 0
     done = False
-    active: Optional[Remote] = candidates[0] if candidates else None
+    active: Remote | None = candidates[0] if candidates else None
 
     while active is not None and time.time() < deadline:
         marker = f"IIAB_DEPLOY_MARKER_{os.getpid()}_{int(time.time() * 1000)}"
@@ -3405,7 +3400,7 @@ exit 0
         return None, active
 
 
-def print_result(result: Optional[dict[str, Any]], remote: Remote) -> None:
+def print_result(result: dict[str, Any] | None, remote: Remote) -> None:
     print()
     print("=" * 70)
     if result:
@@ -3639,7 +3634,7 @@ def run_local_mode(args: argparse.Namespace) -> int:
         if answer.strip() != device:
             die("confirmation did not match; aborted")
 
-    stage: Optional[Path] = None
+    stage: Path | None = None
     try:
         stage = make_stage(
             args=args,
@@ -3693,14 +3688,14 @@ def check_kexec_safety(probe: dict[str, Any]) -> None:
     lockdown = str(probe.get("LOCKDOWN", ""))
     if "[integrity]" in lockdown or "[confidentiality]" in lockdown:
         die(
-            "kernel lockdown is active ({}); kexec is restricted.  "
-            "Disable lockdown/Secure Boot first.".format(lockdown)
+            f"kernel lockdown is active ({lockdown}); kexec is restricted.  "
+            "Disable lockdown/Secure Boot first."
         )
     if str(probe.get("KEXEC_DISABLED", "0")).strip() == "1":
         die("kernel.kexec_load_disabled=1 on the target; kexec is disabled.")
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     epilog = textwrap.dedent(
         """\
         Examples:
@@ -3900,10 +3895,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    args: Optional[argparse.Namespace] = None
-    stage: Optional[Path] = None
-    server: Optional[ImageServer] = None
+def main(argv: list[str] | None = None) -> int:
+    args: argparse.Namespace | None = None
+    stage: Path | None = None
+    server: ImageServer | None = None
     args = parse_args(argv)
     try:
         if args.local_device:
@@ -4209,7 +4204,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         die("interrupted")
     except DeployError as e:
         die(str(e))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         if getattr(args, "debug", False):
             raise
         die(f"unexpected error: {e}")
