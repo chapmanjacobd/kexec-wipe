@@ -44,9 +44,12 @@ A PR can be given as a number, `iiab/iiab#4543`, or a full URL:
    - **Raspberry Pi:** Raspberry Pi OS Lite **arm64**.
    - **Everything else:** Ubuntu 26.04 cloud image, x86_64 or arm64.
 4. Rewrites the cloud-init `network-config` to the target's real interface
-   names and pins the current IPv4 address, gateway, and DNS. The hostname is
-   written into `user-data`, `meta-data`, `/etc/hostname`, `/etc/hosts`, and
-   IIAB's `iiab_hostname`.
+   names and pins the current IPv4 address, gateway, and DNS. Both the plain
+   `version: 2` form and the netplan-style `network:` wrapper are accepted; the
+   output is normalized to the plain form cloud-init's NoCloud datasource
+   expects, and stale `match:`/`set-name:` selectors are dropped when a
+   placeholder interface is renamed. The hostname is written into `user-data`,
+   `meta-data`, `/etc/hostname`, `/etc/hosts`, and IIAB's `iiab_hostname`.
 5. Builds a stage containing the image (or an HTTP URL to it), the replacement
    initramfs `/init`, and the first-boot payload. The stage is uploaded to
    `/var/tmp/iiab-deploy`.
@@ -88,8 +91,48 @@ A PR can be given as a number, `iiab/iiab#4543`, or a full URL:
 - A wired network connection is strongly recommended. `--netburn` uses DHCP in
   the write-stage initramfs, so it cannot use a WiFi association.
 - Enough free space in `/var/tmp` for the embedded image. The default embedded
-  mode needs roughly twice the raw image size plus 1 GiB; use `--netburn` on
-  small disks or low-RAM systems.
+  mode needs room for the compressed download, the decompressed image, and the
+  gzip copy used by the initramfs; the tool checks each step before spending
+  the space and tells you to use `--netburn` if it is tight.
+
+### Cloud-init input
+
+The tool does not generate cloud-init data itself. It reads a `user-data` file
+and a `network-config` file (`--cloudinit-userdata` and
+`--cloudinit-networkconfig`, defaulting to
+`~/.local/bin/cloudinit/user-data` and `~/.local/bin/cloudinit/network-config`)
+and refuses to start if either file is missing.
+
+`user-data` must create the post-boot user, install the control host's SSH
+public key, and (for the log tail and result fetch) allow passwordless sudo.
+`--post-user` overrides the user name that is detected from the file.
+
+```yaml
+#cloud-config
+hostname: box
+users:
+  - name: xk
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA... you@control-host
+```
+
+`network-config` is network-config version 2. Interface IDs are placeholders
+(`eth0`, `wlan0`); they are renamed to the target's real NICs, so a minimal
+file is enough:
+
+```yaml
+version: 2
+ethernets:
+  eth0:
+    dhcp4: true
+```
+
+The netplan-style `network:` wrapper is also accepted and normalized to the
+plain form. When IPv4 pinning is enabled (the default), the pinned address
+replaces any static IPv4 in the template; with `--no-pin-ip`, static IPv4 is
+removed and DHCPv4 is enabled. Static IPv6 is preserved unless IPv6 pinning is
+active.
 
 ## Usage
 
@@ -101,7 +144,9 @@ A PR can be given as a number, `iiab/iiab#4543`, or a full URL:
 
 This probes the target, resolves the PR and image, rewrites the cloud-init
 files, builds the stage, prints the plan, and exits without touching the
-target. `--keep-payload` keeps the generated stage for inspection.
+target. `--keep-payload` keeps the generated stage for inspection. The dry run
+still needs SSH to the target, network access to GitHub and the image host, and
+passes the Secure Boot/kexec checks; only the disk is left alone.
 
 ### Netburn (HTTP image delivery)
 
@@ -119,8 +164,12 @@ The control host's address is detected from the route to the target. If that
 is wrong, set `--http-address`. For an IPv6 target, bind an IPv6 address (for
 example `--http-address ::`) and make sure the target can reach it.
 
-The control host must stay running until the image is written; the tool keeps
-the server alive while it waits for SSH and the first-boot result.
+The control host must stay running until the image is written. The tool keeps
+the server alive, logs transfer progress, and waits for the image to be served
+before it starts waiting for SSH on the new system. If the target makes no
+transfer progress for 15 minutes, the tool reports the stall and continues
+waiting for SSH, which normally ends in exit code 2. The target is wiped just
+before streaming, so do not stop the tool while bytes are still flowing.
 
 ### Roles
 
@@ -163,6 +212,10 @@ pinned by default. To leave IPv4 on DHCP:
 ./iiab_deploy.py 192.168.1.219 4543 --no-pin-ip
 ```
 
+`--no-pin-ip` removes any static IPv4 configuration inherited from
+`network-config` and enables DHCPv4; the plan notes when template addresses
+were cleared.
+
 To pin a different address, gateway, or DNS server, use explicit overrides.
 `--ip` requires a CIDR prefix because netplan needs both the address and the
 netmask:
@@ -174,7 +227,10 @@ netmask:
 
 `--no-pin-ip` wins if both it and an override are given. IPv6 is pinned only
 when a global address and a non-link-local default gateway are present.
-Disable it with `--no-pin-ipv6`.
+`--no-pin-ipv6` leaves the template's IPv6 configuration as-is and does not add
+the current address. Virtual interfaces created by IIAB or other tooling
+(`br0`, `ap0`, `tailscale0`, ...) are ignored when choosing the interface to
+pin, because they do not exist on the freshly imaged system.
 
 IIAB's tiny profile enables `network_install`. The network role may move the
 box to IIAB's default `10.10.10.10`/`box.local` addresses during the install.
@@ -220,13 +276,12 @@ The unit sends stdout/stderr to the journal and the system console. On a
 physical machine or a serial console, watch `tty0` or `ttyS0,115200`.
 
 The first boot also starts a read-only `tmux`, `screen`, or `abduco` session
-when one is available:
+when one is available. It runs as root, so attach with `sudo`:
 
 ```bash
-ssh xk@box
-tmux attach -t iiab-deploy
-# or: screen -r iiab-deploy
-# or: abduco -a iiab-deploy
+ssh -t xk@box 'sudo tmux attach -t iiab-deploy'
+# or: ssh -t xk@box 'sudo screen -r iiab-deploy'
+# or: ssh -t xk@box 'sudo abduco -a iiab-deploy'
 ```
 
 Follow the log directly:
@@ -265,12 +320,15 @@ retrying.
   capable; the tool checks the device-tree SoC and warns before continuing
   for known-capable hardware. Known 32-bit-only or unverifiable `armv7l`
   hardware is rejected, as are `armv6l` targets.
-- **Raspberry Pi OS and cloud-init:** The official Raspberry Pi OS Lite image
-  may not include cloud-init. This tool assumes cloud-init will create the
-  post-boot user and configure SSH, per the deployment requirements. If your
-  image lacks it, provision the user/SSH separately or use a cloud-init-enabled
-  Raspberry Pi OS image. NoCloud files are also written to the boot partition
-  for images that read them there.
+- **Raspberry Pi OS and cloud-init:** The current Raspberry Pi OS Lite arm64
+  image ships cloud-init with the NoCloud datasource enabled
+  (`datasource_list: [NoCloud, None]`), so the injected `user-data` and
+  `network-config` create the post-boot user and configure SSH. If you
+  substitute a custom or older image, verify that it still includes cloud-init;
+  without it the new system may not be reachable over SSH. Raspberry Pi OS
+  reads the NoCloud seed from `/boot/firmware`
+  (`seedfrom: file:///boot/firmware`), and the tool writes the seed there as
+  well as to `/var/lib/cloud/seed/nocloud`.
 - **Boot order:** After writing, the firmware must boot the target disk. Check
   the BIOS/EFI boot order or the Raspberry Pi boot device if the old system
   comes back.

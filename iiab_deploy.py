@@ -59,10 +59,17 @@ from pathlib import Path
 from typing import Any, NoReturn, Optional
 
 DEFAULT_REPO = "iiab/iiab"
+DEFAULT_SSH_PORT = 22
+NETBURN_STALL_MINUTES = 15
 REMOTE_STAGE = "/var/tmp/iiab-deploy"
 STATE_DIR = "/var/lib/iiab-deploy"
 LOG_DIR = "/var/log/iiab-deploy"
-DEFAULT_CLOUDINIT_DIR = os.path.expanduser("~/.local/bin/cloudinit")
+DEFAULT_CLOUDINIT_USERDATA = os.path.expanduser(
+    "~/.local/bin/cloudinit/user-data"
+)
+DEFAULT_CLOUDINIT_NETWORKCONFIG = os.path.expanduser(
+    "~/.local/bin/cloudinit/network-config"
+)
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "iiab-deploy",
@@ -79,12 +86,19 @@ VIRTUAL_IFACE_PREFIXES = (
     "lo",
     "docker",
     "veth",
-    "br-",
+    "br",
     "virbr",
+    "bond",
+    "dummy",
+    "ifb",
+    "macvlan",
+    "vlan",
     "tun",
     "tap",
     "wg",
     "ap",
+    "tailscale",
+    "zt",
 )
 
 
@@ -169,7 +183,12 @@ def http_get_text(url: str, timeout: float = 60.0) -> str:
 
 
 def resolve_url(url: str, timeout: float = 60.0) -> str:
-    """Follow redirects without downloading the body, if possible."""
+    """Follow redirects without downloading the body, if possible.
+
+    Returns the final URL, or "" when it could not be determined.  Returning
+    the original URL here would silently break callers that append a suffix
+    (for example a ``.sha256`` checksum URL).
+    """
     req = urllib.request.Request(
         url,
         method="HEAD",
@@ -197,8 +216,7 @@ def resolve_url(url: str, timeout: float = 60.0) -> str:
             )
             if p.returncode == 0 and p.stdout.strip():
                 return p.stdout.strip()
-    # Last resort: return the original URL.  The downloader will follow it.
-    return url
+    return ""
 
 
 @dataclass
@@ -572,8 +590,30 @@ def _github_api_json(url: str) -> Any:
         raise DeployError(f"GitHub API request failed: {url}: {e}") from e
 
 
+def _gh_pr_files(repo: str, number: int) -> Optional[list[str]]:
+    """List every changed path, past gh's 100-file limit for ``pr view``."""
+    if not _gh_available():
+        return None
+    p = run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repo}/pulls/{number}/files?per_page=100",
+            "--jq",
+            ".[].filename",
+        ],
+        check=False,
+        timeout=120,
+        die_on_timeout=False,
+    )
+    if p.returncode != 0:
+        return None
+    return [line.strip() for line in (p.stdout or "").splitlines() if line.strip()]
+
+
 def resolve_pr(repo: str, number: int) -> PRInfo:
-    fields = {
+    fields: dict[str, Any] = {
         "number": number,
         "title": "",
         "url": f"https://github.com/{repo}/pull/{number}",
@@ -603,9 +643,20 @@ def resolve_pr(repo: str, number: int) -> PRInfo:
         )
         if p.returncode == 0:
             try:
-                fields.update(json.loads(p.stdout))
+                parsed = json.loads(p.stdout)
             except json.JSONDecodeError:
                 warn("gh returned non-JSON PR metadata; falling back to the API")
+            else:
+                fields.update(parsed)
+                # gh pr view caps its file list; fetch every page instead.
+                all_files = _gh_pr_files(repo, number)
+                if all_files is None:
+                    warn(
+                        "could not list every changed file with gh; "
+                        "changed-role detection may be incomplete"
+                    )
+                else:
+                    fields["files"] = [{"path": path} for path in all_files]
         else:
             warn("gh pr view failed; falling back to the GitHub API")
     if not fields.get("title") and fields.get("state") == "UNKNOWN":
@@ -723,6 +774,13 @@ def choose_image(profile: str, arch: str) -> ImageInfo:
         else:
             die(f"cannot pick a Raspberry Pi image for architecture {arch}")
         final = resolve_url(RPI_IMAGE_BASE.format(arch=rpi_arch))
+        if not final or final.rstrip("/").endswith("_latest"):
+            die(
+                "could not resolve "
+                + RPI_IMAGE_BASE.format(arch=rpi_arch)
+                + " to a dated image URL; check network access to "
+                "downloads.raspberrypi.org"
+            )
         sha_text = http_get_text(final + ".sha256")
         first = sha_text.split()
         if not first:
@@ -773,13 +831,16 @@ def parse_post_user(user_data: str, profile: str) -> str:
             users = data.get("users") or []
             for user in users:
                 if isinstance(user, dict) and user.get("name"):
-                    return str(user["name"])
+                    # "default" is cloud-init's reserved placeholder, not a
+                    # real login name.
+                    if str(user["name"]) != "default":
+                        return str(user["name"])
         except Exception:
             pass
     m = re.search(
         r"^\s*-\s*name:\s*['\"]?([A-Za-z0-9_.-]+)", user_data, re.MULTILINE
     )
-    if m:
+    if m and m.group(1) != "default":
         return m.group(1)
     return "pi" if profile == "rpi" else "ubuntu"
 
@@ -804,26 +865,49 @@ def _remap_section(
         return {}
     out: dict[str, Any] = {}
     used: set[str] = set()
+    # Pass 1: keys that already name a real candidate keep their name, so
+    # placeholders in pass 2 cannot claim their slot.
     for key, cfg in section.items():
         if key in candidates:
-            new_key = key
-        else:
-            new_key = next((c for c in candidates if c not in used), "")
-            if not new_key:
-                continue
+            used.add(key)
+            out[key] = dict(cfg) if isinstance(cfg, dict) else {}
+    # Pass 2: remaining keys (placeholders) take the next unused candidate.
+    for key, cfg in section.items():
+        if key in candidates:
+            continue
+        new_key = next((c for c in candidates if c not in used), "")
+        if not new_key:
+            continue
         used.add(new_key)
-        out[new_key] = cfg if isinstance(cfg, dict) else {}
+        config = dict(cfg) if isinstance(cfg, dict) else {}
+        # The template selected the device by a placeholder name (or by
+        # match rules for the old hardware).  The ID now names the real
+        # interface, so stale selectors would stop this config from
+        # applying at all.
+        config.pop("match", None)
+        config.pop("set-name", None)
+        out[new_key] = config
     return out
 
 
-def primary_interface(probe: dict[str, Any]) -> str:
-    nics = str(probe.get("NICS", "")).split()
-    wifi = set(str(probe.get("WIFI_NICS", "")).split())
-    eth = [
-        n
-        for n in nics
-        if n not in wifi and not n.startswith(VIRTUAL_IFACE_PREFIXES)
+def physical_nics(probe: dict[str, Any]) -> list[str]:
+    """Return the NICs that should exist on a freshly imaged system.
+
+    IIAB (and container/VPN tooling) adds virtual interfaces such as ``br0``,
+    ``ap0`` and ``tailscale0`` to the running system.  They must not be used as
+    pin targets or as stand-ins for the new system's physical NICs.
+    """
+    all_nics = str(probe.get("NICS", "")).split()
+    physical = [
+        n for n in all_nics if not n.startswith(VIRTUAL_IFACE_PREFIXES)
     ]
+    return physical or all_nics
+
+
+def primary_interface(probe: dict[str, Any]) -> str:
+    nics = physical_nics(probe)
+    wifi = set(str(probe.get("WIFI_NICS", "")).split()) & set(nics)
+    eth = [n for n in nics if n not in wifi]
     default_iface = str(probe.get("DEFAULT_IFACE", ""))
     if default_iface in nics:
         return default_iface
@@ -882,6 +966,51 @@ def apply_network_overrides(
     return out
 
 
+def _ip_family(value: Any) -> int:
+    """Return 4 or 6 for an address/CIDR/route string, 0 when unknown."""
+    if not isinstance(value, str):
+        return 0
+    try:
+        return ipaddress.ip_network(value, strict=False).version
+    except ValueError:
+        return 0
+
+
+def _strip_ipv4_static(cfg: dict[str, Any]) -> bool:
+    """Remove static IPv4 addressing so DHCPv4 can take over."""
+    changed = False
+    addresses = cfg.get("addresses")
+    if isinstance(addresses, list):
+        kept = [a for a in addresses if _ip_family(a) != 4]
+        changed = changed or kept != addresses
+        if kept:
+            cfg["addresses"] = kept
+        else:
+            cfg.pop("addresses", None)
+    routes = cfg.get("routes")
+    if isinstance(routes, list):
+        kept = [
+            r
+            for r in routes
+            if not (
+                isinstance(r, dict)
+                and (
+                    _ip_family(str(r.get("to", ""))) == 4
+                    or _ip_family(str(r.get("via", ""))) == 4
+                )
+            )
+        ]
+        changed = changed or kept != routes
+        if kept:
+            cfg["routes"] = kept
+        else:
+            cfg.pop("routes", None)
+    if "gateway4" in cfg:
+        cfg.pop("gateway4", None)
+        changed = True
+    return changed
+
+
 def rewrite_network_config(
     text: str,
     probe: dict[str, Any],
@@ -891,17 +1020,20 @@ def rewrite_network_config(
 ) -> tuple[str, list[str]]:
     """Rename placeholder interfaces and pin the current addresses.
 
+    Both the plain network-config v2 form (``version: 2`` at the top level, as
+    NoCloud documents) and the netplan-style ``network:`` wrapper are accepted.
+    The output is always the plain form: cloud-init's NoCloud datasource reads
+    ``version`` from the top level and only then hands the config to netplan.
+    Stale ``match:``/``set-name:`` selectors are dropped when a placeholder ID
+    is renamed, so the config applies to the probed NICs.
+
     Returns (yaml_text, notes).  Unknown/unmanaged interface names are dropped,
     because netplan refuses to apply a config that references a missing NIC.
     """
     notes: list[str] = []
-    nics = str(probe.get("NICS", "")).split()
-    wifi = set(str(probe.get("WIFI_NICS", "")).split())
-    eth = [
-        n
-        for n in nics
-        if n not in wifi and not n.startswith(VIRTUAL_IFACE_PREFIXES)
-    ]
+    nics = physical_nics(probe)
+    wifi = set(str(probe.get("WIFI_NICS", "")).split()) & set(nics)
+    eth = [n for n in nics if n not in wifi]
     primary = primary_interface(probe)
 
     yaml = _load_yaml()
@@ -925,6 +1057,26 @@ def rewrite_network_config(
     if not isinstance(data, dict):
         die("network-config must be a YAML mapping")
 
+    wrapped = isinstance(data.get("network"), dict)
+    if wrapped:
+        outer = data
+        data = dict(outer["network"])
+        extra = sorted(set(outer) - {"network"})
+        if extra:
+            warn(
+                "network-config: ignoring top-level keys outside network: "
+                + ", ".join(extra)
+            )
+        if "version" not in data:
+            die("network-config: the network: mapping has no version")
+
+    version = data.get("version")
+    if version is not None and version != 2:
+        die(
+            "network-config must be version 2 "
+            f"(found version {version!r}); convert it before deploying"
+        )
+
     ethernets = _remap_section(data.get("ethernets"), eth)
     wifis = _remap_section(data.get("wifis"), sorted(wifi))
     if not wifis and "wifis" in data:
@@ -932,28 +1084,27 @@ def rewrite_network_config(
     if not ethernets and "ethernets" in data:
         notes.append("target has no matching Ethernet NIC; dropped ethernets")
 
+    target_cfg: dict[str, Any] = {}
+    section_name = ""
     if primary in eth:
-        if not ethernets:
-            ethernets[primary] = {"dhcp4": True}
-        target_cfg = ethernets.setdefault(primary, {})
         section_name = "ethernets"
+        target_cfg = ethernets.setdefault(primary, {})
+        if not target_cfg:
+            target_cfg["dhcp4"] = True
     elif primary in wifi:
-        if not wifis:
-            wifis[primary] = {"dhcp4": True}
-        target_cfg = wifis.setdefault(primary, {})
         section_name = "wifis"
+        target_cfg = wifis.setdefault(primary, {})
+        if not target_cfg:
+            target_cfg["dhcp4"] = True
         if "access-points" not in target_cfg:
             notes.append(
                 f"target uses WiFi ({primary}) but the network-config has no "
                 "access-points for it; WiFi may not associate"
             )
-    else:
-        target_cfg = {}
-        section_name = ""
-        if eth or wifi:
-            notes.append(
-                "could not determine the primary interface; leaving DHCP as-is"
-            )
+    elif eth or wifi:
+        notes.append(
+            "could not determine the primary interface; leaving DHCP as-is"
+        )
 
     ip4 = parse_ip_map(str(probe.get("IP4", "")))
     ip6 = parse_ip_map(str(probe.get("IP6", "")))
@@ -961,7 +1112,7 @@ def rewrite_network_config(
     gw6 = str(probe.get("GATEWAY6", "")).strip()
     dns = str(probe.get("DNS4", "")).split() or ["1.1.1.1", "8.8.8.8"]
 
-    if section_name and target_cfg:
+    if section_name:
         pin4 = (
             pin_ip
             and primary in ip4
@@ -973,49 +1124,79 @@ def rewrite_network_config(
             and bool(gw6)
             and not gw6.startswith("fe80:")
         )
+
+        # Keep static addressing for families we are not pinning.  IPv4 is
+        # special: it falls back to DHCP below, so stale IPv4 config is
+        # dropped rather than preserved.
         addresses: list[str] = []
+        template_addresses = target_cfg.get("addresses")
+        if isinstance(template_addresses, list):
+            addresses.extend(
+                str(a)
+                for a in template_addresses
+                if _ip_family(a) != 4 and not (pin6 and _ip_family(a) == 6)
+            )
+        routes: list[dict[str, Any]] = []
+        template_routes = target_cfg.get("routes")
+        if isinstance(template_routes, list):
+            for route in template_routes:
+                if not isinstance(route, dict):
+                    continue
+                family = _ip_family(str(route.get("to", ""))) or _ip_family(
+                    str(route.get("via", ""))
+                )
+                if family == 4:
+                    continue  # rebuilt from the pinned gateway, or DHCPv4
+                if family == 6 and pin6:
+                    continue  # rebuilt from the pinned gateway
+                routes.append(route)
+
+        pinned: list[str] = []
         if pin4:
-            addresses.append(ip4[primary])
+            addresses.insert(0, ip4[primary])
             target_cfg["dhcp4"] = False
+            target_cfg.pop("dhcp4-overrides", None)
+            target_cfg.pop("gateway4", None)
+            pinned.append(f"IPv4 {ip4[primary]}")
+            if gw4:
+                routes.insert(0, {"to": "default", "via": gw4})
+                pinned.append(f"gateway {gw4}")
+            else:
+                notes.append(
+                    f"no default IPv4 gateway was found; {primary} will have "
+                    "a static address but no route"
+                )
+        else:
+            cleared = _strip_ipv4_static(target_cfg)
+            target_cfg["dhcp4"] = True
+            if pin_ip:
+                notes.append(f"no usable IPv4 on {primary}; using DHCP")
+            elif cleared:
+                notes.append(
+                    f"cleared static IPv4 config on {primary}; using DHCP"
+                )
         if pin6:
             addresses.append(ip6[primary])
             target_cfg["dhcp6"] = False
             target_cfg["accept-ra"] = False
+            target_cfg.pop("dhcp6-overrides", None)
+            target_cfg.pop("gateway6", None)
+            if gw6:
+                routes.append({"to": "::/0", "via": gw6})
+                pinned.append(f"gateway {gw6}")
+            pinned.append(f"IPv6 {ip6[primary]}")
         if addresses:
             target_cfg["addresses"] = addresses
-            target_cfg.pop("dhcp4-overrides", None)
-            target_cfg.pop("dhcp6-overrides", None)
-            # Drop any routes/gateway keys inherited from the template; they
-            # would otherwise conflict with the routes pinned below.
+        else:
+            target_cfg.pop("addresses", None)
+        if routes:
+            target_cfg["routes"] = routes
+        else:
             target_cfg.pop("routes", None)
-            target_cfg.pop("gateway4", None)
-            target_cfg.pop("gateway6", None)
-            routes: list[dict[str, str]] = []
-            if pin4 and gw4:
-                routes.append({"to": "default", "via": gw4})
-            if pin6:
-                routes.append({"to": "::/0", "via": gw6})
-            if routes:
-                target_cfg["routes"] = routes
+        if pin4 or pin6:
             target_cfg["nameservers"] = {"addresses": dns}
-            pinned: list[str] = []
-            if pin4:
-                pinned.append(f"IPv4 {ip4[primary]}")
-            if pin6:
-                pinned.append(f"IPv6 {ip6[primary]}")
-            if pin4:
-                if gw4:
-                    pinned.append(f"gateway {gw4}")
-                else:
-                    notes.append(
-                        f"no default IPv4 gateway was found; {primary} will have "
-                        "a static address but no route"
-                    )
+        if pinned:
             notes.append(f"pinned {'; '.join(pinned)} on {primary}")
-        elif pin_ip:
-            notes.append(
-                f"no usable IPv4 on {primary}; left DHCP enabled"
-            )
 
     if ethernets:
         data["ethernets"] = ethernets
@@ -1028,7 +1209,10 @@ def rewrite_network_config(
     data["version"] = 2
 
     out = yaml.safe_dump(
-        data, sort_keys=False, default_flow_style=False, width=1000
+        data,
+        sort_keys=False,
+        default_flow_style=False,
+        width=1000,
     )
     return out, notes
 
@@ -1139,6 +1323,7 @@ INSTALL_RC=""
 ROLES_RC=""
 MODULE_RC=""
 RESULT="$STATE_DIR/result.json"
+STATE_DIFF=""
 FAILED=0
 
 section() { echo; echo "===== IIAB_DEPLOY: $* ====="; }
@@ -1153,7 +1338,7 @@ write_result() {
     FINISHED=$(date -Is)
     export START STATUS FINISHED PR_REPO PR_NUMBER PR_TITLE PR_URL PR_REF PR_HEAD_SHA
     export PROFILE HOSTNAME ROLES ROLES_AUTO ROLES_OVERRIDE INSTALL_RC
-    export ROLES_RC MODULE_RC LOG FAILED
+    export ROLES_RC MODULE_RC LOG FAILED STATE_DIFF
     python3 - "$RESULT" <<'PY' || true
 import json, os, sys
 
@@ -1183,7 +1368,7 @@ data = {
     "roles_rc": as_int("ROLES_RC"),
     "module_tests_rc": as_int("MODULE_RC"),
     "log": os.environ.get("LOG"),
-    "state_diff": "/var/log/iiab-deploy/state.diff",
+    "state_diff": os.environ.get("STATE_DIFF", ""),
 }
 with open(sys.argv[1], "w") as fh:
     json.dump(data, fh, indent=2, sort_keys=True)
@@ -1341,6 +1526,7 @@ if ! scripts/ansible; then
 fi
 
 section "Running iiab-install $IIAB_INSTALL_ARGS"
+# shellcheck disable=SC2086  # IIAB_INSTALL_ARGS is a deliberate argument list
 ./iiab-install $IIAB_INSTALL_ARGS
 INSTALL_RC=$?
 echo "iiab-install exit code: $INSTALL_RC"
@@ -1398,8 +1584,9 @@ if [ -f "$EXPECTED" ] && [ -f /etc/iiab/iiab_state.yml ]; then
     sort "$EXPECTED" > /tmp/iiab-deploy-expected.sorted
     sort /etc/iiab/iiab_state.yml > /tmp/iiab-deploy-state.sorted
     diff -u /tmp/iiab-deploy-expected.sorted /tmp/iiab-deploy-state.sorted > "$LOG_DIR/state.diff" || true
-    echo "State diff: $LOG_DIR/state.diff ($(wc -l < "$LOG_DIR/state.diff") lines)"
-    head -60 "$LOG_DIR/state.diff" || true
+    STATE_DIFF="$LOG_DIR/state.diff"
+    echo "State diff: $STATE_DIFF ($(wc -l < "$STATE_DIFF") lines)"
+    head -60 "$STATE_DIFF" || true
 fi
 
 section "IIAB summary"
@@ -1435,7 +1622,7 @@ for c in curl gzip xz zstd cpio tar sha256sum kexec blockdev blkid depmod wget; 
     command -v "$c" >/dev/null 2>&1 || missing=1
 done
 command -v unmkinitramfs >/dev/null 2>&1 || missing=1
-if [ "${IMAGE_COMPRESSION:-none}" = "qcow2" ]; then
+if [ "${NETBURN:-0}" = "0" ] && [ "${IMAGE_COMPRESSION:-none}" = "qcow2" ]; then
     command -v qemu-img >/dev/null 2>&1 || missing=1
 fi
 if [ "$missing" -eq 1 ]; then
@@ -1444,7 +1631,7 @@ if [ "$missing" -eq 1 ]; then
     apt-get install -y --no-install-recommends \
         kexec-tools initramfs-tools cpio gzip xz-utils zstd curl wget \
         iproute2 ca-certificates util-linux kmod || die "apt-get install failed"
-    if [ "${IMAGE_COMPRESSION:-none}" = "qcow2" ]; then
+    if [ "${NETBURN:-0}" = "0" ] && [ "${IMAGE_COMPRESSION:-none}" = "qcow2" ]; then
         apt-get install -y --no-install-recommends qemu-utils || \
             die "apt-get install qemu-utils failed"
     fi
@@ -1491,9 +1678,53 @@ log "kernel: $KERNEL"
 log "initramfs: $INITRD"
 
 # ---- image ----
+free_mb() {
+    local mb
+    mb=$(df -Pm /var/tmp 2>/dev/null | awk 'NR==2 {print $4}')
+    case "$mb" in
+        ''|*[!0-9]*) die "could not determine free space in /var/tmp" ;;
+    esac
+    printf '%s' "$mb"
+}
+
+image_uncompressed_size() {
+    # Best-effort size of the decompressed image, before decompressing it.
+    case "${IMAGE_COMPRESSION:-none}" in
+        qcow2)
+            qemu-img info "$1" 2>/dev/null | \
+                awk -F'[()]' '/virtual size/ {print $2}' | awk '{print $1}'
+            ;;
+        xz)
+            xz --robot --list "$1" 2>/dev/null | \
+                awk '$1 == "totals" {print $5}'
+            ;;
+        gzip|gz)
+            gzip -l "$1" 2>/dev/null | awk 'NR==2 {print $2}'
+            ;;
+        none|raw)
+            stat -c '%s' "$1"
+            ;;
+    esac
+}
+
 if [ "$NETBURN" = "0" ]; then
     mkdir -p image
     if [ ! -s image/base.img ]; then
+        FREE_MB=$(free_mb)
+        DL_BYTES=$(curl -fsSIL --retry 2 --connect-timeout 30 "$IMAGE_URL" 2>/dev/null | \
+            awk 'tolower($1) == "content-length:" {gsub("\r", "", $2); print $2}' | \
+            tail -1) || true
+        case "$DL_BYTES" in
+            ''|*[!0-9]*) DL_BYTES=0 ;;
+        esac
+        if [ "$DL_BYTES" -gt 0 ]; then
+            NEED_MB=$((DL_BYTES / 1024 / 1024 + 512))
+        else
+            NEED_MB=1024
+        fi
+        if [ "$FREE_MB" -lt "$NEED_MB" ]; then
+            die "only ${FREE_MB} MiB free in /var/tmp; downloading needs ~${NEED_MB} MiB. Use --netburn."
+        fi
         log "Downloading base image: $IMAGE_URL"
         rm -f image/download
         curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 \
@@ -1501,6 +1732,17 @@ if [ "$NETBURN" = "0" ]; then
         if [ -n "${IMAGE_SHA256:-}" ]; then
             echo "$IMAGE_SHA256  image/download" | sha256sum -c - || \
                 die "checksum mismatch"
+        fi
+        RAW_BYTES=$(image_uncompressed_size image/download) || true
+        if [ -n "$RAW_BYTES" ] && [ "$RAW_BYTES" -gt 0 ] 2>/dev/null; then
+            RAW_MB=$((RAW_BYTES / 1024 / 1024))
+            FREE_MB=$(free_mb)
+            NEED_MB=$((RAW_MB + 512))
+            log "decompressed image: ~${RAW_MB} MiB; /var/tmp free: ${FREE_MB} MiB"
+            if [ "$FREE_MB" -lt "$NEED_MB" ]; then
+                rm -f image/download
+                die "not enough free space to decompress the image (need ~${NEED_MB} MiB); use --netburn"
+            fi
         fi
         case "${IMAGE_COMPRESSION:-none}" in
             xz) xz -dc image/download > image/base.img ;;
@@ -1514,15 +1756,18 @@ if [ "$NETBURN" = "0" ]; then
     fi
     RAW_SIZE=$(stat -c '%s' image/base.img)
     RAW_MB=$((RAW_SIZE / 1024 / 1024))
-    FREE_MB=$(df -Pm /var/tmp | awk 'NR==2 {print $4}')
-    NEED_MB=$((RAW_MB * 2 + 1024))
-    log "image: ${RAW_MB} MiB raw; /var/tmp free: ${FREE_MB} MiB"
-    if [ "$FREE_MB" -lt "$NEED_MB" ]; then
-        die "not enough free space in /var/tmp (need ~${NEED_MB} MiB); use --netburn"
-    fi
     DISK_SIZE=$(blockdev --getsize64 "$TARGET_DISK")
     [ "$RAW_SIZE" -le "$DISK_SIZE" ] || \
         die "image ($RAW_SIZE bytes) is larger than $TARGET_DISK ($DISK_SIZE bytes)"
+    # gzip -1 of an OS image is much smaller than the raw image; this keeps a
+    # wide margin over the usual ~30% while still failing before the disk is
+    # completely full.
+    FREE_MB=$(free_mb)
+    NEED_MB=$((RAW_MB / 2 + 512))
+    log "image: ${RAW_MB} MiB raw; /var/tmp free: ${FREE_MB} MiB"
+    if [ "$FREE_MB" -lt "$NEED_MB" ]; then
+        die "not enough free space in /var/tmp to compress the image (need ~${NEED_MB} MiB); use --netburn"
+    fi
     log "Compressing image for the initramfs (gzip -1)"
     gzip -1 -c image/base.img > image/base.img.gz
     EMBED=image/base.img.gz
@@ -2027,7 +2272,7 @@ def pin_values(
     if not pin_ip:
         return "", "", "", ""
     ip4 = parse_ip_map(str(probe.get("IP4", "")))
-    iface = str(probe.get("DEFAULT_IFACE", ""))
+    iface = primary_interface(probe)
     cidr = ip4.get(iface) or (next(iter(ip4.values())) if ip4 else "")
     if not cidr or cidr.startswith("169.254."):
         return "", "", "", ""
@@ -2038,7 +2283,9 @@ def pin_values(
     return addr, netmask, gateway, (dns[0] if dns else "")
 
 
-def make_tar_gz(root: Path, out: Any) -> None:
+def make_tar_gz(
+    root: Path, out: Any, *, exclude: tuple[str, ...] = ()
+) -> None:
     close = False
     if isinstance(out, (str, Path)):
         fh = open(out, "wb")
@@ -2048,7 +2295,10 @@ def make_tar_gz(root: Path, out: Any) -> None:
     try:
         with tarfile.open(fileobj=fh, mode="w:gz") as tar:
             for path in sorted(root.rglob("*")):
-                arc = path.relative_to(root).as_posix()
+                relative = path.relative_to(root)
+                if exclude and relative.parts and relative.parts[0] in exclude:
+                    continue
+                arc = relative.as_posix()
                 info = tar.gettarinfo(str(path), arcname=arc)
                 info.uid = 0
                 info.gid = 0
@@ -2089,10 +2339,7 @@ def make_stage(
             die(f"--keep-payload directory is not empty: {stage}")
         stage.mkdir(parents=True, exist_ok=True)
     else:
-        tmp = Path("/tmp/opencode")
-        if not tmp.is_dir() or not os.access(tmp, os.W_OK):
-            tmp = Path(tempfile.gettempdir())
-        stage = Path(tempfile.mkdtemp(prefix="iiab-deploy.", dir=str(tmp)))
+        stage = Path(tempfile.mkdtemp(prefix="iiab-deploy."))
 
     payload = stage / "payload"
     (payload / "etc/systemd/system/multi-user.target.wants").mkdir(parents=True)
@@ -2203,7 +2450,9 @@ def upload_stage(remote: Remote, stage: Path) -> None:
         timeout=120,
     )
     buf = io.BytesIO()
-    make_tar_gz(stage, buf)
+    # payload.tar.gz is what the remote setup extracts; do not ship the
+    # uncompressed copy of the same tree as well.
+    make_tar_gz(stage, buf, exclude=("payload",))
     tar_cmd = f"tar -xzf - -C {shlex.quote(REMOTE_STAGE)}"
     if not remote.is_root:
         tar_cmd = "sudo -n " + tar_cmd
@@ -2226,7 +2475,7 @@ def upload_stage(remote: Remote, stage: Path) -> None:
     log("stage uploaded")
 
 
-def run_remote_setup(remote: Remote, stage: Path) -> bool:
+def run_remote_setup(remote: Remote) -> bool:
     script = f"bash {shlex.quote(REMOTE_STAGE + '/remote-setup.sh')}"
     remote_cmd = script if remote.is_root else "sudo -n " + script
     cmd = ssh_base(remote) + [remote_cmd]
@@ -2297,6 +2546,9 @@ class ImageServer:
         self.image_path = image_path
         self.size = image_path.stat().st_size
         self.filename = image_path.name
+        self._lock = threading.Lock()
+        self.bytes_sent = 0
+        self.completed = 0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -2311,15 +2563,27 @@ class ImageServer:
                 self.send_header("Content-Type", "application/gzip")
                 self.send_header("Content-Length", str(outer.size))
                 self.end_headers()
+                sent = 0
                 try:
                     with open(outer.image_path, "rb") as fh:
-                        shutil.copyfileobj(fh, self.wfile, 1024 * 1024)
+                        while True:
+                            chunk = fh.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            sent += len(chunk)
+                            with outer._lock:
+                                outer.bytes_sent += len(chunk)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                if sent == outer.size:
+                    with outer._lock:
+                        outer.completed += 1
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 log("http: " + (fmt % args))
 
+        self.server: ThreadingHTTPServer
         if ":" in bind:
             class V6Server(ThreadingHTTPServer):
                 address_family = socket.AF_INET6
@@ -2335,6 +2599,43 @@ class ImageServer:
     def start(self) -> int:
         self.thread.start()
         return int(self.server.server_address[1])
+
+    def wait_for_transfer(self, stall_minutes: int = NETBURN_STALL_MINUTES) -> bool:
+        """Block until the image has been served once.
+
+        The image is streamed by the target's initramfs, which runs *before*
+        the new system boots.  Stopping the server while bytes are still
+        flowing would leave the target with a half-written disk, so wait for
+        the transfer (or for a long stall) before the SSH wait begins.
+        """
+        total_mb = self.size / (1024 * 1024)
+        last_bytes = -1
+        last_change = time.time()
+        last_log = last_change
+        while True:
+            with self._lock:
+                done = self.completed > 0
+                sent = self.bytes_sent
+            if done:
+                log(f"netburn: image served ({total_mb:.0f} MiB)")
+                return True
+            now = time.time()
+            if sent != last_bytes:
+                last_bytes = sent
+                last_change = now
+                if now - last_log >= 10:
+                    last_log = now
+                    log(
+                        "netburn: served {:.0f}/{:.0f} MiB".format(
+                            min(sent / (1024 * 1024), total_mb), total_mb
+                        )
+                    )
+            elif now - last_change > stall_minutes * 60:
+                warn(
+                    f"netburn: no transfer progress for {stall_minutes} minutes"
+                )
+                return False
+            time.sleep(2)
 
     def stop(self) -> None:
         self.server.shutdown()
@@ -2625,7 +2926,8 @@ def print_result(result: Optional[dict[str, Any]], remote: Remote) -> None:
         print(f"  roles:        {result.get('roles_rc')}")
         print(f"  modules:      {result.get('module_tests_rc')}")
         print(f"  Log:          {result.get('log', '')}")
-        print(f"  State diff:   {result.get('state_diff', '')}")
+        if result.get("state_diff"):
+            print(f"  State diff:   {result['state_diff']}")
     else:
         print("No result.json was found; the install may still be running.")
     print("=" * 70)
@@ -2792,9 +3094,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="comma/space-separated roles to run after install (default: auto-detect from the PR)",
     )
     p.add_argument(
-        "--cloudinit-dir",
-        default=DEFAULT_CLOUDINIT_DIR,
-        help=f"directory with user-data/network-config (default: {DEFAULT_CLOUDINIT_DIR})",
+        "--cloudinit-userdata",
+        default=DEFAULT_CLOUDINIT_USERDATA,
+        help=f"user-data file (default: {DEFAULT_CLOUDINIT_USERDATA})",
+    )
+    p.add_argument(
+        "--cloudinit-networkconfig",
+        default=DEFAULT_CLOUDINIT_NETWORKCONFIG,
+        help=f"network-config file (default: {DEFAULT_CLOUDINIT_NETWORKCONFIG})",
     )
     p.add_argument(
         "--post-user",
@@ -2992,9 +3299,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not valid_hostname(hostname):
             die(f"invalid hostname: {hostname!r}")
 
-        cloudinit_dir = Path(args.cloudinit_dir).expanduser()
-        user_data_path = cloudinit_dir / "user-data"
-        network_path = cloudinit_dir / "network-config"
+        user_data_path = Path(args.cloudinit_userdata).expanduser()
+        network_path = Path(args.cloudinit_networkconfig).expanduser()
         if not user_data_path.is_file():
             die(f"missing {user_data_path}")
         if not network_path.is_file():
@@ -3137,13 +3443,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             die("internal error: empty deploy id")
 
         upload_stage(remote, stage)
-        run_remote_setup(remote, stage)
+        run_remote_setup(remote)
         log("the target is now writing the new image; SSH will drop")
-        if args.netburn and server:
-            log(
-                "keep this process running until the image is written; the "
-                "netburn server is serving it now"
-            )
+        if args.netburn and server is not None:
+            log("waiting for the netburn image transfer to finish")
+            if not server.wait_for_transfer():
+                warn(
+                    "the target did not finish downloading the image; it may "
+                    "have lost the network or already rebooted"
+                )
 
         hosts: list[str] = []
         for candidate in (
@@ -3155,14 +3463,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         ):
             if candidate and candidate not in hosts:
                 hosts.append(candidate)
+        # The reimaged system uses the image's default SSH port, so also try
+        # 22 when the old system was reached on a custom port.
+        old_port = remote.port or DEFAULT_SSH_PORT
+        ports = [old_port]
+        if old_port != DEFAULT_SSH_PORT:
+            ports.append(DEFAULT_SSH_PORT)
         candidates = [
             Remote(
                 host=h,
                 user=post_user,
-                port=remote.port,
+                port=p,
                 identity=remote.identity,
             )
             for h in hosts
+            for p in ports
         ]
 
         live = wait_for_ssh(candidates, args.boot_timeout, deploy_id)
