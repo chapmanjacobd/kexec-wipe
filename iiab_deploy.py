@@ -1365,6 +1365,9 @@ def _root_disk_paths() -> Optional[set[str]]:
     ).stdout.strip()
     if not source or not source.startswith("/dev/"):
         return None
+    # Btrfs reports the mounted subvolume as /dev/device[/subvolume].
+    # Resolve the underlying device before passing it to lsblk.
+    source = os.path.realpath(source.split("[", 1)[0])
     p = run(
         ["lsblk", "-s", "-nrpo", "PATH,TYPE", source],
         check=False,
@@ -1385,6 +1388,7 @@ def validate_local_device(requested: str) -> tuple[str, dict[str, Any]]:
     """Validate and describe a local whole disk before writing it."""
     if os.geteuid() != 0:
         die("--local-device mode must run as root (use sudo)")
+    # Resolve symlinks such as /dev/disk/by-path before validating or writing.
     device = os.path.realpath(os.path.expanduser(requested))
     if not os.path.exists(device):
         die(f"local device not found: {requested}")
