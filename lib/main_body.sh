@@ -123,8 +123,8 @@ main() {
     fi
 
     if [ "$is_root" -eq 1 ]; then
-        warn "TARGET DEVICE IS THE ROOT DEVICE!"
-        warn "This will kexec into a minimal environment to sanitize."
+        warn "TARGET DEVICE IS THE ROOT DEVICE OR SHARES ITS NVMe SUBSYSTEM!"
+        warn "This will kexec into a minimal environment to sanitize safely."
         warn "THE SYSTEM WILL REBOOT as part of this process."
     elif [ "$INSTALL_FEDORA" -eq 1 ]; then
         warn "TARGET IS NOT THE ROOT DEVICE, but --install-fedora sanitizes and replaces"

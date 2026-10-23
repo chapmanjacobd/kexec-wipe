@@ -12,7 +12,7 @@
 #
 # Requirements:
 #   - Docker (for building static nvme-cli)
-#   - cpio, gzip
+#   - cpio, gzip, xz, zstd
 #
 set -euo pipefail
 
@@ -200,8 +200,8 @@ install_busybox() {
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
         echo "Building busybox static via Docker (arch: $(host_arch))..."
         # Run the container in an `if` so a failed build (missing applet,
-        # builder image, etc.) falls through to host busybox instead of dying
-        # under `set -e`.
+        # builder image, etc.) falls through to another static-busybox source
+        # instead of dying under `set -e`.
         if docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -ec '
             apk add --no-cache busybox-static >/dev/null
             mkdir -p /output/bin
@@ -216,7 +216,8 @@ install_busybox() {
             cp "$busybox_path" /output/bin/busybox
             chown "$HOST_UID:$HOST_GID" /output/bin/busybox
         '; then
-            if [ -s "$BUILD_DIR/bin/busybox" ]; then
+            if [ -s "$BUILD_DIR/bin/busybox" ] \
+               && busybox_is_static "$BUILD_DIR/bin/busybox"; then
                 chmod +x "$BUILD_DIR/bin/busybox"
                 return 0
             fi
@@ -230,11 +231,17 @@ install_busybox() {
         return 0
     fi
 
-    # Tier 4: host busybox binary (may or may not be static).
+    # Tier 4: host busybox binary, but never accept a dynamic binary because
+    # the initramfs does not copy its runtime libraries.
     if command -v busybox >/dev/null 2>&1; then
-        cp "$(command -v busybox)" "$BUILD_DIR/bin/busybox"
-        chmod +x "$BUILD_DIR/bin/busybox"
-        return 0
+        local host_busybox
+        host_busybox=$(command -v busybox)
+        if busybox_is_static "$host_busybox"; then
+            cp "$host_busybox" "$BUILD_DIR/bin/busybox"
+            chmod +x "$BUILD_DIR/bin/busybox"
+            return 0
+        fi
+        echo "Host busybox is not statically linked; refusing to use it." >&2
     fi
 
     echo "ERROR: Could not obtain a busybox binary for arch $(host_arch)" >&2
@@ -342,10 +349,7 @@ copy_module_with_deps() {
 
 # Busybox modprobe cannot decompress module files, so expand any compressed
 # (.ko.xz/.ko.zst) modules that were staged and strip the compression suffix
-# from modules.dep, which busybox uses to resolve module paths. If a
-# decompressor is missing the module is left compressed and untouched in
-# modules.dep (busybox will simply be unable to load it, which is no worse
-# than before).
+# from modules.dep, which busybox uses to resolve module paths.
 decompress_staged_modules() {
     local dst="$1"
     local expanded=0
@@ -373,6 +377,14 @@ decompress_staged_modules() {
     if [ "$expanded" -eq 1 ]; then
         # Not anchored to end-of-line: modules.dep entries end with ':'.
         sed -E -i 's/\.(xz|zst)//g' "$dst/modules.dep" 2>/dev/null || true
+    fi
+
+    local remaining
+    remaining=$(find "$dst/kernel" -type f \( -name '*.ko.xz' -o -name '*.ko.zst' \) 2>/dev/null)
+    if [ -n "$remaining" ]; then
+        echo "ERROR: compressed kernel modules remain; xz and zstd are required to build the initramfs:" >&2
+        printf '%s\n' "$remaining" >&2
+        return 1
     fi
 }
 
@@ -460,7 +472,7 @@ parse_args() {
 
 check_deps() {
     local missing=()
-    for dep in cpio gzip; do
+    for dep in cpio gzip xz zstd; do
         if ! command -v "$dep" &>/dev/null; then
             missing+=("$dep")
         fi
@@ -496,6 +508,10 @@ build_initramfs() {
 
     # Install busybox (arch-aware)
     install_busybox
+    if ! busybox_is_static "$BUILD_DIR/bin/busybox"; then
+        echo "ERROR: initramfs requires a statically linked busybox." >&2
+        exit 1
+    fi
 
     # Create busybox symlinks. partprobe and blockdev are busybox applets and
     # cover the Fedora install path (partition rescans) without needing host

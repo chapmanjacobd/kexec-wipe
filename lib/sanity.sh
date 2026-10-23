@@ -47,7 +47,20 @@ get_device_info() {
     echo "Path:     $dev"
 }
 
-# Return 0 (true) if the given device is the disk backing the root filesystem.
+# Return the NVMe controller name for a namespace or partition, or an empty
+# string when the device is not an NVMe namespace.
+nvme_controller_name() {
+    local devname
+    devname=$(basename "$1")
+    if [[ "$devname" =~ ^(nvme[0-9]+)n[0-9]+(p[0-9]+)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Return 0 (true) if the given device is the disk backing the root filesystem
+# or shares its NVMe controller. Sanitize is an NVMe-subsystem operation, so a
+# namespace on the root controller is unsafe to wipe directly.
+#
 # If the root device cannot be determined, it conservatively returns 0 so the
 # caller picks the (safer) kexec wipe path rather than wiping a mounted disk in
 # place.
@@ -117,5 +130,14 @@ is_root_device() {
         parent=$(basename "$src")
     fi
 
-    [ "$parent" = "$devname" ]
+    local target_controller root_controller
+    target_controller=$(nvme_controller_name "$devname")
+    root_controller=$(nvme_controller_name "$parent")
+
+    if [ -z "$root_controller" ]; then
+        warn "Cannot determine the NVMe controller backing the root device; assuming '$dev' is root."
+        return 0
+    fi
+
+    [ "$parent" = "$devname" ] || [ "$root_controller" = "$target_controller" ]
 }

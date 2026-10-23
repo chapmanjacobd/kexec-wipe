@@ -32,7 +32,8 @@ fatal() {
         i=$((i - 1))
     done
     echo ""
-    reboot -f
+    reboot -f || exit 1
+    exit 1
 }
 
 parse_cmdline() {
@@ -855,9 +856,17 @@ main() {
     log "Sanitize method: $KEXEC_WIPE_METHOD"
 
     # sanitize_and_wait logs the outcome and only ever returns 0 (sanitized) or
-    # 4 (test-mode-skip: sanitize not performed); on a genuine failure it never
-    # returns (fatal). The `|| true` guards the 4 against set -e.
-    sanitize_and_wait || true
+    # 4 (test-mode-skip: sanitize not performed); on a genuine failure it exits
+    # through fatal. Do not let any other status fall through to installation.
+        sanitize_rc=0
+        if sanitize_and_wait; then
+            sanitize_rc=0
+        else
+            sanitize_rc=$?
+        fi
+        if [ "$sanitize_rc" -ne 0 ] && [ "$sanitize_rc" -ne 4 ]; then
+            fatal "Sanitize failed; refusing to install Fedora."
+        fi
 
     install_fedora
 

@@ -125,7 +125,20 @@ get_device_info() {
     echo "Path:     $dev"
 }
 
-# Return 0 (true) if the given device is the disk backing the root filesystem.
+# Return the NVMe controller name for a namespace or partition, or an empty
+# string when the device is not an NVMe namespace.
+nvme_controller_name() {
+    local devname
+    devname=$(basename "$1")
+    if [[ "$devname" =~ ^(nvme[0-9]+)n[0-9]+(p[0-9]+)?$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Return 0 (true) if the given device is the disk backing the root filesystem
+# or shares its NVMe controller. Sanitize is an NVMe-subsystem operation, so a
+# namespace on the root controller is unsafe to wipe directly.
+#
 # If the root device cannot be determined, it conservatively returns 0 so the
 # caller picks the (safer) kexec wipe path rather than wiping a mounted disk in
 # place.
@@ -195,7 +208,16 @@ is_root_device() {
         parent=$(basename "$src")
     fi
 
-    [ "$parent" = "$devname" ]
+    local target_controller root_controller
+    target_controller=$(nvme_controller_name "$devname")
+    root_controller=$(nvme_controller_name "$parent")
+
+    if [ -z "$root_controller" ]; then
+        warn "Cannot determine the NVMe controller backing the root device; assuming '$dev' is root."
+        return 0
+    fi
+
+    [ "$parent" = "$devname" ] || [ "$root_controller" = "$target_controller" ]
 }
 # --- end lib/sanity.sh ---
 
@@ -571,7 +593,7 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
 # checks (root, nvme-cli/docker, kexec-tools, arch). The initramfs builder runs
 # on this host and needs:
 #   - bash, cpio, gzip, find : build and pack the initramfs
-#   - xz                     : decompress the staged .ko.xz kernel modules
+#   - xz, zstd               : decompress staged .ko.xz/.ko.zst kernel modules
 #   - stat                   : report initramfs/image sizes
 #   - curl/wget (or Docker or a host busybox) : obtain the static busybox for
 #     the initramfs; x86_64 fetches a prebuilt one, otherwise it is built with
@@ -582,7 +604,7 @@ check_host_tools() {
     local install="${1:-0}"
     local missing=()
 
-    for d in cpio gzip find xz stat; do
+    for d in cpio gzip find xz zstd stat; do
         command -v "$d" >/dev/null 2>&1 || missing+=("$d")
     done
 
@@ -905,7 +927,8 @@ fatal() {
         i=$((i - 1))
     done
     echo ""
-    reboot -f
+    reboot -f || exit 1
+    exit 1
 }
 
 parse_cmdline() {
@@ -1728,9 +1751,17 @@ main() {
     log "Sanitize method: $KEXEC_WIPE_METHOD"
 
     # sanitize_and_wait logs the outcome and only ever returns 0 (sanitized) or
-    # 4 (test-mode-skip: sanitize not performed); on a genuine failure it never
-    # returns (fatal). The `|| true` guards the 4 against set -e.
-    sanitize_and_wait || true
+    # 4 (test-mode-skip: sanitize not performed); on a genuine failure it exits
+    # through fatal. Do not let any other status fall through to installation.
+        sanitize_rc=0
+        if sanitize_and_wait; then
+            sanitize_rc=0
+        else
+            sanitize_rc=$?
+        fi
+        if [ "$sanitize_rc" -ne 0 ] && [ "$sanitize_rc" -ne 4 ]; then
+            fatal "Sanitize failed; refusing to install Fedora."
+        fi
 
     install_fedora
 
@@ -1775,7 +1806,7 @@ write_embedded_initramfs_build_sh() {
 #
 # Requirements:
 #   - Docker (for building static nvme-cli)
-#   - cpio, gzip
+#   - cpio, gzip, xz, zstd
 #
 set -euo pipefail
 
@@ -1963,8 +1994,8 @@ install_busybox() {
     if [ "$USE_DOCKER" -eq 1 ] && command -v docker >/dev/null 2>&1; then
         echo "Building busybox static via Docker (arch: $(host_arch))..."
         # Run the container in an `if` so a failed build (missing applet,
-        # builder image, etc.) falls through to host busybox instead of dying
-        # under `set -e`.
+        # builder image, etc.) falls through to another static-busybox source
+        # instead of dying under `set -e`.
         if docker run --rm -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" -v "$BUILD_DIR:/output" alpine:latest sh -ec '
             apk add --no-cache busybox-static >/dev/null
             mkdir -p /output/bin
@@ -1979,7 +2010,8 @@ install_busybox() {
             cp "$busybox_path" /output/bin/busybox
             chown "$HOST_UID:$HOST_GID" /output/bin/busybox
         '; then
-            if [ -s "$BUILD_DIR/bin/busybox" ]; then
+            if [ -s "$BUILD_DIR/bin/busybox" ] \
+               && busybox_is_static "$BUILD_DIR/bin/busybox"; then
                 chmod +x "$BUILD_DIR/bin/busybox"
                 return 0
             fi
@@ -1993,11 +2025,17 @@ install_busybox() {
         return 0
     fi
 
-    # Tier 4: host busybox binary (may or may not be static).
+    # Tier 4: host busybox binary, but never accept a dynamic binary because
+    # the initramfs does not copy its runtime libraries.
     if command -v busybox >/dev/null 2>&1; then
-        cp "$(command -v busybox)" "$BUILD_DIR/bin/busybox"
-        chmod +x "$BUILD_DIR/bin/busybox"
-        return 0
+        local host_busybox
+        host_busybox=$(command -v busybox)
+        if busybox_is_static "$host_busybox"; then
+            cp "$host_busybox" "$BUILD_DIR/bin/busybox"
+            chmod +x "$BUILD_DIR/bin/busybox"
+            return 0
+        fi
+        echo "Host busybox is not statically linked; refusing to use it." >&2
     fi
 
     echo "ERROR: Could not obtain a busybox binary for arch $(host_arch)" >&2
@@ -2105,10 +2143,7 @@ copy_module_with_deps() {
 
 # Busybox modprobe cannot decompress module files, so expand any compressed
 # (.ko.xz/.ko.zst) modules that were staged and strip the compression suffix
-# from modules.dep, which busybox uses to resolve module paths. If a
-# decompressor is missing the module is left compressed and untouched in
-# modules.dep (busybox will simply be unable to load it, which is no worse
-# than before).
+# from modules.dep, which busybox uses to resolve module paths.
 decompress_staged_modules() {
     local dst="$1"
     local expanded=0
@@ -2136,6 +2171,14 @@ decompress_staged_modules() {
     if [ "$expanded" -eq 1 ]; then
         # Not anchored to end-of-line: modules.dep entries end with ':'.
         sed -E -i 's/\.(xz|zst)//g' "$dst/modules.dep" 2>/dev/null || true
+    fi
+
+    local remaining
+    remaining=$(find "$dst/kernel" -type f \( -name '*.ko.xz' -o -name '*.ko.zst' \) 2>/dev/null)
+    if [ -n "$remaining" ]; then
+        echo "ERROR: compressed kernel modules remain; xz and zstd are required to build the initramfs:" >&2
+        printf '%s\n' "$remaining" >&2
+        return 1
     fi
 }
 
@@ -2223,7 +2266,7 @@ parse_args() {
 
 check_deps() {
     local missing=()
-    for dep in cpio gzip; do
+    for dep in cpio gzip xz zstd; do
         if ! command -v "$dep" &>/dev/null; then
             missing+=("$dep")
         fi
@@ -2259,6 +2302,10 @@ build_initramfs() {
 
     # Install busybox (arch-aware)
     install_busybox
+    if ! busybox_is_static "$BUILD_DIR/bin/busybox"; then
+        echo "ERROR: initramfs requires a statically linked busybox." >&2
+        exit 1
+    fi
 
     # Create busybox symlinks. partprobe and blockdev are busybox applets and
     # cover the Fedora install path (partition rescans) without needing host
@@ -2464,8 +2511,8 @@ main() {
     fi
 
     if [ "$is_root" -eq 1 ]; then
-        warn "TARGET DEVICE IS THE ROOT DEVICE!"
-        warn "This will kexec into a minimal environment to sanitize."
+        warn "TARGET DEVICE IS THE ROOT DEVICE OR SHARES ITS NVMe SUBSYSTEM!"
+        warn "This will kexec into a minimal environment to sanitize safely."
         warn "THE SYSTEM WILL REBOOT as part of this process."
     elif [ "$INSTALL_FEDORA" -eq 1 ]; then
         warn "TARGET IS NOT THE ROOT DEVICE, but --install-fedora sanitizes and replaces"

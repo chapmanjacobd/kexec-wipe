@@ -48,7 +48,7 @@ Install it with your package manager (e.g., 'apt install kexec-tools' or 'dnf in
 # checks (root, nvme-cli/docker, kexec-tools, arch). The initramfs builder runs
 # on this host and needs:
 #   - bash, cpio, gzip, find : build and pack the initramfs
-#   - xz                     : decompress the staged .ko.xz kernel modules
+#   - xz, zstd               : decompress staged .ko.xz/.ko.zst kernel modules
 #   - stat                   : report initramfs/image sizes
 #   - curl/wget (or Docker or a host busybox) : obtain the static busybox for
 #     the initramfs; x86_64 fetches a prebuilt one, otherwise it is built with
@@ -59,7 +59,7 @@ check_host_tools() {
     local install="${1:-0}"
     local missing=()
 
-    for d in cpio gzip find xz stat; do
+    for d in cpio gzip find xz zstd stat; do
         command -v "$d" >/dev/null 2>&1 || missing+=("$d")
     done
 
