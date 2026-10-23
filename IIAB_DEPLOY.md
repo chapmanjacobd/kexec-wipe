@@ -25,10 +25,13 @@ before it changes anything. To skip the prompt:
 ./iiab_deploy.py xk@box 4543 --yes --hostname box --disk /dev/nvme0n1
 ```
 
-A PR can be given as a number, `iiab/iiab#4543`, or a full URL:
+A PR can be given as a number, `iiab/iiab#4543`, or a full URL. Multiple
+IIAB PRs can be comma-separated; they are fetched and merged in the order
+provided:
 
 ```bash
 ./iiab_deploy.py 192.168.1.219 https://github.com/iiab/iiab/pull/4543
+./iiab_deploy.py 192.168.1.219 4543,4544
 ```
 
 ## What it does
@@ -287,7 +290,8 @@ The injected unit is `iiab-deploy-firstboot.service`. On first boot it:
 6. Clones and installs IIAB's separate Admin Console repository by default.
    Use `--no-admin-console` to skip it, or `--admin-console-pr 677` to
    install a specific Admin Console pull request instead of its default
-   branch.
+   branch. Multiple Admin Console PRs can be comma-separated; they are
+   fetched and merged in the order provided.
 7. Runs the changed-role play (`runroles-base.yml` plus the selected roles),
    then the module tests if applicable, and writes a state diff.
 8. Writes `result.json` and a `done` or `failed` marker.

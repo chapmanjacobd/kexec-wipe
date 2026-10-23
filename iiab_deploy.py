@@ -557,6 +557,97 @@ class PRInfo:
         }
 
 
+@dataclass
+class PRSet:
+    items: list[PRInfo]
+
+    @property
+    def repo(self) -> str:
+        return self.items[0].repo
+
+    @property
+    def number(self) -> int:
+        return self.items[0].number
+
+    @property
+    def numbers(self) -> list[int]:
+        return [pr.number for pr in self.items]
+
+    @property
+    def title(self) -> str:
+        return self.items[0].title
+
+    @property
+    def url(self) -> str:
+        return self.items[0].url
+
+    @property
+    def urls(self) -> list[str]:
+        return [pr.url for pr in self.items]
+
+    @property
+    def state(self) -> str:
+        return self.items[0].state if len(self.items) == 1 else "MULTIPLE"
+
+    @property
+    def draft(self) -> bool:
+        return any(pr.draft for pr in self.items)
+
+    @property
+    def refs(self) -> list[str]:
+        return [pr.merge_ref or pr.head_ref for pr in self.items]
+
+    @property
+    def merge_ref(self) -> str:
+        return self.items[0].merge_ref
+
+    @property
+    def head_ref(self) -> str:
+        return self.items[0].head_ref
+
+    @property
+    def head_sha(self) -> str:
+        return self.items[0].head_sha
+
+    @property
+    def ref_heads(self) -> list[str]:
+        return [pr.head_ref for pr in self.items]
+
+    @property
+    def head_shas(self) -> list[str]:
+        return [pr.head_sha for pr in self.items]
+
+    @property
+    def merge_refs(self) -> list[str]:
+        return [pr.merge_ref for pr in self.items]
+
+    @property
+    def changed_files(self) -> list[str]:
+        return sorted({path for pr in self.items for path in pr.changed_files})
+
+    @property
+    def auto_roles(self) -> list[str]:
+        return sorted({role for pr in self.items for role in pr.auto_roles})
+
+    @property
+    def modules_changed(self) -> bool:
+        return any(pr.modules_changed for pr in self.items)
+
+    def as_dict(self) -> dict[str, Any]:
+        data = self.items[0].as_dict()
+        data.update(
+            {
+                "numbers": self.numbers,
+                "urls": self.urls,
+                "prs": [pr.as_dict() for pr in self.items],
+                "changed_files": self.changed_files,
+                "auto_roles": self.auto_roles,
+                "modules_changed": self.modules_changed,
+            }
+        )
+        return data
+
+
 def parse_pr_arg(
     arg: str, default_repo: str = DEFAULT_REPO
 ) -> tuple[str, int]:
@@ -573,6 +664,16 @@ def parse_pr_arg(
     if arg.strip().isdigit():
         return default_repo, int(arg.strip())
     die(f"could not parse PR {arg!r} (use 4543 or a github.com/.../pull/4543 URL)")
+
+
+def parse_pr_args(
+    arg: str, default_repo: str = DEFAULT_REPO
+) -> list[tuple[str, int]]:
+    """Accept comma-separated numbers, PR references, or full GitHub URLs."""
+    values = [value.strip() for value in arg.split(",")]
+    if not values or any(not value for value in values):
+        die(f"could not parse PR {arg!r} (PRs must be comma-separated)")
+    return [parse_pr_arg(value, default_repo) for value in values]
 
 
 def _gh_available() -> bool:
@@ -757,20 +858,36 @@ def resolve_pr(repo: str, number: int) -> PRInfo:
     )
 
 
-def resolve_admin_console_ref(arg: str | None) -> str:
+def resolve_admin_console_refs(arg: str | None) -> list[str]:
     if not arg:
-        return ""
-    repo, number = parse_pr_arg(arg, DEFAULT_ADMIN_CONSOLE_REPO)
-    if repo != DEFAULT_ADMIN_CONSOLE_REPO:
-        die(
-            f"Admin Console PR must be from {DEFAULT_ADMIN_CONSOLE_REPO}, "
-            f"not {repo}"
-        )
-    log(f"resolving Admin Console {repo}#{number}")
-    pr = resolve_pr(repo, number)
-    if not (pr.merge_ref or pr.head_ref):
-        die("could not determine a ref to fetch for the Admin Console PR")
-    return pr.merge_ref or pr.head_ref
+        return []
+    refs: list[str] = []
+    for repo, number in parse_pr_args(arg, DEFAULT_ADMIN_CONSOLE_REPO):
+        if repo != DEFAULT_ADMIN_CONSOLE_REPO:
+            die(
+                f"Admin Console PR must be from {DEFAULT_ADMIN_CONSOLE_REPO}, "
+                f"not {repo}"
+            )
+        log(f"resolving Admin Console {repo}#{number}")
+        pr = resolve_pr(repo, number)
+        if not (pr.merge_ref or pr.head_ref):
+            die("could not determine a ref to fetch for the Admin Console PR")
+        refs.append(pr.merge_ref or pr.head_ref)
+    return refs
+
+
+def resolve_pr_set(arg: str) -> PRSet:
+    prs: list[PRInfo] = []
+    for repo, number in parse_pr_args(arg):
+        log(f"resolving {repo}#{number}")
+        pr = resolve_pr(repo, number)
+        if not (pr.merge_ref or pr.head_ref):
+            die("could not determine a ref to fetch for the PR")
+        prs.append(pr)
+    repos = {pr.repo for pr in prs}
+    if len(repos) != 1:
+        die("all IIAB PRs must be from the same repository")
+    return PRSet(prs)
 
 
 # ---------------------------------------------------------------------------
@@ -1842,9 +1959,10 @@ fail() {
 write_result() {
     STATUS="$1"
     FINISHED=$(date -Is)
-    export START STATUS FINISHED PR_REPO PR_NUMBER PR_TITLE PR_URL PR_REF PR_HEAD_SHA
+    export START STATUS FINISHED PR_REPO PR_NUMBER PR_NUMBERS PR_TITLE PR_URL PR_URLS
+    export PR_REF PR_REFS PR_HEAD_SHA PR_HEAD_SHAS
     export PROFILE HOSTNAME ROLES ROLES_AUTO ROLES_OVERRIDE ADMIN_CONSOLE
-    export ADMIN_CONSOLE_REF INSTALL_RC
+    export ADMIN_CONSOLE_REF ADMIN_CONSOLE_REFS INSTALL_RC
     export ADMIN_CONSOLE_RC
     export ROLES_RC MODULE_RC LOG FAILED STATE_DIFF
     python3 - "$RESULT" <<'PY' || true
@@ -1857,14 +1975,22 @@ def as_int(name):
     except ValueError:
         return None
 
+def as_json(name, default):
+    try:
+        return json.loads(os.environ.get(name, ""))
+    except (TypeError, json.JSONDecodeError):
+        return default
+
 data = {
     "status": os.environ.get("STATUS"),
     "started": os.environ.get("START", ""),
     "finished": os.environ.get("FINISHED", ""),
     "pr_repo": os.environ.get("PR_REPO"),
     "pr_number": os.environ.get("PR_NUMBER"),
+    "pr_numbers": as_json("PR_NUMBERS", []),
     "pr_title": os.environ.get("PR_TITLE"),
     "pr_url": os.environ.get("PR_URL"),
+    "pr_urls": as_json("PR_URLS", []),
     "pr_ref": os.environ.get("PR_REF"),
     "pr_sha": os.environ.get("PR_HEAD_SHA"),
     "profile": os.environ.get("PROFILE"),
@@ -1874,6 +2000,7 @@ data = {
     "roles_override": os.environ.get("ROLES_OVERRIDE") == "1",
     "admin_console": os.environ.get("ADMIN_CONSOLE", "1") == "1",
     "admin_console_ref": os.environ.get("ADMIN_CONSOLE_REF", ""),
+    "admin_console_refs": os.environ.get("ADMIN_CONSOLE_REFS", "").split(),
     "install_rc": as_int("INSTALL_RC"),
     "admin_console_rc": as_int("ADMIN_CONSOLE_RC"),
     "roles_rc": as_int("ROLES_RC"),
@@ -1910,6 +2037,9 @@ trap on_exit EXIT
 
 section "Starting IIAB deploy"
 echo "PR:          $PR_URL"
+if [ -n "${PR_NUMBERS:-}" ] && [[ "$PR_NUMBERS" == *,* ]]; then
+    echo "PRs:         $PR_NUMBERS"
+fi
 echo "Ref:         $PR_REF"
 echo "Profile:     $PROFILE"
 echo "Hostname:    $HOSTNAME"
@@ -1988,24 +2118,41 @@ cd /opt/iiab/iiab || {
     exit 1
 }
 
-FETCHED=0
-for ref in "$PR_REF" "$PR_REF_HEAD" "$PR_HEAD_SHA"; do
-    [ -n "$ref" ] || continue
-    if git fetch --progress origin "$ref"; then
-        FETCHED=1
-        break
+read -r -a PR_REFS_LIST <<< "${PR_REFS:-$PR_REF}"
+read -r -a PR_REF_HEADS_LIST <<< "${PR_REF_HEADS:-$PR_REF_HEAD}"
+read -r -a PR_HEAD_SHAS_LIST <<< "${PR_HEAD_SHAS:-$PR_HEAD_SHA}"
+if [ "${#PR_REFS_LIST[@]}" -eq 0 ]; then
+    fail "no IIAB PR refs were supplied"
+    finish failed
+    exit 1
+fi
+for i in "${!PR_REFS_LIST[@]}"; do
+    FETCHED=0
+    for ref in "${PR_REFS_LIST[$i]}" \
+        "${PR_REF_HEADS_LIST[$i]:-}" "${PR_HEAD_SHAS_LIST[$i]:-}"; do
+        [ -n "$ref" ] || continue
+        if git fetch --progress origin "$ref"; then
+            FETCHED=1
+            break
+        fi
+    done
+    if [ "$FETCHED" != "1" ]; then
+        fail "could not fetch any ref for IIAB PR ${PR_NUMBERS:-$PR_NUMBER}"
+        finish failed
+        exit 1
+    fi
+    if [ "$i" -eq 0 ]; then
+        if ! git checkout --detach FETCH_HEAD; then
+            fail "git checkout failed"
+            finish failed
+            exit 1
+        fi
+    elif ! git merge --no-edit --no-ff FETCH_HEAD; then
+        fail "could not merge IIAB PR ${PR_NUMBERS:-$PR_NUMBER}"
+        finish failed
+        exit 1
     fi
 done
-if [ "$FETCHED" != "1" ]; then
-    fail "could not fetch any ref for PR $PR_NUMBER"
-    finish failed
-    exit 1
-fi
-if ! git checkout --detach FETCH_HEAD; then
-    fail "git checkout failed"
-    finish failed
-    exit 1
-fi
 git log -1 --oneline
 
 section "Configuring local_vars.yml (tiny profile)"
@@ -2115,15 +2262,34 @@ if [ "${ADMIN_CONSOLE:-1}" = "1" ]; then
         "https://github.com/iiab/iiab-admin-console.git" \
         /opt/iiab/iiab-admin-console; then
         ADMIN_CONSOLE_RC=0
-        if [ -n "${ADMIN_CONSOLE_REF:-}" ]; then
-            if ! git -C /opt/iiab/iiab-admin-console fetch \
-                --depth=1 origin "$ADMIN_CONSOLE_REF" || \
-                ! git -C /opt/iiab/iiab-admin-console checkout --detach \
-                FETCH_HEAD; then
-                ADMIN_CONSOLE_RC=1
-                fail "could not fetch Admin Console ref $ADMIN_CONSOLE_REF"
-            fi
+        read -r -a ADMIN_CONSOLE_REFS_LIST <<< \
+            "${ADMIN_CONSOLE_REFS:-${ADMIN_CONSOLE_REF:-}}"
+        ADMIN_CONSOLE_FETCH_ARGS=()
+        if [ "${#ADMIN_CONSOLE_REFS_LIST[@]}" -eq 1 ]; then
+            ADMIN_CONSOLE_FETCH_ARGS=(--depth=1)
         fi
+        for i in "${!ADMIN_CONSOLE_REFS_LIST[@]}"; do
+            if ! git -C /opt/iiab/iiab-admin-console fetch \
+                "${ADMIN_CONSOLE_FETCH_ARGS[@]}" origin \
+                "${ADMIN_CONSOLE_REFS_LIST[$i]}"; then
+                ADMIN_CONSOLE_RC=1
+                fail "could not fetch Admin Console ref ${ADMIN_CONSOLE_REFS_LIST[$i]}"
+                break
+            fi
+            if [ "$i" -eq 0 ]; then
+                if ! git -C /opt/iiab/iiab-admin-console checkout --detach \
+                    FETCH_HEAD; then
+                    ADMIN_CONSOLE_RC=1
+                    fail "could not checkout Admin Console PR"
+                    break
+                fi
+            elif ! git -C /opt/iiab/iiab-admin-console merge \
+                --no-edit --no-ff FETCH_HEAD; then
+                ADMIN_CONSOLE_RC=1
+                fail "could not merge Admin Console PRs"
+                break
+            fi
+        done
         if [ "$ADMIN_CONSOLE_RC" -eq 0 ]; then
             if cd /opt/iiab/iiab-admin-console && ./install; then
                 :
@@ -2894,7 +3060,7 @@ def make_stage(
     *,
     args: argparse.Namespace,
     probe: dict[str, Any],
-    pr: PRInfo,
+    pr: PRSet,
     image: ImageInfo,
     hostname: str,
     post_user: str,
@@ -2902,7 +3068,7 @@ def make_stage(
     is_root_disk: bool,
     roles: list[str],
     roles_override: bool,
-    admin_console_ref: str,
+    admin_console_refs: list[str],
     user_data: str,
     network_config: str,
     meta_data: str,
@@ -2934,11 +3100,16 @@ def make_stage(
     env_values: dict[str, Any] = {
         "PR_REPO": pr.repo,
         "PR_NUMBER": pr.number,
+        "PR_NUMBERS": json.dumps(pr.numbers),
         "PR_TITLE": pr.title,
         "PR_URL": pr.url,
+        "PR_URLS": json.dumps(pr.urls),
         "PR_REF": pr.merge_ref or pr.head_ref,
+        "PR_REFS": " ".join(pr.refs),
         "PR_REF_HEAD": pr.head_ref,
+        "PR_REF_HEADS": " ".join(pr.ref_heads),
         "PR_HEAD_SHA": pr.head_sha,
+        "PR_HEAD_SHAS": " ".join(pr.head_shas),
         "PR_MERGE_REF": pr.merge_ref,
         "PROFILE": profile,
         "ARCH": arch,
@@ -2958,7 +3129,8 @@ def make_stage(
         "ROLES_AUTO": roles_auto_text,
         "ROLES_OVERRIDE": "1" if roles_override else "0",
         "ADMIN_CONSOLE": "0" if args.no_admin_console else "1",
-        "ADMIN_CONSOLE_REF": admin_console_ref,
+        "ADMIN_CONSOLE_REF": admin_console_refs[0] if admin_console_refs else "",
+        "ADMIN_CONSOLE_REFS": " ".join(admin_console_refs),
         "RUN_MODULE_TESTS": (
             "1" if pr.modules_changed and not args.no_module_tests else "0"
         ),
@@ -3501,9 +3673,10 @@ def print_result(result: dict[str, Any] | None, remote: Remote) -> None:
         print(f"  Roles:        {' '.join(result.get('roles') or []) or '<none>'}")
         print(f"  iiab-install: {result.get('install_rc')}")
         print(f"  admin console: {result.get('admin_console_rc')}")
+        admin_console_refs = result.get("admin_console_refs") or []
         print(
             "  admin console ref: "
-            f"{result.get('admin_console_ref') or 'default branch'}"
+            f"{', '.join(admin_console_refs) if admin_console_refs else 'default branch'}"
         )
         print(f"  roles:        {result.get('roles_rc')}")
         print(f"  modules:      {result.get('module_tests_rc')}")
@@ -3537,7 +3710,7 @@ def print_plan(
     *,
     remote: Remote,
     probe: dict[str, Any],
-    pr: PRInfo,
+    pr: PRSet,
     image: ImageInfo,
     hostname: str,
     disk_dev: str,
@@ -3547,7 +3720,7 @@ def print_plan(
     roles: list[str],
     roles_override: bool,
     admin_console: bool,
-    admin_console_ref: str,
+    admin_console_refs: list[str],
     network_notes: list[str],
     netburn_url: str,
     post_user: str,
@@ -3570,14 +3743,16 @@ def print_plan(
     print(f"Target RAM:    {probe.get('MEM_MB', '?')} MiB; "
           f"/var/tmp free: {probe.get('FREE_MB', '?')} MiB")
     print(f"PR:            {pr.url}  [{pr.state}{', draft' if pr.draft else ''}]")
-    print(f"PR ref:        {pr.merge_ref or pr.head_ref}")
+    if len(pr.items) > 1:
+        print(f"PRs:           {', '.join(pr.urls)}")
+    print(f"PR ref:        {', '.join(pr.refs)}")
     print(f"Changed roles: {' '.join(pr.auto_roles) or '<none>'}")
     print(f"Roles to run:  {' '.join(roles) or '<none>'}"
           f"{' (override)' if roles_override else ' (auto)'}"
           f"  [0-init runs first via runroles-base.yml]")
     admin_label = "enabled" if admin_console else "disabled"
-    if admin_console_ref:
-        admin_label += f" ({admin_console_ref})"
+    if admin_console_refs:
+        admin_label += f" ({', '.join(admin_console_refs)})"
     print(f"Admin Console: {admin_label}")
     print(f"Post-boot SSH: {post_user}@{remote.host}")
     print("Console:       tty0 and ttyS0,115200")
@@ -3602,13 +3777,13 @@ def print_local_plan(
     device: str,
     disk_info: dict[str, Any],
     image: ImageInfo,
-    pr: PRInfo,
+    pr: PRSet,
     hostname: str,
     profile: str,
     roles: list[str],
     roles_override: bool,
     admin_console: bool,
-    admin_console_ref: str,
+    admin_console_refs: list[str],
     post_user: str,
 ) -> None:
     print()
@@ -3625,12 +3800,14 @@ def print_local_plan(
     print(f"New hostname:   {hostname}")
     print(f"Profile:        {profile}")
     print(f"PR:             {pr.url}  [{pr.state}{', draft' if pr.draft else ''}]")
-    print(f"PR ref:         {pr.merge_ref or pr.head_ref}")
+    if len(pr.items) > 1:
+        print(f"PRs:            {', '.join(pr.urls)}")
+    print(f"PR ref:         {', '.join(pr.refs)}")
     print(f"Roles to run:   {' '.join(roles) or '<none>'}"
           f"{' (override)' if roles_override else ' (auto)'}")
     admin_label = "enabled" if admin_console else "disabled"
-    if admin_console_ref:
-        admin_label += f" ({admin_console_ref})"
+    if admin_console_refs:
+        admin_label += f" ({', '.join(admin_console_refs)})"
     print(f"Admin Console:  {admin_label}")
     print(f"First-boot user: {post_user}")
     print("First boot:     IIAB installation runs locally after the Pi boots")
@@ -3665,14 +3842,10 @@ def run_local_mode(args: argparse.Namespace) -> int:
     profile = "rpi" if args.profile == "auto" else args.profile
     arch = "aarch64" if profile == "rpi" else "x86_64"
 
-    repo, pr_number = parse_pr_arg(args.pr)
-    log(f"resolving {repo}#{pr_number}")
-    pr = resolve_pr(repo, pr_number)
-    if not (pr.merge_ref or pr.head_ref):
-        die("could not determine a ref to fetch for the PR")
+    pr = resolve_pr_set(args.pr)
     if args.no_admin_console and args.admin_console_pr:
         die("--admin-console-pr cannot be combined with --no-admin-console")
-    admin_console_ref = resolve_admin_console_ref(args.admin_console_pr)
+    admin_console_refs = resolve_admin_console_refs(args.admin_console_pr)
 
     probe: dict[str, Any] = {
         "HOSTNAME": "",
@@ -3736,7 +3909,7 @@ def run_local_mode(args: argparse.Namespace) -> int:
         roles=roles,
         roles_override=roles_override,
         admin_console=not args.no_admin_console,
-        admin_console_ref=admin_console_ref,
+        admin_console_refs=admin_console_refs,
         post_user=post_user,
     )
     if not args.yes and not args.dry_run:
@@ -3759,7 +3932,7 @@ def run_local_mode(args: argparse.Namespace) -> int:
             is_root_disk=False,
             roles=roles,
             roles_override=roles_override,
-            admin_console_ref=admin_console_ref,
+            admin_console_refs=admin_console_refs,
             user_data=user_data,
             network_config=network_config,
             meta_data=meta_data,
@@ -3845,7 +4018,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "pr",
         nargs="?",
-        help="PR number (4543) or full github.com/.../pull/4543 URL",
+        help=(
+            "PR number(s), comma-separated (4543,4544), or full "
+            "github.com/.../pull/4543 URL(s)"
+        ),
     )
     p.add_argument(
         "--local-device",
@@ -3971,8 +4147,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--admin-console-pr",
         metavar="PR",
         help=(
-            "install an Admin Console PR during first boot, e.g. 677; "
-            "accepts a number, owner/repo#number, or GitHub PR URL"
+            "install Admin Console PR(s) during first boot, comma-separated "
+            "(e.g. 677,678); accepts a number, owner/repo#number, or "
+            "GitHub PR URL"
         ),
     )
     p.add_argument(
@@ -4013,7 +4190,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if args.pr is None and args.address:
             args.pr, args.address = args.address, None
         if args.pr is None:
-            p.error("a PR number or URL is required")
+            p.error("one or more PR numbers or URLs are required")
         if not args.image:
             p.error("--image is required with --local-device")
     elif not args.address or not args.pr:
@@ -4091,20 +4268,17 @@ def main(argv: list[str] | None = None) -> int:
 
         disk_dev, disk_info, is_root_disk = choose_disk(probe, args.disk)
 
-        repo, pr_number = parse_pr_arg(args.pr)
-        log(f"resolving {repo}#{pr_number}")
-        pr = resolve_pr(repo, pr_number)
-        log(
-            f"PR: {pr.title} [{pr.state}{', draft' if pr.draft else ''}]"
-        )
+        pr = resolve_pr_set(args.pr)
+        for item in pr.items:
+            log(
+                f"PR: {item.title} [{item.state}{', draft' if item.draft else ''}]"
+            )
         log(f"changed roles: {' '.join(pr.auto_roles) or '<none>'}")
         if pr.modules_changed:
             log("PR also changes modules/; get_curl tests will run on first boot")
-        if not (pr.merge_ref or pr.head_ref):
-            die("could not determine a ref to fetch for the PR")
         if args.no_admin_console and args.admin_console_pr:
             die("--admin-console-pr cannot be combined with --no-admin-console")
-        admin_console_ref = resolve_admin_console_ref(args.admin_console_pr)
+        admin_console_refs = resolve_admin_console_refs(args.admin_console_pr)
 
         log("resolving the image")
         image = choose_image(profile, arch)
@@ -4177,7 +4351,7 @@ def main(argv: list[str] | None = None) -> int:
             roles=roles,
             roles_override=roles_override,
             admin_console=not args.no_admin_console,
-            admin_console_ref=admin_console_ref,
+            admin_console_refs=admin_console_refs,
             network_notes=network_notes,
             netburn_url=(
                 "(not downloaded in --dry-run; would be served over HTTP)"
@@ -4211,7 +4385,7 @@ def main(argv: list[str] | None = None) -> int:
                 is_root_disk=is_root_disk,
                 roles=roles,
                 roles_override=roles_override,
-                admin_console_ref=admin_console_ref,
+                admin_console_refs=admin_console_refs,
                 user_data=user_data,
                 network_config=network_config,
                 meta_data=meta_data,
@@ -4254,7 +4428,7 @@ def main(argv: list[str] | None = None) -> int:
             is_root_disk=is_root_disk,
             roles=roles,
             roles_override=roles_override,
-            admin_console_ref=admin_console_ref,
+            admin_console_refs=admin_console_refs,
             user_data=user_data,
             network_config=network_config,
             meta_data=meta_data,
