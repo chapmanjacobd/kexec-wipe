@@ -284,9 +284,13 @@ The injected unit is `iiab-deploy-firstboot.service`. On first boot it:
    `iiab_hostname`, the pinned WAN values, and `rpi_image` on Raspberry Pi.
 5. Runs `scripts/ansible` and `./iiab-install` (default `--risky`; use
    `--install-args ''` for strict mode).
-6. Runs the changed-role play (`runroles-base.yml` plus the selected roles),
+6. Clones and installs IIAB's separate Admin Console repository by default.
+   Use `--no-admin-console` to skip it.
+7. Runs the changed-role play (`runroles-base.yml` plus the selected roles),
    then the module tests if applicable, and writes a state diff.
-7. Writes `result.json` and a `done` or `failed` marker.
+8. Writes `result.json` and a `done` or `failed` marker.
+9. Reboots after a successful install so newly installed services, including
+   the IIAB Wi-Fi hotspot, activate.
 
 Logs and state are under:
 

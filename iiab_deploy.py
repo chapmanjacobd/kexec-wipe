@@ -1806,6 +1806,7 @@ fi
 START=$(date -Is)
 export START
 INSTALL_RC=""
+ADMIN_CONSOLE_RC=""
 ROLES_RC=""
 MODULE_RC=""
 RESULT="$STATE_DIR/result.json"
@@ -1823,7 +1824,8 @@ write_result() {
     STATUS="$1"
     FINISHED=$(date -Is)
     export START STATUS FINISHED PR_REPO PR_NUMBER PR_TITLE PR_URL PR_REF PR_HEAD_SHA
-    export PROFILE HOSTNAME ROLES ROLES_AUTO ROLES_OVERRIDE INSTALL_RC
+    export PROFILE HOSTNAME ROLES ROLES_AUTO ROLES_OVERRIDE ADMIN_CONSOLE INSTALL_RC
+    export ADMIN_CONSOLE_RC
     export ROLES_RC MODULE_RC LOG FAILED STATE_DIFF
     python3 - "$RESULT" <<'PY' || true
 import json, os, sys
@@ -1850,7 +1852,9 @@ data = {
     "roles": os.environ.get("ROLES", "").split(),
     "roles_auto": os.environ.get("ROLES_AUTO", "").split(),
     "roles_override": os.environ.get("ROLES_OVERRIDE") == "1",
+    "admin_console": os.environ.get("ADMIN_CONSOLE", "1") == "1",
     "install_rc": as_int("INSTALL_RC"),
+    "admin_console_rc": as_int("ADMIN_CONSOLE_RC"),
     "roles_rc": as_int("ROLES_RC"),
     "module_tests_rc": as_int("MODULE_RC"),
     "log": os.environ.get("LOG"),
@@ -1891,10 +1895,12 @@ echo "Hostname:    $HOSTNAME"
 echo "Roles:       ${ROLES:-<none>}"
 echo "Auto roles:  ${ROLES_AUTO:-<none>}"
 echo "Override:    $ROLES_OVERRIDE"
+echo "Admin Console: $([ "${ADMIN_CONSOLE:-1}" = "1" ] && echo enabled || echo disabled)"
 echo "Started:     $START"
 
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export HOME=/root
 
 section "Waiting for the network"
 for _ in $(seq 1 60); do
@@ -1984,6 +1990,22 @@ section "Configuring local_vars.yml (tiny profile)"
 mkdir -p /etc/iiab
 cp vars/local_vars_tiny.yml /etc/iiab/local_vars.yml
 sed -i "s|^iiab_hostname:.*|iiab_hostname: $HOSTNAME|" /etc/iiab/local_vars.yml
+set_iiab_var() {
+    key="$1"
+    value="$2"
+    if grep -qE "^${key}:" /etc/iiab/local_vars.yml; then
+        sed -i -E "s|^${key}:.*|${key}: ${value}|" /etc/iiab/local_vars.yml
+    else
+        echo "${key}: ${value}" >> /etc/iiab/local_vars.yml
+    fi
+}
+if [ "${ADMIN_CONSOLE:-1}" = "1" ]; then
+    set_iiab_var admin_console_install True
+    set_iiab_var admin_console_enabled True
+else
+    set_iiab_var admin_console_install False
+    set_iiab_var admin_console_enabled False
+fi
 if [ "$PROFILE" = "rpi" ]; then
     if grep -qE '^rpi_image:' /etc/iiab/local_vars.yml; then
         sed -i -E 's|^rpi_image:.*|rpi_image: True|' /etc/iiab/local_vars.yml
@@ -1998,7 +2020,7 @@ if [ -n "${PIN_IP:-}" ]; then
     [ -n "${PIN_DNS:-}" ] && sed -i "s|^wan_nameserver:.*|wan_nameserver: $PIN_DNS|" /etc/iiab/local_vars.yml
     echo "Pinned IIAB WAN address: $PIN_IP $PIN_NETMASK via ${PIN_GATEWAY:-?}"
 fi
-grep -E '^(iiab_hostname|wan_ip|wan_netmask|wan_gateway):' /etc/iiab/local_vars.yml || true
+grep -E '^(iiab_hostname|admin_console_install|admin_console_enabled|wan_ip|wan_netmask|wan_gateway):' /etc/iiab/local_vars.yml || true
 
 section "Installing Ansible"
 if ! scripts/ansible; then
@@ -2064,6 +2086,29 @@ if [ "${RUN_MODULE_TESTS:-0}" = "1" ] && [ -f modules/tests/get_curl.yml ]; then
     [ "$MODULE_RC" -eq 0 ] || fail "module tests failed"
 fi
 
+if [ "${ADMIN_CONSOLE:-1}" = "1" ]; then
+    section "Installing IIAB Admin Console"
+    rm -rf /opt/iiab/iiab-admin-console
+    if git clone --progress \
+        "https://github.com/iiab/iiab-admin-console.git" \
+        /opt/iiab/iiab-admin-console; then
+        if cd /opt/iiab/iiab-admin-console && ./install; then
+            ADMIN_CONSOLE_RC=0
+        else
+            ADMIN_CONSOLE_RC=$?
+            fail "iiab-admin-console install failed"
+        fi
+    else
+        ADMIN_CONSOLE_RC=$?
+        fail "git clone of iiab-admin-console failed"
+    fi
+    cd /opt/iiab/iiab || {
+        fail "cannot return to /opt/iiab/iiab"
+        finish failed
+        exit 1
+    }
+fi
+
 EXPECTED=".github/workflows/tests/expected_state_tiny_image.yml"
 if [ -f "$EXPECTED" ] && [ -f /etc/iiab/iiab_state.yml ]; then
     section "Comparing IIAB state"
@@ -2082,6 +2127,14 @@ fi
 
 if [ "$FAILED" -eq 0 ]; then
     finish success
+    echo "Rebooting to activate installed services"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reboot || \
+            echo "WARNING: automatic reboot failed; reboot the target manually"
+    else
+        reboot || \
+            echo "WARNING: automatic reboot failed; reboot the target manually"
+    fi
 else
     finish failed
 fi
@@ -2869,6 +2922,7 @@ def make_stage(
         "ROLES": roles_text,
         "ROLES_AUTO": roles_auto_text,
         "ROLES_OVERRIDE": "1" if roles_override else "0",
+        "ADMIN_CONSOLE": "0" if args.no_admin_console else "1",
         "RUN_MODULE_TESTS": (
             "1" if pr.modules_changed and not args.no_module_tests else "0"
         ),
@@ -3410,6 +3464,7 @@ def print_result(result: dict[str, Any] | None, remote: Remote) -> None:
         print(f"  Hostname:     {result.get('hostname', '')}")
         print(f"  Roles:        {' '.join(result.get('roles') or []) or '<none>'}")
         print(f"  iiab-install: {result.get('install_rc')}")
+        print(f"  admin console: {result.get('admin_console_rc')}")
         print(f"  roles:        {result.get('roles_rc')}")
         print(f"  modules:      {result.get('module_tests_rc')}")
         print(f"  Log:          {result.get('log', '')}")
@@ -3451,6 +3506,7 @@ def print_plan(
     profile: str,
     roles: list[str],
     roles_override: bool,
+    admin_console: bool,
     network_notes: list[str],
     netburn_url: str,
     post_user: str,
@@ -3478,6 +3534,7 @@ def print_plan(
     print(f"Roles to run:  {' '.join(roles) or '<none>'}"
           f"{' (override)' if roles_override else ' (auto)'}"
           f"  [0-init runs first via runroles-base.yml]")
+    print(f"Admin Console: {'enabled' if admin_console else 'disabled'}")
     print(f"Post-boot SSH: {post_user}@{remote.host}")
     print("Console:       tty0 and ttyS0,115200")
     if not is_root_disk:
@@ -3506,6 +3563,7 @@ def print_local_plan(
     profile: str,
     roles: list[str],
     roles_override: bool,
+    admin_console: bool,
     post_user: str,
 ) -> None:
     print()
@@ -3525,6 +3583,7 @@ def print_local_plan(
     print(f"PR ref:         {pr.merge_ref or pr.head_ref}")
     print(f"Roles to run:   {' '.join(roles) or '<none>'}"
           f"{' (override)' if roles_override else ' (auto)'}")
+    print(f"Admin Console:  {'enabled' if admin_console else 'disabled'}")
     print(f"First-boot user: {post_user}")
     print("First boot:     IIAB installation runs locally after the Pi boots")
     print("=" * 70)
@@ -3625,6 +3684,7 @@ def run_local_mode(args: argparse.Namespace) -> int:
         profile=profile,
         roles=roles,
         roles_override=roles_override,
+        admin_console=not args.no_admin_console,
         post_user=post_user,
     )
     if not args.yes and not args.dry_run:
@@ -3850,6 +3910,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="do not run modules/tests/get_curl.yml when modules/ changed",
     )
     p.add_argument(
+        "--no-admin-console",
+        action="store_true",
+        help="do not install or enable IIAB's Admin Console (enabled by default)",
+    )
+    p.add_argument(
         "--no-follow",
         action="store_true",
         help="wait for the result without tailing the first-boot log",
@@ -4047,6 +4112,7 @@ def main(argv: list[str] | None = None) -> int:
             profile=profile,
             roles=roles,
             roles_override=roles_override,
+            admin_console=not args.no_admin_console,
             network_notes=network_notes,
             netburn_url=(
                 "(not downloaded in --dry-run; would be served over HTTP)"
