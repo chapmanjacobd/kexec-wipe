@@ -1695,7 +1695,11 @@ def install_local_payload(stage: Path, device: str) -> None:
         hosts.write_text("\n".join(host_lines) + "\n", encoding="utf-8")
         machine_id = root_dir / "etc/machine-id"
         if machine_id.exists():
-            machine_id.write_text("", encoding="utf-8")
+            # systemd treats an empty /etc/machine-id as NOT first boot.
+            # The literal "uninitialized" marker is what makes
+            # ConditionFirstBoot=yes units (SSH host key generation, root
+            # filesystem resize, ...) run on the first boot.
+            machine_id.write_text("uninitialized\n", encoding="utf-8")
         dbus_machine_id = root_dir / "var/lib/dbus/machine-id"
         if dbus_machine_id.exists() or dbus_machine_id.is_symlink():
             dbus_machine_id.unlink()
@@ -1750,7 +1754,7 @@ def install_local_payload(stage: Path, device: str) -> None:
 
 FIRSTBOOT_UNIT = r'''[Unit]
 Description=IIAB deploy first-boot install
-Wants=network-online.target
+Wants=network-online.target cloud-final.service
 After=cloud-final.service network-online.target
 ConditionPathExists=!/var/lib/iiab-deploy/attempted
 ConditionPathExists=!/var/lib/iiab-deploy/done
@@ -1765,7 +1769,12 @@ TimeoutStartSec=0
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
+# cloud-final.service is ordered After=multi-user.target on Raspberry Pi
+# OS.  Being WantedBy=multi-user.target with After=cloud-final.service
+# therefore creates an ordering cycle, and systemd deletes this unit's start
+# job to break it (so the install never runs).  cloud-init.target is the
+# synchronization point that is itself after multi-user/cloud-final.
+WantedBy=cloud-init.target
 '''
 
 FIRSTBOOT_SH = r'''#!/bin/bash
@@ -2662,7 +2671,10 @@ if [ -f /newroot/etc/hosts ]; then
     grep -q '^127\.0\.1\.1' /newroot/etc/hosts 2>/dev/null || \
         echo "127.0.1.1 $HOSTNAME" >> /newroot/etc/hosts
 fi
-: > /newroot/etc/machine-id 2>/dev/null || true
+# systemd treats an empty machine-id as NOT first boot.  Its
+# "uninitialized" marker keeps ConditionFirstBoot=yes units (SSH host key
+# generation, root filesystem resize, ...) enabled.
+printf 'uninitialized\n' > /newroot/etc/machine-id 2>/dev/null || true
 rm -f /newroot/var/lib/dbus/machine-id 2>/dev/null || true
 
 for svc in /lib/systemd/system/ssh.service /usr/lib/systemd/system/ssh.service; do
@@ -2822,7 +2834,7 @@ def make_stage(
         stage = Path(tempfile.mkdtemp(prefix="iiab-deploy."))
 
     payload = stage / "payload"
-    (payload / "etc/systemd/system/multi-user.target.wants").mkdir(parents=True)
+    (payload / "etc/systemd/system/cloud-init.target.wants").mkdir(parents=True)
     (payload / "usr/local/sbin").mkdir(parents=True)
     (payload / "var/lib/iiab-deploy/cloudinit").mkdir(parents=True)
 
@@ -2889,7 +2901,7 @@ def make_stage(
     os.chmod(firstboot, 0o755)
     link = (
         payload
-        / "etc/systemd/system/multi-user.target.wants/"
+        / "etc/systemd/system/cloud-init.target.wants/"
         "iiab-deploy-firstboot.service"
     )
     link.symlink_to("../iiab-deploy-firstboot.service")
