@@ -1,3 +1,4 @@
 *.cpio.gz
 *.o
 /tmp/
+__pycache__/
