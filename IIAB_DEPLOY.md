@@ -285,7 +285,9 @@ The injected unit is `iiab-deploy-firstboot.service`. On first boot it:
 5. Runs `scripts/ansible` and `./iiab-install` (default `--risky`; use
    `--install-args ''` for strict mode).
 6. Clones and installs IIAB's separate Admin Console repository by default.
-   Use `--no-admin-console` to skip it.
+   Use `--no-admin-console` to skip it, or `--admin-console-pr 677` to
+   install a specific Admin Console pull request instead of its default
+   branch.
 7. Runs the changed-role play (`runroles-base.yml` plus the selected roles),
    then the module tests if applicable, and writes a state diff.
 8. Writes `result.json` and a `done` or `failed` marker.

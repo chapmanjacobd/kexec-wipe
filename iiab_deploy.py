@@ -64,6 +64,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 DEFAULT_REPO = "iiab/iiab"
+DEFAULT_ADMIN_CONSOLE_REPO = "iiab/iiab-admin-console"
 DEFAULT_SSH_PORT = 22
 NETBURN_STALL_MINUTES = 15
 REMOTE_STAGE = "/var/tmp/iiab-deploy"
@@ -556,8 +557,10 @@ class PRInfo:
         }
 
 
-def parse_pr_arg(arg: str) -> tuple[str, int]:
-    """Accept 4543, iiab/iiab#4543, or a full GitHub pull URL."""
+def parse_pr_arg(
+    arg: str, default_repo: str = DEFAULT_REPO
+) -> tuple[str, int]:
+    """Accept a number, owner/repo#number, or a full GitHub pull URL."""
     m = re.match(
         r"^https?://(?:www\.)?github\.com/([^/]+)/([^/]+)/pull/(\d+)(?:/.*)?$",
         arg.strip(),
@@ -568,7 +571,7 @@ def parse_pr_arg(arg: str) -> tuple[str, int]:
     if m:
         return f"{m.group(1)}/{m.group(2)}", int(m.group(3))
     if arg.strip().isdigit():
-        return DEFAULT_REPO, int(arg.strip())
+        return default_repo, int(arg.strip())
     die(f"could not parse PR {arg!r} (use 4543 or a github.com/.../pull/4543 URL)")
 
 
@@ -752,6 +755,22 @@ def resolve_pr(repo: str, number: int) -> PRInfo:
         modules_changed=modules_changed,
         cross_repo=bool(fields.get("isCrossRepository", False)),
     )
+
+
+def resolve_admin_console_ref(arg: str | None) -> str:
+    if not arg:
+        return ""
+    repo, number = parse_pr_arg(arg, DEFAULT_ADMIN_CONSOLE_REPO)
+    if repo != DEFAULT_ADMIN_CONSOLE_REPO:
+        die(
+            f"Admin Console PR must be from {DEFAULT_ADMIN_CONSOLE_REPO}, "
+            f"not {repo}"
+        )
+    log(f"resolving Admin Console {repo}#{number}")
+    pr = resolve_pr(repo, number)
+    if not (pr.merge_ref or pr.head_ref):
+        die("could not determine a ref to fetch for the Admin Console PR")
+    return pr.merge_ref or pr.head_ref
 
 
 # ---------------------------------------------------------------------------
@@ -1824,7 +1843,8 @@ write_result() {
     STATUS="$1"
     FINISHED=$(date -Is)
     export START STATUS FINISHED PR_REPO PR_NUMBER PR_TITLE PR_URL PR_REF PR_HEAD_SHA
-    export PROFILE HOSTNAME ROLES ROLES_AUTO ROLES_OVERRIDE ADMIN_CONSOLE INSTALL_RC
+    export PROFILE HOSTNAME ROLES ROLES_AUTO ROLES_OVERRIDE ADMIN_CONSOLE
+    export ADMIN_CONSOLE_REF INSTALL_RC
     export ADMIN_CONSOLE_RC
     export ROLES_RC MODULE_RC LOG FAILED STATE_DIFF
     python3 - "$RESULT" <<'PY' || true
@@ -1853,6 +1873,7 @@ data = {
     "roles_auto": os.environ.get("ROLES_AUTO", "").split(),
     "roles_override": os.environ.get("ROLES_OVERRIDE") == "1",
     "admin_console": os.environ.get("ADMIN_CONSOLE", "1") == "1",
+    "admin_console_ref": os.environ.get("ADMIN_CONSOLE_REF", ""),
     "install_rc": as_int("INSTALL_RC"),
     "admin_console_rc": as_int("ADMIN_CONSOLE_RC"),
     "roles_rc": as_int("ROLES_RC"),
@@ -1896,6 +1917,7 @@ echo "Roles:       ${ROLES:-<none>}"
 echo "Auto roles:  ${ROLES_AUTO:-<none>}"
 echo "Override:    $ROLES_OVERRIDE"
 echo "Admin Console: $([ "${ADMIN_CONSOLE:-1}" = "1" ] && echo enabled || echo disabled)"
+echo "Admin Console ref: ${ADMIN_CONSOLE_REF:-default branch}"
 echo "Started:     $START"
 
 export DEBIAN_FRONTEND=noninteractive
@@ -2092,11 +2114,23 @@ if [ "${ADMIN_CONSOLE:-1}" = "1" ]; then
     if git clone --progress \
         "https://github.com/iiab/iiab-admin-console.git" \
         /opt/iiab/iiab-admin-console; then
-        if cd /opt/iiab/iiab-admin-console && ./install; then
-            ADMIN_CONSOLE_RC=0
-        else
-            ADMIN_CONSOLE_RC=$?
-            fail "iiab-admin-console install failed"
+        ADMIN_CONSOLE_RC=0
+        if [ -n "${ADMIN_CONSOLE_REF:-}" ]; then
+            if ! git -C /opt/iiab/iiab-admin-console fetch \
+                --depth=1 origin "$ADMIN_CONSOLE_REF" || \
+                ! git -C /opt/iiab/iiab-admin-console checkout --detach \
+                FETCH_HEAD; then
+                ADMIN_CONSOLE_RC=1
+                fail "could not fetch Admin Console ref $ADMIN_CONSOLE_REF"
+            fi
+        fi
+        if [ "$ADMIN_CONSOLE_RC" -eq 0 ]; then
+            if cd /opt/iiab/iiab-admin-console && ./install; then
+                :
+            else
+                ADMIN_CONSOLE_RC=$?
+                fail "iiab-admin-console install failed"
+            fi
         fi
     else
         ADMIN_CONSOLE_RC=$?
@@ -2868,6 +2902,7 @@ def make_stage(
     is_root_disk: bool,
     roles: list[str],
     roles_override: bool,
+    admin_console_ref: str,
     user_data: str,
     network_config: str,
     meta_data: str,
@@ -2923,6 +2958,7 @@ def make_stage(
         "ROLES_AUTO": roles_auto_text,
         "ROLES_OVERRIDE": "1" if roles_override else "0",
         "ADMIN_CONSOLE": "0" if args.no_admin_console else "1",
+        "ADMIN_CONSOLE_REF": admin_console_ref,
         "RUN_MODULE_TESTS": (
             "1" if pr.modules_changed and not args.no_module_tests else "0"
         ),
@@ -3465,6 +3501,10 @@ def print_result(result: dict[str, Any] | None, remote: Remote) -> None:
         print(f"  Roles:        {' '.join(result.get('roles') or []) or '<none>'}")
         print(f"  iiab-install: {result.get('install_rc')}")
         print(f"  admin console: {result.get('admin_console_rc')}")
+        print(
+            "  admin console ref: "
+            f"{result.get('admin_console_ref') or 'default branch'}"
+        )
         print(f"  roles:        {result.get('roles_rc')}")
         print(f"  modules:      {result.get('module_tests_rc')}")
         print(f"  Log:          {result.get('log', '')}")
@@ -3507,6 +3547,7 @@ def print_plan(
     roles: list[str],
     roles_override: bool,
     admin_console: bool,
+    admin_console_ref: str,
     network_notes: list[str],
     netburn_url: str,
     post_user: str,
@@ -3534,7 +3575,10 @@ def print_plan(
     print(f"Roles to run:  {' '.join(roles) or '<none>'}"
           f"{' (override)' if roles_override else ' (auto)'}"
           f"  [0-init runs first via runroles-base.yml]")
-    print(f"Admin Console: {'enabled' if admin_console else 'disabled'}")
+    admin_label = "enabled" if admin_console else "disabled"
+    if admin_console_ref:
+        admin_label += f" ({admin_console_ref})"
+    print(f"Admin Console: {admin_label}")
     print(f"Post-boot SSH: {post_user}@{remote.host}")
     print("Console:       tty0 and ttyS0,115200")
     if not is_root_disk:
@@ -3564,6 +3608,7 @@ def print_local_plan(
     roles: list[str],
     roles_override: bool,
     admin_console: bool,
+    admin_console_ref: str,
     post_user: str,
 ) -> None:
     print()
@@ -3583,7 +3628,10 @@ def print_local_plan(
     print(f"PR ref:         {pr.merge_ref or pr.head_ref}")
     print(f"Roles to run:   {' '.join(roles) or '<none>'}"
           f"{' (override)' if roles_override else ' (auto)'}")
-    print(f"Admin Console:  {'enabled' if admin_console else 'disabled'}")
+    admin_label = "enabled" if admin_console else "disabled"
+    if admin_console_ref:
+        admin_label += f" ({admin_console_ref})"
+    print(f"Admin Console:  {admin_label}")
     print(f"First-boot user: {post_user}")
     print("First boot:     IIAB installation runs locally after the Pi boots")
     print("=" * 70)
@@ -3622,6 +3670,9 @@ def run_local_mode(args: argparse.Namespace) -> int:
     pr = resolve_pr(repo, pr_number)
     if not (pr.merge_ref or pr.head_ref):
         die("could not determine a ref to fetch for the PR")
+    if args.no_admin_console and args.admin_console_pr:
+        die("--admin-console-pr cannot be combined with --no-admin-console")
+    admin_console_ref = resolve_admin_console_ref(args.admin_console_pr)
 
     probe: dict[str, Any] = {
         "HOSTNAME": "",
@@ -3685,6 +3736,7 @@ def run_local_mode(args: argparse.Namespace) -> int:
         roles=roles,
         roles_override=roles_override,
         admin_console=not args.no_admin_console,
+        admin_console_ref=admin_console_ref,
         post_user=post_user,
     )
     if not args.yes and not args.dry_run:
@@ -3707,6 +3759,7 @@ def run_local_mode(args: argparse.Namespace) -> int:
             is_root_disk=False,
             roles=roles,
             roles_override=roles_override,
+            admin_console_ref=admin_console_ref,
             user_data=user_data,
             network_config=network_config,
             meta_data=meta_data,
@@ -3915,6 +3968,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="do not install or enable IIAB's Admin Console (enabled by default)",
     )
     p.add_argument(
+        "--admin-console-pr",
+        metavar="PR",
+        help=(
+            "install an Admin Console PR during first boot, e.g. 677; "
+            "accepts a number, owner/repo#number, or GitHub PR URL"
+        ),
+    )
+    p.add_argument(
         "--no-follow",
         action="store_true",
         help="wait for the result without tailing the first-boot log",
@@ -4041,6 +4102,9 @@ def main(argv: list[str] | None = None) -> int:
             log("PR also changes modules/; get_curl tests will run on first boot")
         if not (pr.merge_ref or pr.head_ref):
             die("could not determine a ref to fetch for the PR")
+        if args.no_admin_console and args.admin_console_pr:
+            die("--admin-console-pr cannot be combined with --no-admin-console")
+        admin_console_ref = resolve_admin_console_ref(args.admin_console_pr)
 
         log("resolving the image")
         image = choose_image(profile, arch)
@@ -4113,6 +4177,7 @@ def main(argv: list[str] | None = None) -> int:
             roles=roles,
             roles_override=roles_override,
             admin_console=not args.no_admin_console,
+            admin_console_ref=admin_console_ref,
             network_notes=network_notes,
             netburn_url=(
                 "(not downloaded in --dry-run; would be served over HTTP)"
@@ -4146,6 +4211,7 @@ def main(argv: list[str] | None = None) -> int:
                 is_root_disk=is_root_disk,
                 roles=roles,
                 roles_override=roles_override,
+                admin_console_ref=admin_console_ref,
                 user_data=user_data,
                 network_config=network_config,
                 meta_data=meta_data,
@@ -4188,6 +4254,7 @@ def main(argv: list[str] | None = None) -> int:
             is_root_disk=is_root_disk,
             roles=roles,
             roles_override=roles_override,
+            admin_console_ref=admin_console_ref,
             user_data=user_data,
             network_config=network_config,
             meta_data=meta_data,
