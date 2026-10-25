@@ -34,6 +34,13 @@ provided:
 ./iiab_deploy.py 192.168.1.219 4543,4544
 ```
 
+Before anything is written, multiple PRs are replay-merged in a temporary
+repository on the control host, in the same order and with the same
+merge-ref/head-ref fallback that first boot uses. If any PR conflicts with
+the preceding ones, the command stops and reports the conflicting files.
+`--skip-merge-check` bypasses this. The check needs `git` on the control host
+and network access to GitHub; a single PR is treated as trivially clean.
+
 ## What it does
 
 1. Probes the target over SSH: hostname, architecture, running root disk,
@@ -81,6 +88,7 @@ provided:
   host, so install `qemu-utils` there.
 - `gh` (authenticated) or a `GITHUB_TOKEN` for PR metadata. Public PRs also
   work through the unauthenticated GitHub API.
+- `git` for the multi-PR merge pre-check (skipped with `--skip-merge-check`)
 - Network access to GitHub and to the image host
 - For `--netburn`: a TCP route from the target back to the control host
 - For `--local-device`: root privileges and local `lsblk`, `blkid`, `mount`,

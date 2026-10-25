@@ -6,6 +6,7 @@ The control host (where this script runs) needs:
   * key-only SSH access to the target (passwordless sudo, or root)
   * Python 3.9+ and PyYAML
   * gh (or GITHUB_TOKEN) for PR metadata
+  * git to pre-check that multiple PRs merge cleanly (optional)
   * curl/tar/gzip for staging
 
 The target is expected to be Ubuntu, Raspberry Pi OS, or another
@@ -888,6 +889,109 @@ def resolve_pr_set(arg: str) -> PRSet:
     if len(repos) != 1:
         die("all IIAB PRs must be from the same repository")
     return PRSet(prs)
+
+
+def check_pr_merges(pr: PRSet, *, enabled: bool = True) -> None:
+    """Replay first boot's PR merges in a temporary repository.
+
+    First boot checks out the first PR (preferring GitHub's merge ref) and
+    merges every later PR on top with ``git merge --no-ff``.  Doing the same
+    here, in the order provided, reports conflicts before the target is
+    touched.  Single-PR sets are trivially clean.
+    """
+    if len(pr.items) < 2:
+        return
+    if not enabled:
+        log("PR merge check: skipped (--skip-merge-check)")
+        return
+    if not shutil.which("git"):
+        warn("PR merge check: git is not installed; skipping")
+        return
+
+    log(f"PR merge check: replaying {len(pr.items)} PRs in order")
+    env = dict(os.environ)
+    # A credential prompt would hang a non-interactive deploy.
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault("GIT_ASKPASS", "true")
+
+    with tempfile.TemporaryDirectory(prefix="iiab-deploy-merge-") as tmp:
+
+        def git(*args: str, timeout: float = 300) -> subprocess.CompletedProcess:
+            return run(
+                ["git", "-C", tmp, *args],
+                check=False,
+                timeout=timeout,
+                die_on_timeout=False,
+                env=env,
+            )
+
+        init = run(["git", "init", "--quiet", tmp], check=False, env=env)
+        if init.returncode != 0:
+            warn("PR merge check: could not create a scratch repository; skipping")
+            return
+        git("remote", "add", "origin", f"https://github.com/{pr.repo}.git")
+
+        shas: list[str] = []
+        for item in pr.items:
+            sha = ""
+            # Same fallback order as first boot: merge ref, head ref, head SHA.
+            for ref in (item.merge_ref, item.head_ref, item.head_sha):
+                if not ref:
+                    continue
+                if git("fetch", "--quiet", "--no-tags", "origin", ref).returncode:
+                    continue
+                resolved = git("rev-parse", "--verify", "FETCH_HEAD^{commit}")
+                sha = resolved.stdout.strip()
+                if resolved.returncode == 0 and sha:
+                    break
+            if not sha:
+                die(
+                    f"PR merge check: could not fetch any ref for "
+                    f"{item.repo}#{item.number}; first boot would fail too"
+                )
+            shas.append(sha)
+            log(f"  fetched {item.repo}#{item.number} ({sha[:12]})")
+
+        if git("checkout", "--quiet", "--detach", shas[0]).returncode != 0:
+            die("PR merge check: could not check out the first PR")
+
+        for index in range(1, len(pr.items)):
+            earlier = pr.items[index - 1]
+            item = pr.items[index]
+            merged = git(
+                "-c",
+                "user.name=iiab-deploy",
+                "-c",
+                "user.email=iiab-deploy@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "merge",
+                "--no-edit",
+                "--no-ff",
+                shas[index],
+            )
+            if merged.returncode == 0:
+                log(
+                    f"  {earlier.repo}#{earlier.number} + "
+                    f"{item.repo}#{item.number}: clean"
+                )
+                continue
+            conflicts = git("diff", "--name-only", "--diff-filter=U")
+            paths = [
+                line.strip()
+                for line in (conflicts.stdout or "").splitlines()
+                if line.strip()
+            ]
+            git("merge", "--abort")
+            detail = ", ".join(paths)
+            if not detail:
+                detail = (merged.stderr or merged.stdout or "").strip()
+            die(
+                f"PR merge check: {item.repo}#{item.number} does not merge "
+                f"cleanly after {', '.join(f'#{p.number}' for p in pr.items[:index])}"
+                + (f"; conflicts: {detail}" if detail else "")
+            )
+    log("PR merge check: all PRs merge cleanly")
 
 
 # ---------------------------------------------------------------------------
@@ -3843,6 +3947,7 @@ def run_local_mode(args: argparse.Namespace) -> int:
     arch = "aarch64" if profile == "rpi" else "x86_64"
 
     pr = resolve_pr_set(args.pr)
+    check_pr_merges(pr, enabled=not args.skip_merge_check)
     if args.no_admin_console and args.admin_console_pr:
         die("--admin-console-pr cannot be combined with --no-admin-console")
     admin_console_refs = resolve_admin_console_refs(args.admin_console_pr)
@@ -4139,6 +4244,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="do not run modules/tests/get_curl.yml when modules/ changed",
     )
     p.add_argument(
+        "--skip-merge-check",
+        action="store_true",
+        help="do not test whether the requested PRs merge cleanly before deploying",
+    )
+    p.add_argument(
         "--no-admin-console",
         action="store_true",
         help="do not install or enable IIAB's Admin Console (enabled by default)",
@@ -4273,6 +4383,7 @@ def main(argv: list[str] | None = None) -> int:
             log(
                 f"PR: {item.title} [{item.state}{', draft' if item.draft else ''}]"
             )
+        check_pr_merges(pr, enabled=not args.skip_merge_check)
         log(f"changed roles: {' '.join(pr.auto_roles) or '<none>'}")
         if pr.modules_changed:
             log("PR also changes modules/; get_curl tests will run on first boot")
