@@ -869,10 +869,10 @@ def resolve_pr(repo: str, number: int) -> PRInfo:
     )
 
 
-def resolve_admin_console_refs(arg: str | None) -> list[str]:
+def resolve_admin_console_pr_set(arg: str | None) -> PRSet:
     if not arg:
-        return []
-    refs: list[str] = []
+        return PRSet([])
+    prs: list[PRInfo] = []
     for repo, number in parse_pr_args(arg, DEFAULT_ADMIN_CONSOLE_REPO):
         if repo != DEFAULT_ADMIN_CONSOLE_REPO:
             die(
@@ -883,8 +883,12 @@ def resolve_admin_console_refs(arg: str | None) -> list[str]:
         pr = resolve_pr(repo, number)
         if not (pr.merge_ref or pr.head_ref):
             die("could not determine a ref to fetch for the Admin Console PR")
-        refs.append(pr.merge_ref or pr.head_ref)
-    return refs
+        prs.append(pr)
+    return PRSet(prs)
+
+
+def resolve_admin_console_refs(arg: str | None) -> list[str]:
+    return resolve_admin_console_pr_set(arg).refs
 
 
 def resolve_pr_set(arg: str) -> PRSet:
@@ -3978,7 +3982,9 @@ def run_local_mode(args: argparse.Namespace) -> int:
     check_pr_merges(pr, enabled=not args.skip_merge_check)
     if args.no_admin_console and args.admin_console_pr:
         die("--admin-console-pr cannot be combined with --no-admin-console")
-    admin_console_refs = resolve_admin_console_refs(args.admin_console_pr)
+    admin_console_pr = resolve_admin_console_pr_set(args.admin_console_pr)
+    check_pr_merges(admin_console_pr, enabled=not args.skip_merge_check)
+    admin_console_refs = admin_console_pr.refs
 
     probe: dict[str, Any] = {
         "HOSTNAME": "",
@@ -4425,7 +4431,9 @@ def main(argv: list[str] | None = None) -> int:
             log("PR also changes modules/; get_curl tests will run on first boot")
         if args.no_admin_console and args.admin_console_pr:
             die("--admin-console-pr cannot be combined with --no-admin-console")
-        admin_console_refs = resolve_admin_console_refs(args.admin_console_pr)
+        admin_console_pr = resolve_admin_console_pr_set(args.admin_console_pr)
+        check_pr_merges(admin_console_pr, enabled=not args.skip_merge_check)
+        admin_console_refs = admin_console_pr.refs
 
         log("resolving the image")
         image = choose_image(profile, arch)

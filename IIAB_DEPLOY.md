@@ -38,6 +38,8 @@ Before anything is written, multiple PRs are replay-merged in a temporary
 repository on the control host, in the same order and with the same
 merge-ref/head-ref fallback that first boot uses. If any PR conflicts with
 the preceding ones, the command stops and reports the conflicting files.
+The same check applies to multiple Admin Console PRs passed to
+`--admin-console-pr`.
 `--skip-merge-check` bypasses this. The check needs `git` on the control host
 and network access to GitHub; a single PR is treated as trivially clean.
 
@@ -299,7 +301,7 @@ The injected unit is `iiab-deploy-firstboot.service`. On first boot it:
    Use `--no-admin-console` to skip it, or `--admin-console-pr 677` to
    install a specific Admin Console pull request instead of its default
    branch. Multiple Admin Console PRs can be comma-separated; they are
-   fetched and merged in the order provided.
+   merge-checked, then fetched and merged in the order provided.
 7. Runs the changed-role play (`runroles-base.yml` plus the selected roles),
    then the module tests if applicable, and writes a state diff.
 8. Writes `result.json` and a `done` or `failed` marker.
