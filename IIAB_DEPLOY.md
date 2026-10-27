@@ -91,9 +91,9 @@ and network access to GitHub; a single PR is treated as trivially clean.
 - `git` for the multi-PR merge pre-check (skipped with `--skip-merge-check`)
 - Network access to GitHub and to the image host
 - For `--netburn`: a TCP route from the target back to the control host
-- For `--local-device`: root privileges and local `lsblk`, `blkid`, `mount`,
-  `umount`, `dd`, `cp`, `sync`, and the image decompressor (`xz`, `gzip`, or
-  `zstd`) as applicable
+- For `--local-device`: local `lsblk`, `blkid`, `mount`, `umount`, `dd`, `cp`,
+  `sync`, and the image decompressor (`xz`, `gzip`, or `zstd`) as applicable.
+  The tool invokes `sudo` only for device writes and mounting the image.
 
 ### Target
 
@@ -194,7 +194,7 @@ partitions, copies the cloud-init NoCloud seed and IIAB first-boot service,
 then exits. It does not use SSH or kexec.
 
 ```bash
-sudo ./iiab_deploy.py \
+./iiab_deploy.py \
     --local-device /dev/disk/by-path/pci-0000:00:14.0-usb-0:3:1.0-scsi-0:0:0:0 \
     --image ~/Downloads/2026-10-06-raspios-trixie-arm64-lite.img.xz \
     --disable-verify \

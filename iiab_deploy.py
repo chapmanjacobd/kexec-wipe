@@ -31,7 +31,7 @@ Examples:
   ./iiab_deploy.py xk@box 4543 --yes --hostname box --disk /dev/nvme0n1
   ./iiab_deploy.py 192.168.1.219 https://github.com/iiab/iiab/pull/4543 \\
       --roles 0-init,7-edu-apps,network,zimantic --netburn
-  sudo ./iiab_deploy.py --local-device /dev/disk/by-path/... \\
+  ./iiab_deploy.py --local-device /dev/disk/by-path/... \\
       --image ~/Downloads/2026-10-06-raspios-trixie-arm64-lite.img.xz 4543
 
 This tool is intentionally a single file so it can be copied to another
@@ -77,6 +77,7 @@ DEFAULT_CLOUDINIT_USERDATA = os.path.expanduser(
 DEFAULT_CLOUDINIT_NETWORKCONFIG = os.path.expanduser(
     "~/.local/bin/cloudinit/network-config"
 )
+LOCAL_PAYLOAD_HELPER = "--_install-local-payload"
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
     "iiab-deploy",
@@ -163,6 +164,15 @@ def run(
             )
         )
     return p
+
+
+def _local_privileged_command(cmd: list[str]) -> list[str]:
+    if os.geteuid() == 0:
+        return cmd
+    sudo = shutil.which("sudo")
+    if not sudo:
+        die("local-device mode requires sudo for device writes and mounts")
+    return [sudo, *cmd]
 
 
 def http_get_text(url: str, timeout: float = 60.0) -> str:
@@ -1623,8 +1633,6 @@ def _root_disk_paths() -> set[str] | None:
 
 def validate_local_device(requested: str) -> tuple[str, dict[str, Any]]:
     """Validate and describe a local whole disk before writing it."""
-    if os.geteuid() != 0:
-        die("--local-device mode must run as root (use sudo)")
     # Resolve symlinks such as /dev/disk/by-path before validating or writing.
     device = os.path.realpath(os.path.expanduser(requested))
     if not os.path.exists(device):
@@ -1760,7 +1768,10 @@ def write_local_image(
         warn("no local image checksum supplied; writing without verification")
 
     raw_size = _local_raw_size(image_path, compression)
-    disk_size_text = run(["blockdev", "--getsize64", device], timeout=30).stdout.strip()
+    disk_size_text = run(
+        _local_privileged_command(["blockdev", "--getsize64", device]),
+        timeout=30,
+    ).stdout.strip()
     try:
         disk_size = int(disk_size_text)
     except ValueError:
@@ -1794,14 +1805,16 @@ def write_local_image(
 
         log(f"writing {image_path.name} to {device}")
         writer = subprocess.Popen(
-            [
-                "dd",
-                f"of={device}",
-                "bs=4M",
-                "iflag=fullblock",
-                "conv=fsync",
-                "status=progress",
-            ],
+            _local_privileged_command(
+                [
+                    "dd",
+                    f"of={device}",
+                    "bs=4M",
+                    "iflag=fullblock",
+                    "conv=fsync",
+                    "status=progress",
+                ]
+            ),
             stdin=source,
         )
         if decompressor is not None and decompressor.stdout is not None:
@@ -1821,7 +1834,7 @@ def write_local_image(
         die(f"decompressing {image_path.name} failed (exit {decompressor_rc})")
     run(["sync"], timeout=120)
     run(
-        ["blockdev", "--rereadpt", device],
+        _local_privileged_command(["blockdev", "--rereadpt", device]),
         check=False,
         timeout=30,
         die_on_timeout=False,
@@ -1832,6 +1845,21 @@ def write_local_image(
 
 def install_local_payload(stage: Path, device: str) -> None:
     """Mount a freshly-written image and install its first-boot payload."""
+    if os.geteuid() != 0:
+        run(
+            _local_privileged_command(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    LOCAL_PAYLOAD_HELPER,
+                    str(stage),
+                    device,
+                ]
+            ),
+            capture=False,
+        )
+        return
+
     for part, mountpoint in _device_mounts(device):
         run(["umount", mountpoint], check=False, timeout=30, die_on_timeout=False)
     run(
@@ -4094,7 +4122,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
           %(prog)s xk@box 4543 --yes --hostname box --disk /dev/nvme0n1
           %(prog)s 192.168.1.219 https://github.com/iiab/iiab/pull/4543 \\
               --roles 0-init,7-edu-apps,network,zimantic --netburn
-          sudo %(prog)s --local-device /dev/disk/by-path/... \\
+          %(prog)s --local-device /dev/disk/by-path/... \\
               --image ~/Downloads/raspios.img.xz 4543 --yes
 
         The target is reimaged with Raspberry Pi OS Lite arm64 when it is a
@@ -4312,6 +4340,14 @@ def main(argv: list[str] | None = None) -> int:
     args: argparse.Namespace | None = None
     stage: Path | None = None
     server: ImageServer | None = None
+    raw_argv = sys.argv[1:] if argv is None else argv
+    if raw_argv[:1] == [LOCAL_PAYLOAD_HELPER]:
+        if len(raw_argv) != 3:
+            die(f"{LOCAL_PAYLOAD_HELPER} requires a stage path and device")
+        if os.geteuid() != 0:
+            die(f"{LOCAL_PAYLOAD_HELPER} must run as root")
+        install_local_payload(Path(raw_argv[1]), raw_argv[2])
+        return 0
     args = parse_args(argv)
     try:
         if args.local_device:
