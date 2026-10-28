@@ -324,8 +324,12 @@ remove `/var/lib/iiab-deploy/{attempted,failed}` and reboot or start
 
 ## Watching the install
 
-The unit sends stdout/stderr to the journal and the system console. On a
-physical machine or a serial console, watch `tty0` or `ttyS0,115200`.
+The unit sends stdout/stderr to the journal and mirrors them to the local
+consoles. On a physical machine the install takes over `tty1` (HDMI) and
+stops the login prompt until the next boot. On a serial console it writes to
+the UART the kernel is actually using (for example `ttyAMA10,115200` on a
+Pi 5, or `ttyS0` on older boards). The same output is in the journal and in
+`/var/log/iiab-deploy/firstboot.log`.
 
 The first boot also starts a read-only `tmux`, `screen`, or `abduco` session
 when one is available. It runs as root, so attach with `sudo`:

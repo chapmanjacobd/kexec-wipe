@@ -2010,7 +2010,16 @@ def install_local_payload(stage: Path, device: str) -> None:
             text = text.replace("console=tty1", "console=tty0")
             if "console=tty0" not in text:
                 text += " console=tty0"
-            if "console=ttyS0" not in text:
+            # Raspberry Pi images already name their serial console (ttyAMA10
+            # on Pi 5, serial0/ttyAMA0 on older boards).  Only fall back to
+            # ttyS0 when the image has none: on a Pi 5 that UART belongs to
+            # Bluetooth and is not a usable console.
+            if not any(
+                token.startswith(
+                    ("console=ttyS", "console=ttyAMA", "console=serial")
+                )
+                for token in text.split()
+            ):
                 text += " console=ttyS0,115200"
             cmdline.write_text(text + "\n", encoding="utf-8")
         run(["sync"], timeout=120)
@@ -2040,6 +2049,9 @@ FIRSTBOOT_UNIT = r'''[Unit]
 Description=IIAB deploy first-boot install
 Wants=network-online.target cloud-final.service
 After=cloud-final.service network-online.target
+# Show the install on the local display instead of a login prompt.  getty
+# comes back on the next boot.
+Conflicts=getty@tty1.service
 ConditionPathExists=!/var/lib/iiab-deploy/attempted
 ConditionPathExists=!/var/lib/iiab-deploy/done
 ConditionPathExists=!/var/lib/iiab-deploy/failed
@@ -2047,8 +2059,10 @@ ConditionPathExists=!/var/lib/iiab-deploy/failed
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/iiab-deploy-firstboot
-StandardOutput=journal+console
-StandardError=journal+console
+# The script copies its output to the actual local consoles itself (HDMI and
+# the real serial UART), so systemd only needs to keep the journal copy.
+StandardOutput=journal
+StandardError=journal
 TimeoutStartSec=0
 RemainAfterExit=yes
 
@@ -2075,9 +2089,40 @@ mkdir -p "$STATE_DIR" "$LOG_DIR"
 touch "$STATE_DIR/attempted"
 LOG="$LOG_DIR/firstboot.log"
 
-# systemd sends our output to the journal and the console (tty0/serial).
-# tee adds a file that can be followed over SSH.
-if command -v stdbuf >/dev/null 2>&1; then
+# Show the install on the local consoles instead of a login prompt.  The
+# kernel's /dev/console is not necessarily the HDMI VT (the cmdline may point
+# it at a serial or Bluetooth UART), so collect the real console devices and
+# write to them explicitly.  getty comes back on the next boot.
+CONSOLES=()
+if [ -c /dev/tty1 ]; then
+    CONSOLES+=(/dev/tty1)
+fi
+for tty in $(cat /sys/class/tty/console/active 2>/dev/null || true); do
+    case "$tty" in
+        tty[0-9]*) continue ;;
+    esac
+    if [ -c "/dev/$tty" ]; then
+        CONSOLES+=("/dev/$tty")
+    fi
+done
+for dev in "${CONSOLES[@]}"; do
+    if [ "$dev" = "/dev/tty1" ]; then
+        systemctl stop getty@tty1.service 2>/dev/null || true
+    else
+        systemctl stop "serial-getty@${dev#/dev/}.service" 2>/dev/null || true
+    fi
+    printf '\033[2J\033[H' > "$dev" 2>/dev/null || true
+done
+
+# tee adds a log file that can be followed over SSH, and mirrors the install
+# to the local consoles.  tee's own stdout still goes to the journal.
+if [ "${#CONSOLES[@]}" -gt 0 ]; then
+    if command -v stdbuf >/dev/null 2>&1; then
+        exec > >(stdbuf -oL -eL tee -a "$LOG" "${CONSOLES[@]}") 2>&1
+    else
+        exec > >(tee -a "$LOG" "${CONSOLES[@]}") 2>&1
+    fi
+elif command -v stdbuf >/dev/null 2>&1; then
     exec > >(stdbuf -oL -eL tee -a "$LOG") 2>&1
 else
     exec > >(tee -a "$LOG") 2>&1
@@ -2830,6 +2875,10 @@ log "initramfs size: $(du -h initramfs.cpio.gz | awk '{print $1}')"
 
 # ---- kexec ----
 CMDLINE="root=/dev/ram rw quiet panic=10 console=tty0 console=ttyS0,115200 iiab_deploy=1 iiab_deploy_disk=$TARGET_DISK iiab_deploy_profile=$PROFILE iiab_deploy_netburn=$NETBURN iiab_deploy_reboot=$FINAL_REBOOT"
+# Pi 5 (BCM2712) exposes the debug UART as ttyAMA10; ttyS0 is Bluetooth.
+if grep -qa 'bcm2712' /proc/device-tree/compatible 2>/dev/null; then
+    CMDLINE=${CMDLINE/console=ttyS0,115200/console=ttyAMA10,115200}
+fi
 if [ "$NETBURN" = "1" ]; then
     CMDLINE="$CMDLINE iiab_deploy_url=$NETBURN_URL"
 fi
@@ -3123,7 +3172,10 @@ fi
 if [ -n "$CMD" ]; then
     sed -i 's/console=tty1/console=tty0/g' "$CMD" 2>/dev/null || true
     grep -q 'console=tty0' "$CMD" || sed -i 's/$/ console=tty0/' "$CMD"
-    grep -q 'console=ttyS0' "$CMD" || sed -i 's/$/ console=ttyS0,115200/' "$CMD"
+    # Keep the image's serial console when it has one (ttyAMA10 on Pi 5);
+    # ttyS0 is Bluetooth on that board, not a console.
+    grep -qE 'console=(ttyS|ttyAMA|serial)' "$CMD" || \
+        sed -i 's/$/ console=ttyS0,115200/' "$CMD"
 fi
 if [ -f /newroot/etc/default/grub ]; then
     grep -q 'console=tty0' /newroot/etc/default/grub || \
