@@ -1933,7 +1933,22 @@ def install_local_payload(stage: Path, device: str) -> None:
         if boot_dir is None:
             die(f"could not identify the boot partition layout on {device}")
         payload = stage / "payload"
-        run(["cp", "-a", f"{payload}/.", f"{root_dir}/"], timeout=120)
+        # The stage payload was built by the unprivileged user, and this
+        # helper runs as root.  Copying with -a would therefore chown the
+        # image's /, /etc, /usr and /var to that user, which makes systemd
+        # refuse paths ("Detected unsafe path transition") and breaks
+        # services such as php8.4-fpm.  Let the copy create root-owned
+        # entries instead; modes and symlinks are still preserved.
+        run(
+            [
+                "cp",
+                "-a",
+                "--no-preserve=ownership",
+                f"{payload}/.",
+                f"{root_dir}/",
+            ],
+            timeout=120,
+        )
 
         cloud = payload / "var/lib/iiab-deploy/cloudinit"
         seed = root_dir / "var/lib/cloud/seed/nocloud"
@@ -2167,6 +2182,11 @@ on_exit() {
     if [ ! -f "$STATE_DIR/done" ] && [ ! -f "$STATE_DIR/failed" ]; then
         finish failed
     fi
+    # Report failure to systemd too: with RemainAfterExit=yes a failed deploy
+    # must not leave the unit looking active/successful.
+    if [ -f "$STATE_DIR/failed" ]; then
+        exit 1
+    fi
     exit "$rc"
 }
 trap on_exit EXIT
@@ -2189,6 +2209,22 @@ echo "Started:     $START"
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export HOME=/root
+
+# systemd can hand over a locale that was never generated (Raspberry Pi OS
+# puts en_GB.UTF-8 in the manager environment while only generating en_US).
+# Python then fails in setlocale() and every Ansible command aborts with
+# "could not initialize the preferred locale".  Fall back to a UTF-8 locale
+# that exists.
+current_locale="${LC_ALL:-${LC_CTYPE:-${LANG:-C}}}"
+current_locale_norm=$(
+    printf '%s' "$current_locale" | tr '[:upper:]' '[:lower:]' | tr -d '_-'
+)
+if ! locale -a 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '_-' |
+    grep -qxF "$current_locale_norm"; then
+    echo "WARNING: locale $current_locale is not generated; using C.UTF-8"
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+fi
 
 section "Waiting for the network"
 for _ in $(seq 1 60); do
@@ -2241,6 +2277,11 @@ if [ "$PROFILE" = "rpi" ] && [ "${RPI_UPGRADE:-0}" = "1" ]; then
 fi
 
 section "Cloning $PR_REPO"
+# A freshly imaged system has no Git identity, but merging more than one PR
+# needs a committer for the merge commits.  Set one up front so both the IIAB
+# and Admin Console merges below work.
+git config --global user.name "iiab-deploy"
+git config --global user.email "iiab-deploy@localhost"
 rm -rf /opt/iiab/iiab
 mkdir -p /opt/iiab
 if ! git clone --progress "https://github.com/$PR_REPO.git" /opt/iiab/iiab; then
