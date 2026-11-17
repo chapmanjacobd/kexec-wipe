@@ -43,6 +43,7 @@ machine.  The remote shell payloads are embedded near the bottom.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import ipaddress
@@ -65,7 +66,7 @@ import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Iterator, NoReturn
 
 DEFAULT_REPO = "iiab/iiab"
 DEFAULT_ADMIN_CONSOLE_REPO = "iiab/iiab-admin-console"
@@ -128,6 +129,19 @@ def warn(msg: str) -> None:
 def die(msg: str, code: int = 1) -> NoReturn:
     print(f"[iiab-deploy] ERROR: {msg}", file=sys.stderr, flush=True)
     raise SystemExit(code)
+
+
+@contextlib.contextmanager
+def scratch_directory(prefix: str) -> Iterator[str]:
+    """Create a temporary directory, tolerating cleanup races."""
+    path = tempfile.mkdtemp(prefix=prefix)
+    try:
+        yield path
+    finally:
+        # Background processes (notably Git's detached auto-maintenance) can
+        # still be writing here when the caller finishes.  Leaving a /tmp
+        # directory behind is preferable to failing an otherwise good run.
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def run(
@@ -931,11 +945,19 @@ def check_pr_merges(pr: PRSet, *, enabled: bool = True) -> None:
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_ASKPASS", "true")
 
-    with tempfile.TemporaryDirectory(prefix="iiab-deploy-merge-") as tmp:
+    with scratch_directory("iiab-deploy-merge-") as tmp:
 
         def git(*args: str, timeout: float = 300) -> subprocess.CompletedProcess:
             return run(
-                ["git", "-C", tmp, *args],
+                [
+                    "git",
+                    "-C", tmp,
+                    # Fetch can detach auto-maintenance, which then keeps
+                    # writing into .git/objects/pack after fetch returns.
+                    "-c", "gc.auto=0",
+                    "-c", "maintenance.auto=false",
+                    *args,
+                ],
                 check=False,
                 timeout=timeout,
                 die_on_timeout=False,
