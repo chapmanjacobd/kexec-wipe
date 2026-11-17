@@ -948,8 +948,7 @@ def check_pr_merges(pr: PRSet, *, enabled: bool = True) -> None:
             return
         git("remote", "add", "origin", f"https://github.com/{pr.repo}.git")
 
-        shas: list[str] = []
-        for item in pr.items:
+        def fetch_pr(item: PRInfo) -> str:
             sha = ""
             # Same fallback order as first boot: merge ref, head ref, head SHA.
             for ref in (item.merge_ref, item.head_ref, item.head_sha):
@@ -966,15 +965,19 @@ def check_pr_merges(pr: PRSet, *, enabled: bool = True) -> None:
                     f"PR merge check: could not fetch any ref for "
                     f"{item.repo}#{item.number}; first boot would fail too"
                 )
-            shas.append(sha)
             log(f"  fetched {item.repo}#{item.number} ({sha[:12]})")
+            return sha
 
-        if git("checkout", "--quiet", "--detach", shas[0]).returncode != 0:
+        first_sha = fetch_pr(pr.items[0])
+        if git("checkout", "--quiet", "--detach", first_sha).returncode != 0:
             die("PR merge check: could not check out the first PR")
 
         for index in range(1, len(pr.items)):
             earlier = pr.items[index - 1]
             item = pr.items[index]
+            # Fetch lazily so a conflict fails the check before the remaining
+            # PRs cost a network round trip each.
+            sha = fetch_pr(item)
             merged = git(
                 "-c",
                 "user.name=iiab-deploy",
@@ -985,7 +988,7 @@ def check_pr_merges(pr: PRSet, *, enabled: bool = True) -> None:
                 "merge",
                 "--no-edit",
                 "--no-ff",
-                shas[index],
+                sha,
             )
             if merged.returncode == 0:
                 log(
