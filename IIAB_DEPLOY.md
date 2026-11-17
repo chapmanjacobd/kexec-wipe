@@ -94,8 +94,9 @@ and network access to GitHub; a single PR is treated as trivially clean.
 - Network access to GitHub and to the image host
 - For `--netburn`: a TCP route from the target back to the control host
 - For `--local-device`: local `lsblk`, `blkid`, `mount`, `umount`, `dd`, `cp`,
-  `sync`, and the image decompressor (`xz`, `gzip`, or `zstd`) as applicable.
-  The tool invokes `sudo` only for device writes and mounting the image.
+  `sync`, the image decompressor (`xz`, `gzip`, or `zstd`) as applicable, and
+  `curl` when `--image` is an `http(s)` URL. The tool invokes `sudo` only for
+  device writes and mounting the image.
 
 ### Target
 
@@ -195,24 +196,29 @@ Pi Imager: it writes a raw Raspberry Pi image, mounts its root and boot
 partitions, copies the cloud-init NoCloud seed and IIAB first-boot service,
 then exits. It does not use SSH or kexec.
 
+`--image` accepts a local file or an `http(s)` URL. Remote images are downloaded
+to the `images/` subdirectory of `--cache-dir` and reused on later runs; a
+download interrupted partway is never written to the device.
+
 ```bash
 ./iiab_deploy.py \
     --local-device /dev/disk/by-path/pci-0000:00:14.0-usb-0:3:1.0-scsi-0:0:0:0 \
-    --image ~/Downloads/2026-10-06-raspios-trixie-arm64-lite.img.xz \
-    --disable-verify \
-    https://github.com/iiab/iiab/pull/4543 \
+    --image https://github.com/iiab/iiab/releases/download/daily-261113-2126-PR4574/iiab-8.3-rpios-tiny-261113-PR4574.img.zst \
     --cloudinit-userdata ~/.local/bin/cloudinit/user-data \
     --cloudinit-networkconfig ~/.local/bin/cloudinit/network-config \
-    --skip-rpi-upgrade
+    --skip-rpi-upgrade \
+    --roles 'captiveportal zimantic kiwix network nginx pylibs sshd usb_lib' \
+    https://github.com/iiab/iiab/pull/4543
 ```
 
 The command refuses partitions, mounted target filesystems, and the disk
 containing the running system's root filesystem. It accepts raw `.img` files
-and `.xz`, `.gz`, or `.zst` compressed raw images, and requires `--yes` to
-skip the confirmation prompt. The target must be a whole Raspberry Pi OS
-image with a Linux root partition and a recognizable FAT boot partition. If
-`<image>.sha256` (or the same basename with a `.sha256` suffix) exists, it is
-used for verification; pass `--disable-verify` to skip that check.
+and `.xz`, `.gz`, or `.zst` compressed raw images from a local path or URL,
+and requires `--yes` to skip the confirmation prompt. The target must be a
+whole Raspberry Pi OS image with a Linux root partition and a recognizable FAT
+boot partition. For local images, `<image>.sha256` (or the same basename with a
+`.sha256` suffix) is used when it exists. For remote images, the tool looks for
+`<url>.sha256`. Pass `--disable-verify` to skip the checksum lookup and check.
 After the device boots, cloud-init creates the configured user and
 `iiab-deploy-firstboot.service` installs IIAB from the requested PR.
 

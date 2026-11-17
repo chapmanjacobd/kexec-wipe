@@ -22,9 +22,9 @@ IIAB from the requested PR using vars/local_vars_tiny.yml and then runs the
 PR's changed roles.
 
 With --local-device, the script instead behaves like a Raspberry Pi image
-writer: it writes a local raw image to a USB or microSD device, mounts the
-new filesystems, injects the same cloud-init and first-boot payload, and
-leaves the device ready to boot.  This mode does not use SSH or kexec.
+writer: it writes a local or downloaded raw image to a USB or microSD device,
+mounts the new filesystems, injects the same cloud-init and first-boot payload,
+and leaves the device ready to boot.  This mode does not use SSH or kexec.
 
 Examples:
   ./iiab_deploy.py 192.168.1.219 4543
@@ -33,6 +33,8 @@ Examples:
       --roles 0-init,7-edu-apps,network,zimantic --netburn
   ./iiab_deploy.py --local-device /dev/disk/by-path/... \\
       --image ~/Downloads/2026-10-06-raspios-trixie-arm64-lite.img.xz 4543
+  ./iiab_deploy.py --local-device /dev/disk/by-path/... \\
+      --image https://example.com/release/raspios-trixie.img.zst 4543
 
 This tool is intentionally a single file so it can be copied to another
 machine.  The remote shell payloads are embedded near the bottom.
@@ -57,6 +59,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -1021,21 +1024,66 @@ class ImageInfo:
     compression: str  # xz | gzip | zstd | qcow2 | none
 
 
+def is_remote_image(source: str) -> bool:
+    return bool(re.match(r"https?://", source, re.IGNORECASE))
+
+
+def _compression_from_name(name: str) -> str:
+    lower = name.lower()
+    if lower.endswith(".xz"):
+        return "xz"
+    if lower.endswith((".gz", ".gzip")):
+        return "gzip"
+    if lower.endswith((".zst", ".zstd")):
+        return "zstd"
+    return "none"
+
+
+def _url_image_label(url: str) -> str:
+    path = urllib.parse.urlsplit(url).path
+    label = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+    if not label:
+        die(f"could not determine an image file name from {url}")
+    # Keep cached downloads from escaping the cache directory or acquiring
+    # shell-hostile characters from an unusual URL.
+    return re.sub(r"[^A-Za-z0-9._+-]", "_", label)
+
+
+def remote_image_info(url: str, disable_verify: bool = False) -> ImageInfo:
+    label = _url_image_label(url)
+    if label.lower().endswith((".qcow2", ".qcow")):
+        die("local-device mode accepts raw images, not qcow2; convert it first")
+    sha256 = ""
+    if not disable_verify:
+        parts = urllib.parse.urlsplit(url)
+        checksum_url = urllib.parse.urlunsplit(
+            parts._replace(path=parts.path + ".sha256", query="", fragment="")
+        )
+        try:
+            text = http_get_text(checksum_url, timeout=20)
+        except DeployError:
+            log(f"no checksum available at {checksum_url}")
+        else:
+            fields = text.split()
+            if fields and re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]):
+                sha256 = fields[0]
+            else:
+                warn(f"invalid SHA-256 checksum at {checksum_url}")
+    return ImageInfo(
+        label=label,
+        url=url,
+        sha256=sha256,
+        compression=_compression_from_name(label),
+    )
+
+
 def local_image_info(path_text: str) -> tuple[Path, ImageInfo]:
     path = Path(path_text).expanduser()
     if not path.is_file():
         die(f"local image not found: {path}")
-    name = path.name.lower()
-    if name.endswith(".xz"):
-        compression = "xz"
-    elif name.endswith((".gz", ".gzip")):
-        compression = "gzip"
-    elif name.endswith((".zst", ".zstd")):
-        compression = "zstd"
-    elif name.endswith((".qcow2", ".qcow")):
+    if path.name.lower().endswith((".qcow2", ".qcow")):
         die("local-device mode accepts raw images, not qcow2; convert it first")
-    else:
-        compression = "none"
+    compression = _compression_from_name(path.name)
     sha256 = ""
     for checksum_path in (
         Path(str(path) + ".sha256"),
@@ -1756,21 +1804,89 @@ def _local_raw_size(image_path: Path, compression: str) -> int:
     return size
 
 
+def verify_image_source(
+    image_path: Path, expected_sha256: str, disable_verify: bool
+) -> None:
+    if disable_verify:
+        warn("local image verification disabled")
+    elif expected_sha256:
+        log(f"verifying {image_path}")
+        verify_sha256(image_path, expected_sha256)
+    else:
+        warn("no local image checksum supplied; writing without verification")
+
+
+def fetch_remote_image(
+    image: ImageInfo,
+    cache_dir: Path,
+    disable_verify: bool,
+) -> Path:
+    """Download a remote image into the cache and return the local path.
+
+    A completed download is reused on later runs.  When a checksum is known,
+    it is verified before the download is promoted to the cache and the
+    checksum is recorded next to it, so an interrupted or stale download is
+    never written to the device.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = cache_dir / image.label
+    stamp = cache_dir / (image.label + ".sha256")
+    if target.is_file() and target.stat().st_size > 0:
+        trusted = disable_verify or not image.sha256
+        if not trusted and stamp.is_file():
+            trusted = (
+                stamp.read_text(encoding="utf-8").strip().lower()
+                == image.sha256.lower()
+            )
+        if trusted:
+            log(f"using cached {target}")
+            return target
+        log(f"cached {target} is stale; downloading again")
+        target.unlink()
+    download = cache_dir / (image.label + ".download")
+    download.unlink(missing_ok=True)
+    log(f"downloading {image.url}")
+    try:
+        run(
+            [
+                "curl",
+                "-fL",
+                "--retry",
+                "3",
+                "--retry-delay",
+                "5",
+                "--connect-timeout",
+                "30",
+                "--progress-bar",
+                "-o",
+                str(download),
+                image.url,
+            ],
+            capture=False,
+        )
+        if disable_verify:
+            warn("remote image verification disabled")
+        elif image.sha256:
+            log(f"verifying {download}")
+            verify_sha256(download, image.sha256)
+        else:
+            warn("no remote image checksum supplied; writing without verification")
+        download.replace(target)
+        if image.sha256 and not disable_verify:
+            stamp.write_text(image.sha256 + "\n", encoding="utf-8")
+        else:
+            stamp.unlink(missing_ok=True)
+    except BaseException:
+        download.unlink(missing_ok=True)
+        raise
+    return target
+
+
 def write_local_image(
     image_path: Path,
     device: str,
     compression: str,
-    expected_sha256: str,
-    disable_verify: bool,
 ) -> None:
-    if expected_sha256 and not disable_verify:
-        log(f"verifying {image_path}")
-        verify_sha256(image_path, expected_sha256)
-    elif disable_verify:
-        warn("local image verification disabled")
-    else:
-        warn("no local image checksum supplied; writing without verification")
-
     raw_size = _local_raw_size(image_path, compression)
     disk_size_text = run(
         _local_privileged_command(["blockdev", "--getsize64", device]),
@@ -4067,7 +4183,12 @@ def run_local_mode(args: argparse.Namespace) -> int:
     if not args.image:
         die("--image is required with --local-device")
     device, disk_info = validate_local_device(args.local_device)
-    image_path, image = local_image_info(args.image)
+    remote_image = is_remote_image(args.image)
+    if remote_image:
+        image_path: Path | None = None
+        image = remote_image_info(args.image, args.disable_verify)
+    else:
+        image_path, image = local_image_info(args.image)
     profile = "rpi" if args.profile == "auto" else args.profile
     arch = "aarch64" if profile == "rpi" else "x86_64"
 
@@ -4176,12 +4297,21 @@ def run_local_mode(args: argparse.Namespace) -> int:
         if args.dry_run:
             log("dry run: no changes made to the local device")
             return 0
+        if remote_image:
+            image_path = fetch_remote_image(
+                image,
+                Path(args.cache_dir).expanduser() / "images",
+                args.disable_verify,
+            )
+        else:
+            assert image_path is not None
+            verify_image_source(
+                image_path, image.sha256, args.disable_verify
+            )
         write_local_image(
             image_path,
             device,
             image.compression,
-            image.sha256,
-            args.disable_verify,
         )
         install_local_payload(stage, device)
         log(f"local image ready on {device}")
@@ -4223,6 +4353,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
               --roles 0-init,7-edu-apps,network,zimantic --netburn
           %(prog)s --local-device /dev/disk/by-path/... \\
               --image ~/Downloads/raspios.img.xz 4543 --yes
+          %(prog)s --local-device /dev/disk/by-path/... \\
+              --image https://example.com/release/raspios.img.zst 4543
 
         The target is reimaged with Raspberry Pi OS Lite arm64 when it is a
         Raspberry Pi, otherwise with the Ubuntu 26.04 cloud image.  Both use
@@ -4261,12 +4393,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--image",
-        help="local raw image (.img, .xz, .gz, or .zst) for --local-device",
+        help=(
+            "raw image for --local-device: a local .img/.xz/.gz/.zst file "
+            "or an http(s) URL"
+        ),
     )
     p.add_argument(
         "--disable-verify",
         action="store_true",
-        help="skip local image checksum verification (no checksum is supplied by default)",
+        help="skip local/remote image checksum verification and checksum lookup",
     )
     p.add_argument(
         "--yes", action="store_true", help="do not ask for hostname confirmation"
@@ -4330,7 +4465,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--cache-dir",
         default=CACHE_DIR,
-        help=f"netburn image cache (default: {CACHE_DIR})",
+        help=(
+            "netburn and remote image cache "
+            f"(default: {CACHE_DIR}; remote images go in its images/ subdir)"
+        ),
     )
     p.add_argument(
         "--install-args",
