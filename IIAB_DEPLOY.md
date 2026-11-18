@@ -238,11 +238,14 @@ Override the list (comma or whitespace separated):
     --roles 0-init,7-edu-apps,network,zimantic
 ```
 
-`0-init` is provided by `runroles-base.yml`, so it is run first and is not
-added twice. Stage roles (`0-init`, `7-edu-apps`, `9-*`, and so on) do not get
-`<role>_install`/`<role>_enabled` variables. Other roles are enabled by
-appending those variables to `/etc/iiab/local_vars.yml` before the changed-role
-play.
+`0-init` is provided by `runrole-base.yml` (or `runroles-base.yml` on older
+images), so it is run first and is not added twice. Stage roles (`0-init`,
+`7-edu-apps`, `9-*`, and so on) do not get `<role>_install`/`<role>_enabled`
+variables. Other roles get both variables appended to
+`/etc/iiab/local_vars.yml` before the changed-role play. The play uses
+`./runrole --add` so stage roles and roles without an install variable still
+run; `--add` only forces `<role>_install` for that run, so the exported
+`<role>_enabled: True` still comes from `local_vars.yml`.
 
 A change under `modules/` makes the first boot run
 `modules/tests/get_curl.yml`. Disable that with `--no-module-tests`.

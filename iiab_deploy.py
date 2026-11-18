@@ -2597,18 +2597,30 @@ if [ -n "$(printf '%s' "${ROLES:-}" | tr -d '[:space:]')" ]; then
     done
 
     export ANSIBLE_LOG_PATH="$LOG_DIR/ansible-roles.log"
+    # runrole-base.yml already starts with 0-init, so do not append it again.
+    RUN_ROLES=()
+    for role in $ROLES; do
+        [ "$role" = "0-init" ] && continue
+        RUN_ROLES+=("$role")
+    done
     # Current IIAB provides ./runrole (which accepts several roles, applies
     # local_vars.yml, and tracks state).  Images from before "simplify
     # runroles" only ship runroles-base.yml, so keep that as a fallback.
-    if [ -x ./runrole ] && [ -f runrole-base.yml ]; then
-        ./runrole --yes $ROLES
+    # --add is needed for stage roles (7-edu-apps, 9-local-addons, ...) and any
+    # role whose install prefix is not in local_vars.yml. It only forces
+    # <prefix>_install for this run; the loop above still writes
+    # <prefix>_enabled so services start and the menu updater sees them.
+    if [ "${#RUN_ROLES[@]}" -eq 0 ] && [ -f runrole-base.yml ]; then
+        ansible-playbook -i ansible_hosts runrole-base.yml --connection=local
+        ROLES_RC=$?
+    elif [ -x ./runrole ] && [ -f runrole-base.yml ]; then
+        ./runrole --yes --add "${RUN_ROLES[@]}"
         ROLES_RC=$?
     elif [ -f runroles-base.yml ]; then
         TMP_PLAY=/opt/iiab/iiab/iiab-deploy-runroles.yml
         cp runroles-base.yml "$TMP_PLAY" || \
             fail "could not copy runroles-base.yml"
-        for role in $ROLES; do
-            [ "$role" = "0-init" ] && continue
+        for role in "${RUN_ROLES[@]}"; do
             printf '    - { role: %s }\n' "$role" >> "$TMP_PLAY"
         done
         ansible-playbook -i ansible_hosts "$TMP_PLAY" --connection=local
