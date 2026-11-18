@@ -1977,7 +1977,7 @@ def write_local_image(
         die(f"writing {device} failed (dd exit {writer_rc})")
     if decompressor_rc != 0:
         die(f"decompressing {image_path.name} failed (exit {decompressor_rc})")
-    run(["sync"], timeout=120)
+    run(["sync"])
     run(
         _local_privileged_command(["blockdev", "--rereadpt", device]),
         check=False,
@@ -2163,7 +2163,7 @@ def install_local_payload(stage: Path, device: str) -> None:
             ):
                 text += " console=ttyS0,115200"
             cmdline.write_text(text + "\n", encoding="utf-8")
-        run(["sync"], timeout=120)
+        run(["sync"])
     finally:
         if boot_mounted:
             run(
