@@ -2596,18 +2596,30 @@ if [ -n "$(printf '%s' "${ROLES:-}" | tr -d '[:space:]')" ]; then
         done
     done
 
-    TMP_PLAY=/opt/iiab/iiab/iiab-deploy-runroles.yml
-    cp runroles-base.yml "$TMP_PLAY"
-    for role in $ROLES; do
-        [ "$role" = "0-init" ] && continue
-        printf '    - { role: %s }\n' "$role" >> "$TMP_PLAY"
-    done
     export ANSIBLE_LOG_PATH="$LOG_DIR/ansible-roles.log"
-    ansible-playbook -i ansible_hosts "$TMP_PLAY" --connection=local
-    ROLES_RC=$?
+    # Current IIAB provides ./runrole (which accepts several roles, applies
+    # local_vars.yml, and tracks state).  Images from before "simplify
+    # runroles" only ship runroles-base.yml, so keep that as a fallback.
+    if [ -x ./runrole ] && [ -f runrole-base.yml ]; then
+        ./runrole --yes $ROLES
+        ROLES_RC=$?
+    elif [ -f runroles-base.yml ]; then
+        TMP_PLAY=/opt/iiab/iiab/iiab-deploy-runroles.yml
+        cp runroles-base.yml "$TMP_PLAY" || \
+            fail "could not copy runroles-base.yml"
+        for role in $ROLES; do
+            [ "$role" = "0-init" ] && continue
+            printf '    - { role: %s }\n' "$role" >> "$TMP_PLAY"
+        done
+        ansible-playbook -i ansible_hosts "$TMP_PLAY" --connection=local
+        ROLES_RC=$?
+        rm -f "$TMP_PLAY"
+    else
+        ROLES_RC=1
+        fail "neither ./runrole nor runroles-base.yml exists"
+    fi
     echo "changed-role exit code: $ROLES_RC"
     [ "$ROLES_RC" -eq 0 ] || fail "changed roles failed"
-    rm -f "$TMP_PLAY"
 fi
 
 if [ "${RUN_MODULE_TESTS:-0}" = "1" ] && [ -f modules/tests/get_curl.yml ]; then
@@ -3923,6 +3935,32 @@ def follow_firstboot(
     offset = 0
     done = False
     active: Remote | None = candidates[0] if candidates else None
+
+    # The unit has been observed enabled in cloud-init.target.wants but never
+    # queued by systemd on the first boot (no journal entry, no "attempted"
+    # marker).  Ask for it explicitly; this is a no-op when it is already
+    # running or has already finished (the state markers make the conditions
+    # fail), and --no-block keeps the SSH call from waiting for a oneshot.
+    start_script = f"""
+DEV={shlex.quote(STATE_DIR + '/deploy-id')}
+[ "$(cat "$DEV" 2>/dev/null)" = {shlex.quote(deploy_id)} ] || exit 3
+systemctl start --no-block iiab-deploy-firstboot.service
+exit 0
+"""
+    for cand in candidates:
+        p = ssh_run(cand, start_script, check=False, timeout=30, insecure=True)
+        if p.returncode != 0:
+            p = ssh_run(
+                cand,
+                start_script,
+                sudo=True,
+                check=False,
+                timeout=30,
+                insecure=True,
+            )
+        if p.returncode == 0:
+            active = cand
+            break
 
     while active is not None and time.time() < deadline:
         marker = f"IIAB_DEPLOY_MARKER_{os.getpid()}_{int(time.time() * 1000)}"
